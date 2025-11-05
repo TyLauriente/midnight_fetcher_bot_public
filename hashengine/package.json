@@ -1,0 +1,13 @@
+{
+  "name": "hashengine-napi",
+  "version": "0.1.0",
+  "description": "Node.js bindings for native hash engine",
+  "main": "index.node",
+  "scripts": {
+    "build": "build.cmd",
+    "build:debug": "cargo build && build.cmd"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.16.0"
+  }
+}

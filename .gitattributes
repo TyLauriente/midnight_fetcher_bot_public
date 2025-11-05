@@ -1,0 +1,7 @@
+# Git attributes for Midnight Fetcher Bot
+
+# Ensure Windows executables are treated as binary files
+*.exe binary
+
+# Specifically mark the pre-built hash server as binary
+hashengine/target/release/hash-server.exe binary

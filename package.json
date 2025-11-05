@@ -1,0 +1,42 @@
+{
+  "name": "midnight-fetcher-bot",
+  "version": "1.0.0",
+  "description": "Windows-based NextJS application for Midnight mining",
+  "scripts": {
+    "dev": "run.cmd",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "build:native": "cd hashengine && npm install && npm run build",
+    "build:hash": "cd hashengine && cargo build --release --bin hash-server"
+  },
+  "keywords": [
+    "midnight",
+    "mining",
+    "cardano",
+    "windows"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.2",
+    "axios": "^1.13.2",
+    "clsx": "^2.1.1",
+    "dotenv": "^17.2.3",
+    "lucid-cardano": "^0.10.11",
+    "lucide-react": "^0.552.0",
+    "next": "^16.0.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^3.3.1",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.16",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.16"
+  }
+}

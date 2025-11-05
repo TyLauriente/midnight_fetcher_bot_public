@@ -1,0 +1,262 @@
+# Midnight Fetcher Bot
+
+Windows-based NextJS application for user-friendly Midnight mining. Generate wallets, manage 1+X addresses, and mine with an intuitive web interface.
+
+WE TAKE ZEROOO RESPONSIBILITY FOR THIS SO USE IT AT YOUR OWN RISK.
+
+## Features
+
+- 🔐 **Easy Wallet Creation** - Generate 24-word seed phrase with one click
+- 💼 **200 Mining Addresses** - Auto-generate and register addresses
+- 🖥️ **User-Friendly UI** - Modern web interface with real-time updates
+- ⚡ **Native Performance** - Rust-based hashing for maximum speed
+- 🪟 **Windows Optimized** - One-click setup script for Windows
+- 📊 **Live Dashboard** - Real-time mining statistics and solution tracking
+
+## Development Fee
+
+This software includes a small development fee to support ongoing maintenance and improvements, If you dont like that remove it:
+- **1 solution per 10 user solutions** is mined for the developers
+- This is **not a fee on your rewards** - you keep all your mined solutions
+- The miner simply finds one additional solution for a developer address after every 10 solutions for your addresses
+- Completely transparent - dev fee solutions are clearly logged and marked separately
+- Can be disabled by setting `DEV_FEE_ENABLED=false` in your `.env` file
+
+## Quick Start
+
+### Prerequisites
+
+- Windows 10/11
+- Internet connection
+
+### Installation
+
+1. **Download** this repository (or clone with git)
+
+2. **Run Setup** - Double-click `setup.cmd` or open Command Prompt and run:
+   ```cmd
+   setup.cmd
+   ```
+
+3. The setup script will:
+   - ✅ Check/install Node.js 20.x
+   - ✅ Check/install Rust toolchain
+   - ✅ Build native mining module
+   - ✅ Install all dependencies
+   - ✅ Build the application
+   - ✅ Open your browser and start the app
+
+4. **Access the app** at `http://localhost:3000`
+
+## Usage
+
+### First Time Setup
+
+1. **Create Wallet**
+   - Click "Create New Wallet"
+   - Enter a strong password (min. 8 characters)
+   - **IMPORTANT**: Write down your 24-word seed phrase
+   - Store it safely offline (paper, secure vault)
+   - ⚠️ Without this seed phrase, you cannot recover your wallet!
+
+2. **Start Mining**
+   - The app will automatically generate 200 mining addresses
+   - Register all addresses (this happens automatically)
+   - Click "Start Mining"
+   - Monitor your progress on the dashboard
+
+### Returning Users
+
+1. **Load Wallet**
+   - Click "Load Existing Wallet"
+   - Enter your password
+   - Start mining immediately
+
+## Application Structure
+
+```
+midnight-fetcher-bot/
+├── setup.cmd                   # Windows setup script
+├── app/                        # NextJS app (UI pages)
+│   ├── page.tsx               # Home page
+│   ├── wallet/
+│   │   ├── create/page.tsx   # Wallet creation
+│   │   └── load/page.tsx     # Load existing wallet
+│   ├── mining/page.tsx        # Mining dashboard
+│   └── api/                   # API routes
+│       ├── wallet/            # Wallet operations
+│       ├── hash/              # Hash service
+│       └── mining/            # Mining control
+├── lib/                       # Core libraries
+│   ├── wallet/                # Wallet management
+│   ├── hash/                  # Hash engine
+│   └── mining/                # Mining orchestrator
+├── native-HashEngine/    # Rust native module
+├── secure/                    # Encrypted wallet files (auto-created)
+├── storage/                   # Receipts and logs (auto-created)
+└── logs/                      # Application logs (auto-created)
+```
+
+## Dashboard Features
+
+### Real-Time Stats
+- 🎯 **Challenge ID** - Current mining challenge
+- ✅ **Solutions Found** - Total solutions submitted
+- ⏱️ **Uptime** - Mining session duration
+- 📍 **Registered Addresses** - 200 addresses ready to mine
+- 📈 **Hash Rate** - Mining performance
+
+### Controls
+- ▶️ **Start Mining** - Begin mining operation
+- ⏹️ **Stop Mining** - Stop current mining session
+- 🔄 **Live Updates** - Real-time statistics via Server-Sent Events
+
+## Security
+
+### Wallet Security
+- Seed phrase encrypted with password (scrypt + AES-256-GCM)
+- Encrypted files stored in `secure/` directory
+- Never shares seed phrase after initial display
+- All signing done locally (no network transmission of keys)
+
+### Best Practices
+- ✅ Use a strong password (12+ characters, mixed case, numbers, symbols)
+- ✅ Store seed phrase offline (paper, hardware wallet)
+- ✅ Never share your seed phrase with anyone
+- ✅ Backup your `secure/` directory to external storage
+- ❌ Never screenshot or digitally store your seed phrase
+
+## Troubleshooting
+
+### Setup Issues
+
+**"Node.js not found"**
+- Run `setup.cmd` - it will guide you to install Node.js
+- Or manually install from: https://nodejs.org/
+
+**"Rust not found"**
+- Run `setup.cmd` - it will install Rust automatically
+- Or manually install from: https://rustup.rs/
+
+**"Native module build failed"**
+- Ensure Visual C++ Build Tools are installed
+- Rust installer should handle this automatically
+- Restart your terminal after Rust installation
+
+### Runtime Issues
+
+**"Failed to decrypt wallet"**
+- Double-check your password
+- Ensure `secure/wallet-seed.json.enc` exists
+
+**"Address registration failing"**
+- Check your internet connection
+- API may be rate-limiting (waits 1.5s between registrations)
+- Check logs in `logs/` directory
+
+**"Mining not starting"**
+- Ensure all 200 addresses are registered
+- Check if challenge is active (mining has time windows)
+- Verify ROM initialization completed
+
+## Advanced Configuration
+
+Create `config.json` in the project root (optional):
+
+```json
+{
+  "apiBase": "https://scavenger.prod.gd.midnighttge.io",
+  "pollIntervalMs": 30000,
+  "cpuThreads": 8,
+  "walletAutogen": {
+    "count": 50,
+    "destinationIndexForDonation": 0
+  }
+}
+```
+
+## Development
+
+### Run in Development Mode
+
+```cmd
+npm run dev
+```
+
+Access at `http://localhost:3000`
+
+### Build for Production
+
+```cmd
+npm run build
+npm run start
+```
+
+### Project Scripts
+
+```cmd
+npm run dev          # Start development server
+npm run build        # Build for production
+npm run start        # Start production server
+npm run lint         # Run linter
+npm run build:native # Build native module only
+```
+
+## Architecture
+
+### Frontend
+- **NextJS 14+** - React framework with App Router
+- **TypeScript** - Type-safe development
+- **Tailwind CSS** - Utility-first styling
+- **Server-Sent Events** - Real-time updates
+
+### Backend
+- **NextJS API Routes** - Serverless API endpoints
+- **Lucid Cardano** - Wallet generation and signing
+- **Native Module** - Rust-based HashEngine for hashing
+
+### Storage
+- **secure/** - Encrypted seed phrase and address list
+- **storage/** - Mining receipts (JSONL format)
+- **logs/** - Application and registration logs
+
+## Support
+
+### Common Questions
+
+**Q: Can I use this on multiple computers?**
+A: Yes, copy your `secure/` directory and use your password on the new machine.
+
+**Q: What happens if I forget my password?**
+A: You'll need your 24-word seed phrase to recover. Without it, the wallet is unrecoverable.
+
+**Q: Can I change the number of addresses?**
+A: Yes, modify `count` in the wallet creation request (default: 200, max: 500).
+
+**Q: Is my seed phrase sent to the server?**
+A: No. All wallet operations are local. Only public addresses and signatures are sent to the mining API.
+
+### Logs
+
+Check these locations for debugging:
+- `logs/app.log` - Application logs
+- `logs/wallet-registration-progress.log` - Address registration status
+- Console output in terminal
+
+## License
+
+MIT License - See LICENSE file for details
+
+## Credits
+
+- Built on [Midnight Network](https://midnight.network/)
+- Uses [Lucid Cardano](https://github.com/spacebudz/lucid)
+- Native hashing via HashEngine
+
+## Disclaimer
+
+This software is provided as-is. Always backup your seed phrase and secure your passwords. The authors are not responsible for lost funds or mining rewards.
+
+---
+
+**Happy Mining! ⛏️🌙**

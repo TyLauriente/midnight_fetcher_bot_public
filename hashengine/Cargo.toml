@@ -1,0 +1,47 @@
+[package]
+name = "HashEngine-napi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Binary for standalone HTTP server
+[[bin]]
+name = "hash-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# Core HashEngine dependencies (copy from original)
+cryptoxide = "~0.5.1"
+hex = "0.4"
+getrandom = "0.3"
+
+# NAPI bindings (optional for library)
+napi = { version = "2", optional = true }
+napi-derive = { version = "2", optional = true }
+
+# HTTP server dependencies
+actix-web = "4"
+actix-rt = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+rayon = "1.10"
+once_cell = "1.19"
+env_logger = "0.11"
+log = "0.4"
+num_cpus = "1.16"
+
+[build-dependencies]
+
+[features]
+default = ["napi-bindings"]
+napi-bindings = ["napi", "napi-derive"]
+
+[profile.release]
+lto = true
+strip = true
+opt-level = 3
+codegen-units = 1
