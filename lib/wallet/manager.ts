@@ -262,4 +262,46 @@ export class WalletManager {
 
     return signedMessage.signature;
   }
+  /**
+   * Expands the derived addresses of the wallet to a newCount.
+   * Only adds addresses; never alters or removes ones with registered=true
+   */
+  async expandAddresses(password: string, newCount: number): Promise<void> {
+    if (!fs.existsSync(SEED_FILE)) throw new Error('No wallet found');
+    const encryptedData: EncryptedData = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+    this.mnemonic = decrypt(encryptedData, password);
+    if (!this.mnemonic) throw new Error('Mnemonic decrypt failed');
+    // Load existing addresses
+    let addresses: DerivedAddress[] = [];
+    if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
+      addresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+    }
+    // Add up to newCount
+    const toAdd = newCount - addresses.length;
+    if (toAdd <= 0) return; // Nothing to do
+    for (let i = addresses.length; i < newCount; i++) {
+      const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
+      addresses.push({
+        index: i,
+        bech32: address,
+        publicKeyHex: pubKeyHex,
+        registered: false,
+      });
+    }
+    fs.writeFileSync(DERIVED_ADDRESSES_FILE, JSON.stringify(addresses, null, 2), { mode: 0o600 });
+    this.derivedAddresses = addresses;
+  }
+
+  /**
+   * Truncates derived addresses to newCount (cannot remove any with registered=true)
+   */
+  async truncateAddresses(newCount: number): Promise<void> {
+    if (!fs.existsSync(DERIVED_ADDRESSES_FILE)) throw new Error('Addresses file missing');
+    let addresses: DerivedAddress[] = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+    const numRegistered = addresses.filter((a) => a.registered).length;
+    if (newCount < numRegistered) throw new Error(`Cannot truncate below ${numRegistered} registered addresses`);
+    addresses = addresses.slice(0, newCount);
+    fs.writeFileSync(DERIVED_ADDRESSES_FILE, JSON.stringify(addresses, null, 2), { mode: 0o600 });
+    this.derivedAddresses = addresses;
+  }
 }
