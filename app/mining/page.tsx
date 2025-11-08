@@ -235,7 +235,7 @@ function MiningDashboardContent() {
     if (addressesData) setAddressCountSetting(addressesData.addresses?.length || 200);
   }, [stats, addressesData]);
 
-  const handleWalletAddressCountChange = (e) => {
+  const handleWalletAddressCountChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = Number(e.target.value);
     if (val < currentRegistered) {
       setUpdateWarning(
