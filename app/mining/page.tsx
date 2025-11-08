@@ -182,22 +182,33 @@ function MiningDashboardContent() {
   const handleApplyAddressCount = async () => {
     setUpdateInProgress(true);
     setUpdateWarning('');
-    // Optional: Pause mining here
-    // Make API call to regenerate wallet or adjust addresses (simulate create, or offer backend endpoint for re-derive on existing seed)
     try {
       const password = sessionStorage.getItem('walletPassword');
-      const res = await fetch('/api/wallet/create', {
+      // Try expand endpoint first (normal case)
+      let res = await fetch('/api/wallet/expand', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password, count: addressCountSetting }),
       });
-      const data = await res.json();
+      let data = await res.json();
+      if (!res.ok && data.error && data.error.includes('No wallet found')) {
+        // Fallback: try create
+        res = await fetch('/api/wallet/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password, count: addressCountSetting }),
+        });
+        data = await res.json();
+      }
       if (!res.ok) throw new Error(data.error || 'Failed to update address count');
-      // Optional: Reload wallet, stats, and re-start mining if needed
-      await checkStatus(); // or whatever reloads wallet state for UI
+      await checkStatus();
       setTimeout(() => setUpdateInProgress(false), 1200);
-    } catch (err) {
-      setUpdateWarning(err.message);
+    } catch (err: any) {
+      if (typeof err?.message === 'string' && err.message.includes('No wallet found')) {
+        setUpdateWarning('No wallet found, please load or create a wallet.');
+      } else {
+        setUpdateWarning(err.message || 'Update failed');
+      }
       setUpdateInProgress(false);
     }
   };
