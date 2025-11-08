@@ -224,6 +224,53 @@ function MiningDashboardContent() {
     }
   };
 
+  // --- BEGIN PATCH: Wallet Address Count Management Card ---
+  const [addressCountSetting, setAddressCountSetting] = useState(200);
+  const [updateInProgress, setUpdateInProgress] = useState(false);
+  const [updateWarning, setUpdateWarning] = useState('');
+  const [currentRegistered, setCurrentRegistered] = useState(0);
+  // Fetch registered addresses for min/disable logic
+  useEffect(() => {
+    if (stats) setCurrentRegistered(stats.registeredAddresses || 0);
+    if (addressesData) setAddressCountSetting(addressesData.addresses?.length || 200);
+  }, [stats, addressesData]);
+
+  const handleWalletAddressCountChange = (e) => {
+    const val = Number(e.target.value);
+    if (val < currentRegistered) {
+      setUpdateWarning(
+        `Cannot set address count below the number of currently registered addresses (${currentRegistered}).`
+      );
+    } else {
+      setUpdateWarning('');
+      setAddressCountSetting(val);
+    }
+  };
+
+  const handleApplyAddressCount = async () => {
+    setUpdateInProgress(true);
+    setUpdateWarning('');
+    // Optional: Pause mining here
+    // Make API call to regenerate wallet or adjust addresses (simulate create, or offer backend endpoint for re-derive on existing seed)
+    try {
+      const password = sessionStorage.getItem('walletPassword');
+      const res = await fetch('/api/wallet/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password, count: addressCountSetting }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to update address count');
+      // Optional: Reload wallet, stats, and re-start mining if needed
+      await checkStatus(); // or whatever reloads wallet state for UI
+      setTimeout(() => setUpdateInProgress(false), 1200);
+    } catch (err) {
+      setUpdateWarning(err.message);
+      setUpdateInProgress(false);
+    }
+  };
+  // --- END PATCH ---
+
   useEffect(() => {
     // Retrieve password from sessionStorage
     const storedPassword = sessionStorage.getItem('walletPassword');
