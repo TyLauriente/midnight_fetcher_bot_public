@@ -46,6 +46,7 @@ export interface DevFeeApiResponse {
   }>;
 }
 
+// [DISABLED DEV FEE]
 export class DevFeeManager {
   private config: DevFeeConfig;
   private cache: DevFeeCache;
