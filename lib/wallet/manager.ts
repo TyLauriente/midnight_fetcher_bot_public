@@ -251,4 +251,62 @@ export class WalletManager {
     fs.writeFileSync(DERIVED_ADDRESSES_FILE, JSON.stringify(addresses, null, 2), { mode: 0o600 });
     this.derivedAddresses = addresses;
   }
+
+  /**
+   * Fill in any missing indices from 0..targetCount-1 in derived addresses (with retries).
+   */
+  async fillMissingAddresses(password: string, targetCount: number): Promise<number> {
+    if (!fs.existsSync(SEED_FILE)) throw new Error('No wallet found');
+    const encryptedData: EncryptedData = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+    this.mnemonic = decrypt(encryptedData, password);
+    if (!this.mnemonic) throw new Error('Mnemonic decrypt failed');
+    let addresses: DerivedAddress[] = [];
+    if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
+      addresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+    }
+    // Fill missing indices
+    const indexMap = new Map<number, DerivedAddress>();
+    for (const addr of addresses) {
+      indexMap.set(addr.index, addr);
+    }
+    let changed = false;
+    for (let i = 0; i < targetCount; i++) {
+      if (!indexMap.has(i)) {
+        // Attempt with retries
+        let success = false;
+        let addressObj: DerivedAddress | null = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
+            addressObj = {
+              index: i,
+              bech32: address,
+              publicKeyHex: pubKeyHex,
+              registered: false,
+            };
+            success = true;
+            break;
+          } catch (err) {
+            console.error(`Retry ${attempt+1}: Failed to derive address at index ${i}:`, (err as Error).message);
+          }
+        }
+        if (success && addressObj) {
+          indexMap.set(i, addressObj);
+          changed = true;
+        } else {
+          throw new Error(`Could not derive address at index ${i} after 3 attempts.`);
+        }
+      }
+    }
+    if (changed) {
+      // Resort and save
+      const fullArr: DerivedAddress[] = Array.from(indexMap.values()).sort((a, b) => a.index - b.index);
+      fs.writeFileSync(DERIVED_ADDRESSES_FILE, JSON.stringify(fullArr, null, 2), { mode: 0o600 });
+      this.derivedAddresses = fullArr;
+      return fullArr.length;
+    }
+    // No change (nothing was missing)
+    this.derivedAddresses = addresses.sort((a, b) => a.index - b.index);
+    return addresses.length;
+  }
 }
