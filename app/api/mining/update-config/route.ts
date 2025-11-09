@@ -9,10 +9,11 @@ export async function POST(req: NextRequest) {
   try {
     const { workerThreads, batchSize } = await req.json();
 
-    // Validate inputs
-    if (typeof workerThreads !== 'number' || workerThreads < 1 || workerThreads > 32) {
+    // Raise the max allowed workerThreads
+    const MAX_WORKERS = 1024; // Use at your own risk: high values can cause instability if you don't have enough cores/memory
+    if (typeof workerThreads !== 'number' || workerThreads < 1 || workerThreads > MAX_WORKERS) {
       return NextResponse.json(
-        { success: false, error: 'Invalid workerThreads value (must be between 1 and 32)' },
+        { success: false, error: `Invalid workerThreads value (must be between 1 and ${MAX_WORKERS})` },
         { status: 400 }
       );
     }
