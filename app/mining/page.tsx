@@ -282,6 +282,27 @@ function MiningDashboardContent() {
   };
   // --- END PATCH ---
 
+  // ... inside MiningDashboardContent, after handleApplyAddressCount, add:
+  const handleFillMissingAddresses = async () => {
+    setFillMissingLoading(true);
+    setFillMissingError('');
+    try {
+      const password = sessionStorage.getItem('walletPassword');
+      const res = await fetch('/api/wallet/fill-missing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password, targetCount: addressCountSetting }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to generate missing addresses');
+      await checkStatus();
+      setFillMissingLoading(false);
+    } catch (err: any) {
+      setFillMissingError(err.message || 'Failed to generate missing addresses');
+      setFillMissingLoading(false);
+    }
+  };
+
   useEffect(() => {
     // Retrieve password from sessionStorage
     const storedPassword = sessionStorage.getItem('walletPassword');
@@ -774,6 +795,10 @@ function MiningDashboardContent() {
     return () => clearInterval(interval);
   }, []);
 
+  // ... inside MiningDashboardContent, after handleApplyAddressCount, add:
+  const [fillMissingLoading, setFillMissingLoading] = useState(false);
+  const [fillMissingError, setFillMissingError] = useState('');
+
   if (!stats) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -865,8 +890,24 @@ function MiningDashboardContent() {
               <Home className="w-4 h-4" />
               Back to Home
             </Button>
+            {addressCountSetting > (addressesData?.addresses?.length || 0) && (
+              <Button
+                onClick={handleFillMissingAddresses}
+                disabled={fillMissingLoading}
+                variant="secondary"
+                size="md"
+                title="Regenerates only missing wallet addresses (good if creation failed before)."
+              >
+                {fillMissingLoading ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Generating...</>
+                ) : (
+                  <>Generate Remaining Addresses</>
+                )}
+              </Button>
+            )}
           </div>
         </div>
+        {fillMissingError && <Alert variant="error" className="mt-2">{fillMissingError}</Alert>}
 
         {/* Tab Navigation */}
         <div className="flex gap-2 border-b border-gray-700">
