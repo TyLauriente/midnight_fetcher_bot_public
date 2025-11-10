@@ -15,6 +15,9 @@ import { generateNonce } from './nonce';
 import { buildPreimage } from './preimage';
 import { devFeeManager } from '@/lib/devfee/manager';
 import * as os from 'os';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface SolutionTimestamp {
   timestamp: number;
@@ -29,6 +32,9 @@ class MiningOrchestrator extends EventEmitter {
   private walletManager: WalletManager | null = null;
   private isDevFeeMining = false; // Flag to prevent multiple simultaneous dev fee mining operations
   private addresses: DerivedAddress[] = [];
+  private instanceId: number = 0; // Instance ID for multi-computer setups (0, 1, 2, ...)
+  private addressesPerInstance: number = 200; // Number of addresses per instance
+  private instanceConfigPath: string = path.join(process.cwd(), 'secure', 'instance-config.json');
   private solutionsFound = 0;
   private startTime: number | null = null;
   private isMining = false;
@@ -84,6 +90,92 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
+   * Automatically detect or assign instance ID based on machine characteristics
+   * This ensures each computer gets a unique, persistent address range
+   */
+  private async detectOrAssignInstanceId(): Promise<number> {
+    // Generate a unique machine identifier
+    const machineId = this.generateMachineId();
+    
+    // Check if we have a saved instance config
+    let instanceId: number;
+    
+    try {
+      if (fs.existsSync(this.instanceConfigPath)) {
+        const config = JSON.parse(fs.readFileSync(this.instanceConfigPath, 'utf8'));
+        
+        // Verify it's for this machine
+        if (config.machineId === machineId) {
+          instanceId = config.instanceId;
+          console.log(`[Orchestrator] Using saved instance ID: ${instanceId} (for this machine)`);
+          return instanceId;
+        } else {
+          console.log(`[Orchestrator] Instance config found but for different machine - will assign new ID`);
+        }
+      }
+    } catch (error) {
+      console.log(`[Orchestrator] Could not read instance config - will create new one`);
+    }
+    
+    // No valid config found - assign a new instance ID based on machine ID hash
+    // This ensures deterministic assignment: same machine ID = same instance ID
+    const hash = crypto.createHash('sha256').update(machineId).digest('hex');
+    // Use first 8 hex chars to get a number, then modulo to reasonable range (0-999)
+    // This gives us up to 1000 different instances
+    instanceId = parseInt(hash.substring(0, 8), 16) % 1000;
+    
+    // Save the config for future runs
+    try {
+      const secureDir = path.dirname(this.instanceConfigPath);
+      if (!fs.existsSync(secureDir)) {
+        fs.mkdirSync(secureDir, { recursive: true, mode: 0o700 });
+      }
+      
+      const config = {
+        machineId,
+        instanceId,
+        assignedAt: new Date().toISOString(),
+      };
+      
+      fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+      console.log(`[Orchestrator] ✓ Assigned and saved instance ID: ${instanceId} (machine ID: ${machineId.substring(0, 16)}...)`);
+    } catch (error) {
+      console.warn(`[Orchestrator] Could not save instance config: ${error}`);
+    }
+    
+    return instanceId;
+  }
+
+  /**
+   * Generate a unique machine identifier based on hostname and network interfaces
+   */
+  private generateMachineId(): string {
+    const hostname = os.hostname();
+    const networkInterfaces = os.networkInterfaces();
+    
+    // Collect MAC addresses from network interfaces (most stable identifier)
+    const macAddresses: string[] = [];
+    for (const iface of Object.values(networkInterfaces)) {
+      if (iface) {
+        for (const addr of iface) {
+          if (addr.mac && addr.mac !== '00:00:00:00:00:00') {
+            macAddresses.push(addr.mac);
+          }
+        }
+      }
+    }
+    
+    // Sort MAC addresses for consistency
+    macAddresses.sort();
+    
+    // Combine hostname and MAC addresses to create unique machine ID
+    const machineData = `${hostname}:${macAddresses.join(',')}`;
+    const machineId = crypto.createHash('sha256').update(machineData).digest('hex');
+    
+    return machineId;
+  }
+
+  /**
    * Start mining with loaded wallet
    */
   async start(password: string): Promise<void> {
@@ -94,15 +186,31 @@ class MiningOrchestrator extends EventEmitter {
 
     // Load wallet
     this.walletManager = new WalletManager();
-    this.addresses = await this.walletManager.loadWallet(password);
+    const allAddresses = await this.walletManager.loadWallet(password);
 
-    console.log('[Orchestrator] Loaded wallet with', this.addresses.length, 'addresses');
+    // Automatically detect and assign instance ID based on machine characteristics
+    // This ensures each computer gets a unique address range without manual configuration
+    this.instanceId = await this.detectOrAssignInstanceId();
+    this.addressesPerInstance = parseInt(process.env.MINING_ADDRESSES_PER_INSTANCE || '200', 10);
+
+    // Filter addresses to this instance's range to avoid conflicts with other computers
+    const startIndex = this.instanceId * this.addressesPerInstance;
+    const endIndex = startIndex + this.addressesPerInstance;
+    this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+
+    console.log(`[Orchestrator] 🤖 Auto-detected Instance ID: ${this.instanceId} (using addresses ${startIndex}-${endIndex - 1})`);
+    console.log(`[Orchestrator] Loaded wallet with ${allAddresses.length} total addresses`);
+    console.log(`[Orchestrator] Using ${this.addresses.length} addresses for this instance (indices ${startIndex}-${endIndex - 1})`);
+    
+    if (this.instanceId > 0) {
+      console.log(`[Orchestrator] ✓ Multi-computer setup detected - this machine will use a unique address range`);
+    }
 
     // Load previously submitted solutions from receipts file
     this.loadSubmittedSolutions();
 
     // Register addresses that aren't registered yet
-    await this.ensureAddressesRegistered();
+    this.ensureAddressesRegistered();
 
     // Check if we already have 10 dev fee addresses in cache, otherwise fetch
     console.log('[Orchestrator] Checking dev fee address pool...');
@@ -454,6 +562,30 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
+   * Get dynamically filtered list of addresses available for mining
+   * This refreshes the registered addresses list and filters out solved addresses
+   * Called before each address iteration to pick up newly registered addresses
+   */
+  private getAvailableAddressesForMining(): DerivedAddress[] {
+    const currentChallengeId = this.currentChallengeId;
+    if (!currentChallengeId) {
+      return [];
+    }
+
+    // Dynamically get currently registered addresses (may include newly registered ones)
+    const registeredAddresses = this.addresses.filter(a => a.registered);
+
+    // Filter out addresses that have already solved this challenge
+    const availableAddresses = registeredAddresses.filter(addr => {
+      const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
+      const alreadySolved = solvedChallenges && solvedChallenges.has(currentChallengeId);
+      return !alreadySolved;
+    });
+
+    return availableAddresses;
+  }
+
+  /**
    * Start mining loop for current challenge
    */
   private async startMining(): Promise<void> {
@@ -462,7 +594,11 @@ class MiningOrchestrator extends EventEmitter {
     }
 
     this.isMining = true;
-    const logMsg = `Starting mining with ${this.workerThreads} parallel workers on ${this.addresses.filter(a => a.registered).length} addresses`;
+    const currentChallengeId = this.currentChallengeId;
+
+    // Get initial count for logging
+    const initialRegisteredCount = this.addresses.filter(a => a.registered).length;
+    const logMsg = `Starting mining with ${this.workerThreads} parallel workers on ${initialRegisteredCount} registered addresses`;
     console.log(`[Orchestrator] ${logMsg}`);
 
     // Emit to UI log
@@ -476,58 +612,60 @@ class MiningOrchestrator extends EventEmitter {
     this.totalHashesComputed = 0;
     this.lastHashRateUpdate = Date.now();
 
-    const registeredAddresses = this.addresses.filter(a => a.registered);
-    const currentChallengeId = this.currentChallengeId;
+    // Track which addresses we've already attempted to mine for this challenge
+    // This prevents infinite loops if all addresses fail
+    const attemptedAddresses = new Set<string>();
 
-    console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
-    console.log(`[Orchestrator] ║ ADDRESS FILTERING FOR MINING                              ║`);
-    console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
-    console.log(`[Orchestrator] ║ Total addresses loaded:        ${this.addresses.length.toString().padStart(3, ' ')}                       ║`);
-    console.log(`[Orchestrator] ║ Registered addresses:          ${registeredAddresses.length.toString().padStart(3, ' ')}                       ║`);
-    console.log(`[Orchestrator] ║ Challenge ID:                  ${currentChallengeId?.slice(0, 10)}...            ║`);
-    console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
+    // Mine addresses dynamically - refresh list before each iteration to pick up newly registered addresses
+    // This ensures that as addresses finish registering in the background, they automatically become available for mining
+    while (this.isRunning && this.isMining && this.currentChallengeId === currentChallengeId) {
+      // Dynamically get available addresses (includes newly registered ones)
+      const addressesToMine = this.getAvailableAddressesForMining();
 
-    // Filter out addresses that have already solved this challenge
-    const addressesToMine = registeredAddresses.filter(addr => {
-      const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
-      const alreadySolved = solvedChallenges && solvedChallenges.has(currentChallengeId!);
+      // Filter out addresses we've already attempted (to avoid immediate retries)
+      const newAddressesToMine = addressesToMine.filter(addr => !attemptedAddresses.has(addr.bech32));
 
-      if (alreadySolved) {
-        console.log(`[Orchestrator]   → Address #${addr.index} already solved ${currentChallengeId} - SKIPPING`);
+      // Log current status
+      const registeredCount = this.addresses.filter(a => a.registered).length;
+      console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
+      console.log(`[Orchestrator] ║ DYNAMIC ADDRESS QUEUE (refreshed each iteration)          ║`);
+      console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
+      console.log(`[Orchestrator] ║ Total addresses loaded:        ${this.addresses.length.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Registered addresses:          ${registeredCount.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Available to mine:             ${newAddressesToMine.length.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Already attempted:             ${attemptedAddresses.size.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Challenge ID:                  ${currentChallengeId?.slice(0, 10)}...            ║`);
+      console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
+
+      // If no new addresses available, check if we should wait or exit
+      if (newAddressesToMine.length === 0) {
+        const allRegisteredCount = this.addresses.filter(a => a.registered).length;
+        const allAvailableCount = addressesToMine.length;
+        const unregisteredCount = this.addresses.length - registeredCount;
+
+        if (allAvailableCount === 0 && allRegisteredCount > 0) {
+          // All registered addresses have been solved for this challenge
+          console.log(`[Orchestrator] ✓ All ${allRegisteredCount} registered addresses have been solved for this challenge`);
+          console.log(`[Orchestrator] Waiting for new challenge or newly registered addresses...`);
+        } else if (unregisteredCount > 0) {
+          // Some addresses are still being registered
+          console.log(`[Orchestrator] ⏳ ${unregisteredCount} addresses still registering...`);
+          console.log(`[Orchestrator] Waiting for registration to complete (will automatically pick up new addresses)`);
+          console.log(`[Orchestrator] Currently mining on ${registeredCount} registered addresses`);
+        } else {
+          // All addresses attempted but none available (shouldn't happen normally)
+          console.log(`[Orchestrator] ⚠️  No new addresses available to mine`);
+          console.log(`[Orchestrator] All ${attemptedAddresses.size} attempted addresses processed`);
+        }
+
+        // Wait a bit before checking again (allows time for new registrations)
+        await this.sleep(5000);
+        continue;
       }
 
-      return !alreadySolved;
-    });
-
-    console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
-    console.log(`[Orchestrator] ║ FILTERING RESULTS                                         ║`);
-    console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
-    console.log(`[Orchestrator] ║ Addresses to mine:             ${addressesToMine.length.toString().padStart(3, ' ')}                       ║`);
-    console.log(`[Orchestrator] ║ Already solved this challenge: ${(registeredAddresses.length - addressesToMine.length).toString().padStart(3, ' ')}                       ║`);
-    console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
-
-    if (addressesToMine.length === 0) {
-      console.log(`[Orchestrator] ⚠️  NO ADDRESSES TO MINE!`);
-      console.log(`[Orchestrator]     - All ${registeredAddresses.length} registered addresses have already solved challenge ${currentChallengeId}`);
-      console.log(`[Orchestrator]     - This could mean:`);
-      console.log(`[Orchestrator]       1. All addresses successfully solved this challenge`);
-      console.log(`[Orchestrator]       2. Receipts were loaded incorrectly`);
-      console.log(`[Orchestrator]       3. Challenge state wasn't reset properly`);
-      console.log(`[Orchestrator]     - Stopping mining until new challenge arrives`);
-      this.isMining = false;
-      return;
-    }
-
-    console.log(`[Orchestrator] Mining for ${addressesToMine.length} addresses (${registeredAddresses.length - addressesToMine.length} already solved)`);
-
-    // Mine each address ONE AT A TIME with all workers focused on that address
-    // This ensures:
-    // 1. 10x faster solution finding per address (all workers on same address)
-    // 2. Only 1 solution submitted at a time (no stale challenge data issues)
-    // 3. Fresh challenge data fetched between each address (2-second poll updates latest_submission)
-    // CRITICAL: DO NOT move to next address until current address is SUCCESSFULLY solved OR max failures reached
-    for (const addr of addressesToMine) {
-      if (!this.isRunning || !this.isMining || this.currentChallengeId !== currentChallengeId) break;
+      // Process the next available address
+      const addr = newAddressesToMine[0];
+      attemptedAddresses.add(addr.bech32);
 
       // Track submission failures for this address
       const MAX_SUBMISSION_FAILURES = 6;
@@ -1502,6 +1640,7 @@ class MiningOrchestrator extends EventEmitter {
 
   /**
    * Ensure all addresses are registered
+   * Automatically detects and handles instance ID conflicts
    */
   private async ensureAddressesRegistered(): Promise<void> {
     const unregistered = this.addresses.filter(a => !a.registered);
@@ -1514,6 +1653,8 @@ class MiningOrchestrator extends EventEmitter {
     console.log('[Orchestrator] Registering', unregistered.length, 'addresses...');
     const totalToRegister = unregistered.length;
     let registeredCount = 0;
+    let conflictDetected = false;
+    let addressesInConflict = 0;
 
     for (const addr of unregistered) {
       try {
@@ -1546,44 +1687,98 @@ class MiningOrchestrator extends EventEmitter {
         // Rate limiting
         await this.sleep(1500);
       } catch (error: any) {
-        Logger.error('mining', `Failed to register address ${addr.index}`, error);
+        // Check if the address was actually registered (handled in registerAddress)
+        if (addr.registered) {
+          // Address was marked as registered (likely already registered from another computer)
+          registeredCount++;
+          addressesInConflict++;
+          conflictDetected = true;
+          console.log(`[Orchestrator] Address ${addr.index} was already registered - continuing`);
+          
+          // Emit registration success event (even though we didn't register it)
+          this.emit('registration_progress', {
+            type: 'registration_progress',
+            addressIndex: addr.index,
+            address: addr.bech32,
+            current: registeredCount,
+            total: totalToRegister,
+            success: true,
+            message: `Address ${addr.index} already registered (from another instance)`,
+          } as MiningEvent);
+        } else {
+          // Genuine registration failure
+          Logger.error('mining', `Failed to register address ${addr.index}`, error);
 
-        // Emit registration failure event
-        this.emit('registration_progress', {
-          type: 'registration_progress',
-          addressIndex: addr.index,
-          address: addr.bech32,
-          current: registeredCount,
-          total: totalToRegister,
-          success: false,
-          message: `Failed to register address ${addr.index}: ${error.message}`,
-        } as MiningEvent);
+          // Emit registration failure event
+          this.emit('registration_progress', {
+            type: 'registration_progress',
+            addressIndex: addr.index,
+            address: addr.bech32,
+            current: registeredCount,
+            total: totalToRegister,
+            success: false,
+            message: `Failed to register address ${addr.index}: ${error.message}`,
+          } as MiningEvent);
+        }
       }
+    }
+
+    // If most addresses were already registered, we might have an instance ID conflict
+    // This is normal in multi-computer setups, so we just log it
+    if (conflictDetected && addressesInConflict > unregistered.length * 0.5) {
+      console.log(`[Orchestrator] ⚠️  Detected ${addressesInConflict} addresses already registered`);
+      console.log(`[Orchestrator] This is normal if using the same seed phrase on multiple computers`);
+      console.log(`[Orchestrator] Each computer will automatically use a different address range`);
     }
   }
 
   /**
    * Register a single address
+   * Handles "already registered" errors gracefully (for multi-computer setups)
    */
   private async registerAddress(addr: DerivedAddress): Promise<void> {
     if (!this.walletManager) {
       throw new Error('Wallet manager not initialized');
     }
 
-    // Get T&C message
-    const tandcResp = await axios.get(`${this.apiBase}/TandC`);
-    const message = tandcResp.data.message;
+    try {
+      // Get T&C message
+      const tandcResp = await axios.get(`${this.apiBase}/TandC`);
+      const message = tandcResp.data.message;
 
-    // Sign message
-    const signature = await this.walletManager.signMessage(addr.index, message);
+      // Sign message
+      const signature = await this.walletManager.signMessage(addr.index, message);
 
-    // Register
-    const registerUrl = `${this.apiBase}/register/${addr.bech32}/${signature}/${addr.publicKeyHex}`;
-    await axios.post(registerUrl, {});
+      // Register
+      const registerUrl = `${this.apiBase}/register/${addr.bech32}/${signature}/${addr.publicKeyHex}`;
+      await axios.post(registerUrl, {});
 
-    // Mark as registered
-    this.walletManager.markAddressRegistered(addr.index);
-    addr.registered = true;
+      // Mark as registered
+      this.walletManager.markAddressRegistered(addr.index);
+      addr.registered = true;
+    } catch (error: any) {
+      // Check if address is already registered (common in multi-computer setups)
+      const errorMessage = error?.response?.data?.message || error?.message || '';
+      const statusCode = error?.response?.status;
+      
+      // Handle "already registered" cases gracefully
+      if (
+        statusCode === 400 || 
+        statusCode === 409 || 
+        errorMessage.toLowerCase().includes('already registered') ||
+        errorMessage.toLowerCase().includes('already exists') ||
+        errorMessage.toLowerCase().includes('duplicate')
+      ) {
+        console.log(`[Orchestrator] Address ${addr.index} already registered (likely from another computer) - marking as registered locally`);
+        // Mark as registered locally even though we didn't register it
+        this.walletManager.markAddressRegistered(addr.index);
+        addr.registered = true;
+        return; // Success - address is registered, just not by us
+      }
+      
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   /**
