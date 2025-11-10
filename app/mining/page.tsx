@@ -799,6 +799,19 @@ function MiningDashboardContent() {
   const [fillMissingLoading, setFillMissingLoading] = useState(false);
   const [fillMissingError, setFillMissingError] = useState('');
 
+  const [stopServerLoading, setStopServerLoading] = useState(false);
+  const [stopServerModal, setStopServerModal] = useState(false);
+  const handleStopServer = async () => {
+    setStopServerLoading(true);
+    setStopServerModal(true);
+    try {
+      await fetch('/api/stop-server', { method: 'POST' });
+      setStopServerLoading(false);
+    } catch {
+      setStopServerLoading(false);
+    }
+  };
+
   if (!stats) {
     return (
       <div className="flex items-center justify-center min-h-screen">
