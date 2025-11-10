@@ -14,9 +14,9 @@ export async function POST(request: NextRequest) {
       );
     }
     const newCount = Number(count);
-    if (!newCount || newCount < 1 || newCount > 1000) {
+    if (!newCount || newCount < 1 || newCount > 50000) {
       return NextResponse.json(
-        { error: 'Address count must be between 1 and 1000' },
+        { error: 'Address count must be between 1 and 50000' },
         { status: 400 }
       );
     }

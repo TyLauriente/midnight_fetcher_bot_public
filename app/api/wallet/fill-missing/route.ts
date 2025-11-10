@@ -11,9 +11,9 @@ export async function POST(request: NextRequest) {
       );
     }
     const count = Number(targetCount);
-    if (!count || count < 1 || count > 1000) {
+    if (!count || count < 1 || count > 50000) {
       return NextResponse.json(
-        { error: 'targetCount must be between 1 and 1000' },
+        { error: 'targetCount must be between 1 and 50000' },
         { status: 400 }
       );
     }

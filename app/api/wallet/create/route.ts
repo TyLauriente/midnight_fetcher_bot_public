@@ -18,9 +18,9 @@ export async function POST(request: NextRequest) {
       );
     }
     const walletCount = count || 40;
-    if (walletCount < 1 || walletCount > 1000) {
+    if (walletCount < 1 || walletCount > 50000) {
       return NextResponse.json(
-        { error: 'Wallet count must be between 1 and 1000' },
+        { error: 'Wallet count must be between 1 and 50000' },
         { status: 400 }
       );
     }
