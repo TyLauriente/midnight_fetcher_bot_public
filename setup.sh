@@ -14,6 +14,50 @@
 # ============================================================================
 
 set -e  # Exit on error
+SESSION_NAME=midnightbot
+
+if ! command -v tmux &> /dev/null; then
+  echo "Missing dependency: tmux"
+  echo "Please run: sudo apt-get install tmux"
+  exit 1
+fi
+
+if tmux has-session -t $SESSION_NAME 2>/dev/null; then
+  echo "\n================================================================================"
+  echo "Midnight Fetcher Bot already running in tmux session: $SESSION_NAME"
+  echo "To attach: tmux attach-session -t $SESSION_NAME"
+  echo "To stop: pkill -f hash-server && pkill -f 'next' && tmux kill-session -t $SESSION_NAME"
+  echo "================================================================================"
+  tmux attach-session -t $SESSION_NAME
+  exit 0
+fi
+
+echo "================================================================================"
+echo "  Starting new background session via tmux..."
+echo "  To attach to logs, run: tmux attach-session -t $SESSION_NAME"
+echo "  To detach, press Ctrl+B then D"
+echo "  To stop: pkill -f hash-server && pkill -f 'next' && tmux kill-session -t $SESSION_NAME"
+echo "================================================================================"
+sleep 2
+
+# Prepare the inner setup script
+cat > setup_internal.sh << "EOF"
+#!/bin/bash
+# ============================================================================
+# Midnight Fetcher Bot - Ubuntu Setup Script
+# ============================================================================
+# This script performs complete setup:
+# 1. Checks/installs Node.js 20.x
+# 2. Checks/installs Rust toolchain
+# 3. Builds optimized hash server with performance improvements
+# 4. Installs all dependencies
+# 5. Builds NextJS application
+# 6. Starts the app
+#
+# NOTE: Builds optimized hash server with +15-38% performance improvement
+# ============================================================================
+
+set -e  # Exit on error
 
 echo ""
 echo "================================================================================"
@@ -255,20 +299,24 @@ echo "Both services are running!"
 echo "Hash Server PID: $HASH_SERVER_PID"
 echo "Next.js PID: $NEXTJS_PID"
 echo ""
-echo "Press Ctrl+C to stop..."
+echo "To kill: pkill -f hash-server && pkill -f 'next' && exit"
+echo "To detach and keep running (recommended), press Ctrl+B, then D"
 echo "================================================================================"
+# Sleep forever
+while true; do sleep 600; done
+EOF
+chmod +x setup_internal.sh
 
-# Trap Ctrl+C to cleanup
-cleanup() {
-    echo ""
-    echo "Stopping services..."
-    kill $NEXTJS_PID 2>/dev/null || true
-    pkill -f hash-server 2>/dev/null || true
-    echo "Services stopped."
-    exit 0
-}
+# Start tmux session running the internal script
+# The ending 'read' helps prevent tmux from immediate exit if anything fails
+# All output is visible in tmux
 
-trap cleanup SIGINT SIGTERM
+# This will detach after launching, allowing the script to run in the background even after you close the original shell
+# The user can attach at any time
 
-# Wait for Next.js process
-wait $NEXTJS_PID
+tmux new-session -d -s $SESSION_NAME './setup_internal.sh; read'
+echo "Services are now running in tmux session: $SESSION_NAME"
+echo "To attach: tmux attach-session -t $SESSION_NAME"
+echo "To kill everything: tmux kill-session -t $SESSION_NAME"
+echo "To stop individual servers, pkill -f hash-server, pkill -f 'next'"
+exit 0

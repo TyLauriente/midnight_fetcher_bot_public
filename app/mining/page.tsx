@@ -692,6 +692,19 @@ function MiningDashboardContent() {
   const [fillMissingLoading, setFillMissingLoading] = useState(false);
   const [fillMissingError, setFillMissingError] = useState('');
 
+  const [stopServerLoading, setStopServerLoading] = useState(false);
+  const [stopServerModal, setStopServerModal] = useState(false);
+  const handleStopServer = async () => {
+    setStopServerLoading(true);
+    setStopServerModal(true);
+    try {
+      await fetch('/api/stop-server', { method: 'POST' });
+      setStopServerLoading(false);
+    } catch {
+      setStopServerLoading(false);
+    }
+  };
+
   if (!stats) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -2887,6 +2900,21 @@ function MiningDashboardContent() {
           </div>
         )}
       </div>
+      <div className="absolute top-0 right-0 m-6">
+        <Button variant="danger" onClick={handleStopServer} disabled={stopServerLoading}>
+          {stopServerLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4" />} Stop Server Completely
+        </Button>
+      </div>
+      {stopServerModal && (
+        <Modal open onClose={() => setStopServerModal(false)}>
+          <div className="p-6 text-center">
+            <h2 className="text-2xl font-bold mb-4">Server Stopped</h2>
+            <p className="text-lg text-gray-300 mb-2">Both the mining bot and web server have shut down.</p>
+            <p className="text-gray-400">You may now close this browser tab.</p>
+            <Button className="mt-6" onClick={() => window.close()}>Close Tab</Button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
