@@ -796,6 +796,24 @@ function MiningDashboardContent() {
               <Home className="w-4 h-4" />
               Back to Home
             </Button>
+            <Button
+              onClick={() => router.push('/wallet/create')}
+              variant="outline"
+              size="md"
+              className="ml-2"
+            >
+              <Wallet className="w-4 h-4 mr-2" />
+              Change Wallet
+            </Button>
+            <Button
+              onClick={handleStopServer}
+              disabled={stopServerLoading}
+              variant="danger"
+              size="md"
+              className="ml-2"
+            >
+              {stopServerLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4" />} Stop Server Completely
+            </Button>
             {addressCountSetting > (addressesData?.addresses?.length || 0) && (
               <Button
                 onClick={handleFillMissingAddresses}
@@ -2899,11 +2917,6 @@ function MiningDashboardContent() {
             </Card>
           </div>
         )}
-      </div>
-      <div className="absolute top-0 right-0 m-6">
-        <Button variant="danger" onClick={handleStopServer} disabled={stopServerLoading}>
-          {stopServerLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4" />} Stop Server Completely
-        </Button>
       </div>
       {stopServerModal && (
         <Modal
