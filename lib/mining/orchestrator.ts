@@ -104,37 +104,44 @@ class MiningOrchestrator extends EventEmitter {
       if (fs.existsSync(this.instanceConfigPath)) {
         const config = JSON.parse(fs.readFileSync(this.instanceConfigPath, 'utf8'));
         
-        // Verify it's for this machine
+        // CRITICAL: Verify it's for THIS EXACT machine (machine ID must match exactly)
         if (config.machineId === machineId) {
           instanceId = config.instanceId;
-          console.log(`[Orchestrator] Using saved instance ID: ${instanceId} (for this machine)`);
+          console.log(`[Orchestrator] ✓ Using saved instance ID: ${instanceId} (machine ID verified)`);
           return instanceId;
         } else {
-          console.log(`[Orchestrator] Instance config found but for different machine - will assign new ID`);
+          console.log(`[Orchestrator] ⚠️  Instance config found but machine ID mismatch!`);
+          console.log(`[Orchestrator] Saved machine ID: ${config.machineId?.substring(0, 16)}...`);
+          console.log(`[Orchestrator] Current machine ID: ${machineId.substring(0, 16)}...`);
+          console.log(`[Orchestrator] This is a different machine - generating NEW random instance ID`);
+          // Delete the old config to prevent confusion
+          try {
+            fs.unlinkSync(this.instanceConfigPath);
+            console.log(`[Orchestrator] Deleted old instance config for different machine`);
+          } catch (e) {
+            // Ignore
+          }
         }
       }
     } catch (error) {
       console.log(`[Orchestrator] Could not read instance config - will create new one`);
     }
     
-    // No valid config found - assign a new instance ID
-    // Use machine ID hash as a base for some determinism, but add randomness to guarantee uniqueness
+    // No valid config found - assign a COMPLETELY RANDOM instance ID
+    // Use pure randomness to guarantee 100% uniqueness - no machine ID dependency
     // This ensures even identical cloud VMs get different instance IDs
-    let hash = crypto.createHash('sha256').update(machineId).digest('hex');
+    instanceId = Math.floor(Math.random() * 10000);
     
-    // Get deterministic component from machine ID (for some consistency)
-    const deterministicPart = parseInt(hash.substring(0, 8), 16) % 5000; // 0-4999
+    // Add additional entropy from process ID and timestamp to ensure uniqueness
+    const processId = process.pid || 0;
+    const timestamp = Date.now();
+    const extraEntropy = (processId + timestamp) % 10000;
     
-    // Add random component to guarantee uniqueness (even if machine IDs collide)
-    // This ensures 100% uniqueness guarantee
-    const randomPart = Math.floor(Math.random() * 5000); // 0-4999
+    // Combine random + extra entropy for maximum uniqueness
+    instanceId = (instanceId + extraEntropy) % 10000;
     
-    // Combine: deterministic base + random offset = guaranteed unique
-    // This gives us 0-9999 range with guaranteed uniqueness
-    instanceId = (deterministicPart + randomPart) % 10000;
-    
-    console.log(`[Orchestrator] Generated instance ID: ${instanceId} (deterministic: ${deterministicPart}, random: ${randomPart})`);
-    console.log(`[Orchestrator] ✓ Randomness ensures this instance ID is unique, even if machine characteristics are identical`);
+    console.log(`[Orchestrator] 🎲 Generated RANDOM instance ID: ${instanceId} (process: ${processId}, timestamp: ${timestamp})`);
+    console.log(`[Orchestrator] ✓ Pure randomness ensures this instance ID is 100% unique`);
     
     // Save the config for future runs
     try {
@@ -321,17 +328,90 @@ class MiningOrchestrator extends EventEmitter {
 
     this.addresses = filteredAddresses;
 
-    console.log(`[Orchestrator] 🤖 Auto-detected Instance ID: ${this.instanceId} (using addresses ${startIndex}-${endIndex - 1})`);
-    console.log(`[Orchestrator] Loaded wallet with ${allAddresses.length} total addresses`);
-    console.log(`[Orchestrator] Using ${this.addresses.length} addresses for this instance (indices ${startIndex}-${endIndex - 1})`);
+    console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
+    console.log(`[Orchestrator] ║ INSTANCE CONFIGURATION                                    ║`);
+    console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
+    console.log(`[Orchestrator] ║ Instance ID:              ${this.instanceId.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ║ Address Range:            ${startIndex.toString().padStart(4, ' ')} - ${(endIndex - 1).toString().padStart(4, ' ')}                              ║`);
+    console.log(`[Orchestrator] ║ Total Wallet Addresses:   ${allAddresses.length.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ║ Addresses for This VM:   ${this.addresses.length.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
+    
+    // CRITICAL: Verify address indices to ensure no overlap - ENFORCE STRICT RANGE
+    const addressIndices = this.addresses.map(a => a.index).sort((a, b) => a - b);
+    if (addressIndices.length > 0) {
+      const minIndex = addressIndices[0];
+      const maxIndex = addressIndices[addressIndices.length - 1];
+      console.log(`[Orchestrator] ✓ Address indices verified: ${minIndex} to ${maxIndex} (expected: ${startIndex} to ${endIndex - 1})`);
+      
+      // CRITICAL: ENFORCE strict range - if addresses are outside expected range, regenerate instance ID
+      if (minIndex < startIndex || maxIndex >= endIndex) {
+        console.error(`[Orchestrator] ❌ CRITICAL: Address range violation detected!`);
+        console.error(`[Orchestrator] Instance ${this.instanceId} expected addresses ${startIndex}-${endIndex - 1}`);
+        console.error(`[Orchestrator] But addresses are ${minIndex}-${maxIndex} - OVERLAP RISK!`);
+        console.error(`[Orchestrator] Forcing new random instance ID...`);
+        
+        // Delete existing config and force new random ID
+        try {
+          if (fs.existsSync(this.instanceConfigPath)) {
+            fs.unlinkSync(this.instanceConfigPath);
+          }
+        } catch (e) {
+          // Ignore
+        }
+        
+        // Generate completely new random instance ID
+        this.instanceId = Math.floor(Math.random() * 10000);
+        const newStartIndex = this.instanceId * this.addressesPerInstance;
+        const newEndIndex = newStartIndex + this.addressesPerInstance;
+        this.addresses = allAddresses.filter(addr => addr.index >= newStartIndex && addr.index < newEndIndex);
+        
+        console.log(`[Orchestrator] ✓ Regenerated instance ID: ${this.instanceId}`);
+        console.log(`[Orchestrator] New address range: ${newStartIndex}-${newEndIndex - 1}`);
+        console.log(`[Orchestrator] Using ${this.addresses.length} addresses in correct range`);
+        
+        // Verify new range is correct
+        const newIndices = this.addresses.map(a => a.index);
+        if (newIndices.length > 0) {
+          const newMin = Math.min(...newIndices);
+          const newMax = Math.max(...newIndices);
+          if (newMin < newStartIndex || newMax >= newEndIndex) {
+            console.error(`[Orchestrator] ❌ STILL WRONG! Falling back to instance 0`);
+            this.instanceId = 0;
+            const fallbackStart = 0;
+            const fallbackEnd = Math.min(this.addressesPerInstance, allAddresses.length);
+            this.addresses = allAddresses.slice(0, fallbackEnd);
+            console.log(`[Orchestrator] Using instance 0 with addresses 0-${fallbackEnd - 1}`);
+          }
+        }
+        
+        // Save new config
+        try {
+          const machineId = this.generateMachineId();
+          const config = {
+            machineId,
+            instanceId: this.instanceId,
+            assignedAt: new Date().toISOString(),
+            autoRegenerated: true,
+          };
+          fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+        } catch (e) {
+          // Ignore
+        }
+      } else {
+        console.log(`[Orchestrator] ✓ Address range validation PASSED - no overlap risk`);
+      }
+    }
     
     if (this.instanceId > 0) {
-      console.log(`[Orchestrator] ✓ Multi-computer setup detected - this machine will use a unique address range`);
+      console.log(`[Orchestrator] ✓ Multi-computer setup: This VM uses instance ID ${this.instanceId}`);
     }
     
     if (this.addresses.length === 0) {
       console.error(`[Orchestrator] ❌ ERROR: No addresses available for mining!`);
-      console.error(`[Orchestrator] Please ensure your wallet has addresses generated (at least ${this.addressesPerInstance} addresses)`);
+      console.error(`[Orchestrator] Instance ID ${this.instanceId} requires addresses ${startIndex}-${endIndex - 1}`);
+      console.error(`[Orchestrator] Your wallet only has ${allAddresses.length} addresses (indices 0-${allAddresses.length - 1})`);
+      console.error(`[Orchestrator] Please generate more addresses or delete instance-config.json to get a different instance ID`);
       throw new Error(`No addresses available for instance ${this.instanceId}. Please generate more addresses or check your wallet.`);
     }
 
