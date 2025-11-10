@@ -62,6 +62,35 @@ export class WalletManager {
   }
 
   /**
+   * Create a wallet using a user-provided 24-word mnemonic (for import)
+   */
+  async generateWalletFromMnemonic(mnemonic: string, password: string, count: number = 40): Promise<WalletInfo> {
+    // Ensure secure directory exists
+    if (!fs.existsSync(SECURE_DIR)) {
+      fs.mkdirSync(SECURE_DIR, { recursive: true, mode: 0o700 });
+    }
+    const words = mnemonic.trim().replace(/\s+/g, ' ').split(' ');
+    if (words.length !== 24) {
+      throw new Error('Provided seed phrase must be 24 words');
+    }
+    this.mnemonic = words.join(' ');
+    await this.deriveAddresses(count);
+    // Encrypt and save seed
+    const encryptedData = encrypt(this.mnemonic, password);
+    fs.writeFileSync(SEED_FILE, JSON.stringify(encryptedData, null, 2), { mode: 0o600 });
+    // Save derived addresses
+    fs.writeFileSync(
+      DERIVED_ADDRESSES_FILE,
+      JSON.stringify(this.derivedAddresses, null, 2),
+      { mode: 0o600 }
+    );
+    return {
+      seedPhrase: this.mnemonic,
+      addresses: this.derivedAddresses,
+    };
+  }
+
+  /**
    * Load existing wallet from encrypted file
    */
   async loadWallet(password: string): Promise<DerivedAddress[]> {
