@@ -344,6 +344,30 @@ while true; do sleep 600; done
 EOF
 chmod +x setup_internal.sh
 
+# Ensure a working C toolchain is present (cc/gcc/etc)
+if ! command -v cc > /dev/null 2>&1; then
+  echo "Missing C compiler (cc). Attempting to install build tools..."
+  if command -v apt-get > /dev/null 2>&1; then
+    sudo apt-get update && sudo apt-get install -y build-essential
+  elif command -v dnf > /dev/null 2>&1; then
+    sudo dnf groupinstall -y 'Development Tools'
+  elif command -v yum > /dev/null 2>&1; then
+    sudo yum groupinstall -y 'Development Tools'
+  elif command -v zypper > /dev/null 2>&1; then
+    sudo zypper install -t pattern devel_basis
+  elif command -v pacman > /dev/null 2>&1; then
+    sudo pacman -Sy --noconfirm base-devel
+  else
+    echo 'ERROR: Please install build-essential tools for your OS (e.g., gcc, make)' >&2
+    exit 1
+  fi
+  if ! command -v cc > /dev/null 2>&1; then
+    echo 'ERROR: Failed to install a working C compiler (cc). Please install it manually.' >&2
+    exit 1
+  fi
+  echo 'C compiler installed successfully.'
+fi
+
 # Start tmux session running the internal script
 # The ending 'read' helps prevent tmux from immediate exit if anything fails
 # All output is visible in tmux
