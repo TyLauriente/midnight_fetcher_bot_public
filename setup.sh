@@ -17,9 +17,26 @@ set -e  # Exit on error
 SESSION_NAME=midnightbot
 
 if ! command -v tmux &> /dev/null; then
-  echo "Missing dependency: tmux"
-  echo "Please run: sudo apt-get install tmux"
-  exit 1
+  echo "Missing dependency: tmux. Attempting to install..."
+  if command -v apt-get &> /dev/null; then
+    sudo apt-get update && sudo apt-get install -y tmux
+  elif command -v dnf &> /dev/null; then
+    sudo dnf install -y tmux
+  elif command -v yum &> /dev/null; then
+    sudo yum install -y tmux
+  elif command -v zypper &> /dev/null; then
+    sudo zypper install -y tmux
+  elif command -v pacman &> /dev/null; then
+    sudo pacman -Sy --noconfirm tmux
+  else
+    echo "ERROR: Could not auto-install tmux. Please install tmux using your distro's package manager (e.g., apk, emerge, pkg, etc)." >&2
+    exit 1
+  fi
+  if ! command -v tmux &> /dev/null; then
+    echo "ERROR: tmux could not be installed automatically. Please install manually and re-run the script." >&2
+    exit 1
+  fi
+  echo "tmux installed successfully."
 fi
 
 if tmux has-session -t $SESSION_NAME 2>/dev/null; then
@@ -80,36 +97,49 @@ fi
 # ============================================================================
 echo "[1/6] Checking Node.js installation..."
 if ! command -v node &> /dev/null; then
-    echo "Node.js not found. Installing Node.js 20.x..."
-    echo ""
-
-    # Add NodeSource repository
+  echo "Node.js not found. Attempting to install Node.js..."
+  if command -v apt-get &> /dev/null; then
+    # NodeSource preferred for apt
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
     sudo apt-get install -y nodejs
-
-    echo "Node.js installed!"
-    node --version
-    echo ""
+  elif command -v dnf &> /dev/null; then
+    sudo dnf install -y nodejs npm
+  elif command -v yum &> /dev/null; then
+    sudo yum install -y nodejs npm
+  elif command -v zypper &> /dev/null; then
+    sudo zypper install -y nodejs npm
+  elif command -v pacman &> /dev/null; then
+    sudo pacman -Sy --noconfirm nodejs npm
+  else
+    echo "ERROR: Could not auto-install Node.js. Please install Node.js >= 18 manually (see https://nodejs.org)."
+    exit 1
+  fi
+  if ! command -v node &> /dev/null; then
+    echo "ERROR: Node.js could not be installed automatically. Please install manually and re-run the script."
+    exit 1
+  fi
+  echo "Node.js installed!"
+  node --version
 else
-    echo "Node.js found!"
-    node --version
-
-    # Check version
-    NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
-    if [ "$NODE_VERSION" -lt 18 ]; then
-        echo "WARNING: Node.js version is below 18. Version 20.x is recommended."
-        echo "To upgrade, run:"
-        echo "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -"
-        echo "  sudo apt-get install -y nodejs"
-        echo ""
-        read -p "Continue anyway? (y/N) " -n 1 -r
-        echo ""
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    fi
-    echo ""
+  echo "Node.js found!"
+  node --version
 fi
+
+# Check version
+NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+if [ "$NODE_VERSION" -lt 18 ]; then
+    echo "WARNING: Node.js version is below 18. Version 20.x is recommended."
+    echo "To upgrade, run:"
+    echo "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -"
+    echo "  sudo apt-get install -y nodejs"
+    echo ""
+    read -p "Continue anyway? (y/N) " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+echo ""
 
 # ============================================================================
 # Check Rust Installation
