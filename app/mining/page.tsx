@@ -2906,12 +2906,11 @@ function MiningDashboardContent() {
         </Button>
       </div>
       {stopServerModal && (
-        <Modal open onClose={() => setStopServerModal(false)}>
+        <Modal onClose={() => setStopServerModal(false)}>
           <div className="p-6 text-center">
             <h2 className="text-2xl font-bold mb-4">Server Stopped</h2>
             <p className="text-lg text-gray-300 mb-2">Both the mining bot and web server have shut down.</p>
-            <p className="text-gray-400">You may now close this browser tab.</p>
-            <Button className="mt-6" onClick={() => window.close()}>Close Tab</Button>
+            <p className="text-gray-400">You may now close this window or start again.</p>
           </div>
         </Modal>
       )}
