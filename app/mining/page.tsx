@@ -2906,7 +2906,11 @@ function MiningDashboardContent() {
         </Button>
       </div>
       {stopServerModal && (
-        <Modal onClose={() => setStopServerModal(false)}>
+        <Modal
+          isOpen={stopServerModal}
+          onClose={() => setStopServerModal(false)}
+          title="Server Stopped"
+        >
           <div className="p-6 text-center">
             <h2 className="text-2xl font-bold mb-4">Server Stopped</h2>
             <p className="text-lg text-gray-300 mb-2">Both the mining bot and web server have shut down.</p>
