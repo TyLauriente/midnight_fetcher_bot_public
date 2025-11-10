@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from '@/components/ui/input';
 import { Alert } from '@/components/ui/alert';
 import { Lock, Eye, EyeOff, Copy, Check, ShieldAlert, ArrowLeft, Loader2 } from 'lucide-react';
+import { Modal } from '@/components/ui/modal';
 
 export default function CreateWallet() {
   const router = useRouter();
@@ -22,6 +23,8 @@ export default function CreateWallet() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [showReplaceWalletModal, setShowReplaceWalletModal] = useState(false);
+  const [replaceAttempt, setReplaceAttempt] = useState(false);
 
   const handleCreateWallet = async () => {
     if (password !== confirmPassword) {
@@ -48,6 +51,7 @@ export default function CreateWallet() {
         count: addressCount,
       };
       if (mode === 'import') payload.mnemonic = importMnemonic.trim();
+      if (replaceAttempt) payload.replace = true;
       const response = await fetch('/api/wallet/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -55,11 +59,20 @@ export default function CreateWallet() {
       });
       const data = await response.json();
       if (!response.ok) {
+        if (data.error && data.error.includes('Wallet already exists') && !replaceAttempt) {
+          setShowReplaceWalletModal(true);
+          setError(null);
+          return;
+        }
         throw new Error(data.error || 'Failed to create/import wallet');
       }
       setSeedPhrase(data.seedPhrase);
+      setShowReplaceWalletModal(false);
+      setReplaceAttempt(false);
     } catch (err: any) {
       setError(err.message);
+      setShowReplaceWalletModal(false);
+      setReplaceAttempt(false);
     } finally {
       setLoading(false);
     }
@@ -431,6 +444,18 @@ export default function CreateWallet() {
           </div>
         )}
       </div>
+      {showReplaceWalletModal && (
+        <Modal open onClose={() => setShowReplaceWalletModal(false)}>
+          <div className="p-6 text-center">
+            <h2 className="text-xl font-bold text-red-400 mb-4">Replace Existing Wallet?</h2>
+            <p className="mb-3 text-gray-300">A wallet already exists on this computer. If you continue, <b>your old wallet and all previously mined addresses will be permanently deleted.</b> This cannot be undone.</p>
+            <div className="flex gap-6 mt-6 justify-center">
+              <Button variant="ghost" onClick={() => setShowReplaceWalletModal(false)}>Cancel</Button>
+              <Button variant="danger" onClick={() => { setReplaceAttempt(true); setShowReplaceWalletModal(false); handleCreateWallet(); }}>Replace Wallet</Button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

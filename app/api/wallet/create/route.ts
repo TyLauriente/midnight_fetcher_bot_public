@@ -1,9 +1,15 @@
+import fs from 'fs';
+import path from 'path';
 import { NextRequest, NextResponse } from 'next/server';
 import { WalletManager } from '@/lib/wallet/manager';
 
+const SECURE_DIR = path.join(process.cwd(), 'secure');
+const SEED_FILE = path.join(SECURE_DIR, 'wallet-seed.json.enc');
+const DERIVED_ADDRESSES_FILE = path.join(SECURE_DIR, 'derived-addresses.json');
+
 export async function POST(request: NextRequest) {
   try {
-    const { password, count, mnemonic } = await request.json();
+    const { password, count, mnemonic, replace } = await request.json();
 
     if (!password || password.length < 8) {
       return NextResponse.json(
@@ -30,10 +36,22 @@ export async function POST(request: NextRequest) {
     }
     const manager = new WalletManager();
     if (manager.walletExists()) {
-      return NextResponse.json(
-        { error: 'Wallet already exists. Use /api/wallet/load to load it.' },
-        { status: 400 }
-      );
+      if (replace) {
+        try {
+          if (fs.existsSync(SEED_FILE)) fs.unlinkSync(SEED_FILE);
+          if (fs.existsSync(DERIVED_ADDRESSES_FILE)) fs.unlinkSync(DERIVED_ADDRESSES_FILE);
+        } catch (e) {
+          return NextResponse.json(
+            { error: 'Failed to delete existing wallet files.' },
+            { status: 500 }
+          );
+        }
+      } else {
+        return NextResponse.json(
+          { error: 'Wallet already exists. Use /api/wallet/load to load it.' },
+          { status: 400 }
+        );
+      }
     }
     let walletInfo;
     if (mnemonic) {
