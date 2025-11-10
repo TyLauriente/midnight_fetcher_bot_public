@@ -706,6 +706,11 @@ class MiningOrchestrator extends EventEmitter {
         // Reset challenge progress tracking
         this.addressesProcessedCurrentChallenge.clear();
         this.submittedSolutions.clear(); // Clear submitted solutions for new challenge
+        
+        // CRITICAL: Clear all failure counters for new challenge
+        // This ensures addresses can be retried on new challenges even if they failed on previous ones
+        this.addressSubmissionFailures.clear();
+        console.log(`[Orchestrator] Cleared all address failure counters for new challenge`);
 
         // Initialize ROM
         const noPreMine = challenge.challenge.no_pre_mine;
@@ -821,9 +826,11 @@ class MiningOrchestrator extends EventEmitter {
     this.totalHashesComputed = 0;
     this.lastHashRateUpdate = Date.now();
 
-    // Track which addresses we've already attempted to mine for this challenge
-    // This prevents infinite loops if all addresses fail
-    const attemptedAddresses = new Set<string>();
+    // Track addresses that are currently being mined to avoid duplicate work
+    // But allow retries after failures (don't permanently block addresses)
+    const addressesInProgress = new Set<string>();
+    const lastMineAttempt = new Map<string, number>(); // Track when we last tried each address
+    const MIN_RETRY_DELAY = 30000; // Retry failed addresses after 30 seconds
 
     // Mine addresses dynamically - refresh list before each iteration to pick up newly registered addresses
     // This ensures that as addresses finish registering in the background, they automatically become available for mining
@@ -831,22 +838,44 @@ class MiningOrchestrator extends EventEmitter {
       // Dynamically get available addresses (includes newly registered ones)
       const addressesToMine = this.getAvailableAddressesForMining();
 
-      // Filter out addresses we've already attempted (to avoid immediate retries)
-      const newAddressesToMine = addressesToMine.filter(addr => !attemptedAddresses.has(addr.bech32));
+      // Filter out addresses currently being mined, but allow retries after delay
+      const now = Date.now();
+      const newAddressesToMine = addressesToMine.filter(addr => {
+        // Skip if currently being mined
+        if (addressesInProgress.has(addr.bech32)) {
+          return false;
+        }
+        
+        // Allow retry if enough time has passed since last attempt
+        const lastAttempt = lastMineAttempt.get(addr.bech32);
+        if (lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY) {
+          return false;
+        }
+        
+        return true;
+      });
 
       // Log current status
       const registeredCount = this.addresses.filter(a => a.registered).length;
       console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
       console.log(`[Orchestrator] ║ DYNAMIC ADDRESS QUEUE (refreshed each iteration)          ║`);
       console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
+      const addressesInProgressCount = addressesInProgress.size;
+      const addressesWaitingRetry = addressesToMine.filter(addr => {
+        const lastAttempt = lastMineAttempt.get(addr.bech32);
+        return lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY && !addressesInProgress.has(addr.bech32);
+      }).length;
+      
       console.log(`[Orchestrator] ║ Total addresses loaded:        ${this.addresses.length.toString().padStart(3, ' ')}                       ║`);
       console.log(`[Orchestrator] ║ Registered addresses:          ${registeredCount.toString().padStart(3, ' ')}                       ║`);
-      console.log(`[Orchestrator] ║ Available to mine:             ${newAddressesToMine.length.toString().padStart(3, ' ')}                       ║`);
-      console.log(`[Orchestrator] ║ Already attempted:             ${attemptedAddresses.size.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Available to mine:             ${addressesToMine.length.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Ready to mine now:             ${newAddressesToMine.length.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Currently mining:              ${addressesInProgressCount.toString().padStart(3, ' ')}                       ║`);
+      console.log(`[Orchestrator] ║ Waiting for retry:             ${addressesWaitingRetry.toString().padStart(3, ' ')}                       ║`);
       console.log(`[Orchestrator] ║ Challenge ID:                  ${currentChallengeId?.slice(0, 10)}...            ║`);
       console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
 
-      // If no new addresses available, check if we should wait or exit
+      // If no new addresses available, check if we should wait or continue
       if (newAddressesToMine.length === 0) {
         const allRegisteredCount = this.addresses.filter(a => a.registered).length;
         const allAvailableCount = addressesToMine.length;
@@ -855,26 +884,56 @@ class MiningOrchestrator extends EventEmitter {
         if (allAvailableCount === 0 && allRegisteredCount > 0) {
           // All registered addresses have been solved for this challenge
           console.log(`[Orchestrator] ✓ All ${allRegisteredCount} registered addresses have been solved for this challenge`);
-          console.log(`[Orchestrator] Waiting for new challenge or newly registered addresses...`);
+          console.log(`[Orchestrator] Waiting for new challenge...`);
+          // Don't exit - keep polling for new challenges
+          await this.sleep(5000);
+          continue;
+        } else if (addressesInProgressCount > 0) {
+          // Some addresses are currently being mined, wait for them to finish
+          console.log(`[Orchestrator] ⏳ ${addressesInProgressCount} addresses currently being mined, waiting...`);
+          await this.sleep(2000);
+          continue;
+        } else if (addressesWaitingRetry > 0) {
+          // Some addresses are waiting for retry delay
+          const nextRetryIn = Math.min(...Array.from(lastMineAttempt.values()).map(t => Math.max(0, MIN_RETRY_DELAY - (now - t))));
+          console.log(`[Orchestrator] ⏳ ${addressesWaitingRetry} addresses waiting for retry (next retry in ${Math.ceil(nextRetryIn / 1000)}s)`);
+          await this.sleep(Math.min(5000, nextRetryIn + 1000));
+          continue;
         } else if (unregisteredCount > 0) {
           // Some addresses are still being registered
           console.log(`[Orchestrator] ⏳ ${unregisteredCount} addresses still registering...`);
           console.log(`[Orchestrator] Waiting for registration to complete (will automatically pick up new addresses)`);
-          console.log(`[Orchestrator] Currently mining on ${registeredCount} registered addresses`);
+          await this.sleep(5000);
+          continue;
         } else {
-          // All addresses attempted but none available (shouldn't happen normally)
-          console.log(`[Orchestrator] ⚠️  No new addresses available to mine`);
-          console.log(`[Orchestrator] All ${attemptedAddresses.size} attempted addresses processed`);
+          // No addresses available - this shouldn't happen if we have addresses
+          console.log(`[Orchestrator] ⚠️  No addresses available to mine`);
+          console.log(`[Orchestrator] Waiting and will retry...`);
+          await this.sleep(10000);
+          continue;
         }
-
-        // Wait a bit before checking again (allows time for new registrations)
-        await this.sleep(5000);
-        continue;
       }
 
       // Process the next available address
       const addr = newAddressesToMine[0];
-      attemptedAddresses.add(addr.bech32);
+      addressesInProgress.add(addr.bech32);
+      lastMineAttempt.set(addr.bech32, now);
+
+      // CRITICAL: Reset failure counter if we're retrying after delay
+      // This allows addresses to be retried even if they previously failed
+      // Challenge data may have changed (latest_submission updated, etc.)
+      const submissionKey = `${addr.bech32}:${currentChallengeId}`;
+      const lastAttempt = lastMineAttempt.get(addr.bech32);
+      const timeSinceLastAttempt = lastAttempt ? (now - lastAttempt) : 0;
+      
+      // If retrying after delay, clear failure counter to give it a fresh chance
+      if (timeSinceLastAttempt >= MIN_RETRY_DELAY) {
+        const failureCount = this.addressSubmissionFailures.get(submissionKey);
+        if (failureCount && failureCount > 0) {
+          console.log(`[Orchestrator] Retrying address ${addr.index} after delay - clearing previous failure count (${failureCount})`);
+          this.addressSubmissionFailures.delete(submissionKey);
+        }
+      }
 
       // Track submission failures for this address
       const MAX_SUBMISSION_FAILURES = 6;
@@ -908,7 +967,14 @@ class MiningOrchestrator extends EventEmitter {
       );
 
       // Wait for ALL workers to complete (they'll exit when address is solved or max failures reached)
-      await Promise.all(workers);
+      try {
+        await Promise.all(workers);
+      } catch (error) {
+        console.error(`[Orchestrator] Error in workers for address ${addr.index}:`, error);
+      } finally {
+        // Always remove from in-progress set, even if there was an error
+        addressesInProgress.delete(addr.bech32);
+      }
 
       // Check if address was successfully solved
       const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
@@ -916,15 +982,24 @@ class MiningOrchestrator extends EventEmitter {
 
       if (addressSolved) {
         console.log(`[Orchestrator] ✓ Address ${addr.index} SOLVED! Moving to next address...`);
+        // Remove from retry tracking since it's solved
+        lastMineAttempt.delete(addr.bech32);
       } else {
-        console.log(`[Orchestrator] ✗ Address ${addr.index} FAILED after ${MAX_SUBMISSION_FAILURES} attempts. Moving to next address...`);
+        console.log(`[Orchestrator] ✗ Address ${addr.index} FAILED after ${MAX_SUBMISSION_FAILURES} attempts.`);
+        console.log(`[Orchestrator] Will retry this address after ${MIN_RETRY_DELAY / 1000}s (challenge data may have updated)`);
+        // Keep in lastMineAttempt so it can be retried after delay
+        // Don't add back to addressesInProgress - let it retry later
       }
 
-      // After solution submitted or max failures, the 2-second poll will refresh challenge data
-      // Next address will use fresh latest_submission value
+      // After solution submitted or max failures, continue to next address
+      // The 2-second poll will refresh challenge data, and failed addresses will be retried after delay
     }
 
-    this.isMining = false;
+    // Only set isMining to false if we're actually stopping (not just waiting)
+    if (!this.isRunning || this.currentChallengeId !== currentChallengeId) {
+      this.isMining = false;
+      console.log(`[Orchestrator] Mining loop exited: isRunning=${this.isRunning}, challengeChanged=${this.currentChallengeId !== currentChallengeId}`);
+    }
   }
 
   /**
