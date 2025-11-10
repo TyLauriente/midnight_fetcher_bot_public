@@ -17,27 +17,32 @@
 set -e  # Exit on error
 SESSION_NAME=midnightbot
 
-if ! command -v tmux &> /dev/null; then
+# Robust tmux install and detection for all distros and shells
+if command -v tmux > /dev/null 2>&1; then
+  echo "tmux is already installed, continuing..."
+else
   echo "Missing dependency: tmux. Attempting to install..."
-  if command -v apt-get &> /dev/null; then
+  if command -v apt-get > /dev/null 2>&1; then
     sudo apt-get update && sudo apt-get install -y tmux
-  elif command -v dnf &> /dev/null; then
+  elif command -v dnf > /dev/null 2>&1; then
     sudo dnf install -y tmux
-  elif command -v yum &> /dev/null; then
+  elif command -v yum > /dev/null 2>&1; then
     sudo yum install -y tmux
-  elif command -v zypper &> /dev/null; then
+  elif command -v zypper > /dev/null 2>&1; then
     sudo zypper install -y tmux
-  elif command -v pacman &> /dev/null; then
+  elif command -v pacman > /dev/null 2>&1; then
     sudo pacman -Sy --noconfirm tmux
   else
-    echo "ERROR: Could not auto-install tmux. Please install tmux using your distro's package manager (e.g., apk, emerge, pkg, etc)." >&2
+    echo "ERROR: Could not auto-install tmux. Please install tmux using your distro's package manager."
     exit 1
   fi
-  if ! command -v tmux &> /dev/null; then
-    echo "ERROR: tmux could not be installed automatically. Please install manually and re-run the script." >&2
+  # Check again after install attempt
+  if command -v tmux > /dev/null 2>&1; then
+    echo "tmux installed successfully, continuing..."
+  else
+    echo "ERROR: tmux could not be installed. Please install manually and re-run the script."
     exit 1
   fi
-  echo "tmux installed successfully."
 fi
 
 if tmux has-session -t $SESSION_NAME 2>/dev/null; then
