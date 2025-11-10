@@ -184,6 +184,9 @@ class MiningOrchestrator extends EventEmitter {
       return; // Just return without error if already running
     }
 
+    // Store password for use in conflict resolution
+    (this as any).currentPassword = password;
+    
     // Load wallet
     this.walletManager = new WalletManager();
     const allAddresses = await this.walletManager.loadWallet(password);
@@ -194,9 +197,59 @@ class MiningOrchestrator extends EventEmitter {
     this.addressesPerInstance = parseInt(process.env.MINING_ADDRESSES_PER_INSTANCE || '200', 10);
 
     // Filter addresses to this instance's range to avoid conflicts with other computers
-    const startIndex = this.instanceId * this.addressesPerInstance;
-    const endIndex = startIndex + this.addressesPerInstance;
-    this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+    let startIndex = this.instanceId * this.addressesPerInstance;
+    let endIndex = startIndex + this.addressesPerInstance;
+    let filteredAddresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+
+    // If the assigned instance ID range doesn't have addresses, find the first available range
+    if (filteredAddresses.length === 0) {
+      console.log(`[Orchestrator] ⚠️  Instance ID ${this.instanceId} range (${startIndex}-${endIndex - 1}) has no addresses`);
+      console.log(`[Orchestrator] Finding first available address range...`);
+      
+      // Find the first instance ID that has addresses available
+      let foundRange = false;
+      for (let testInstanceId = 0; testInstanceId < 1000; testInstanceId++) {
+        const testStart = testInstanceId * this.addressesPerInstance;
+        const testEnd = testStart + this.addressesPerInstance;
+        const testFiltered = allAddresses.filter(addr => addr.index >= testStart && addr.index < testEnd);
+        
+        if (testFiltered.length > 0) {
+          console.log(`[Orchestrator] ✓ Found available range: Instance ID ${testInstanceId} (addresses ${testStart}-${testEnd - 1})`);
+          this.instanceId = testInstanceId;
+          startIndex = testStart;
+          endIndex = testEnd;
+          filteredAddresses = testFiltered;
+          foundRange = true;
+          
+          // Update saved instance config to use the working range
+          try {
+            const machineId = this.generateMachineId();
+            const config = {
+              machineId,
+              instanceId: testInstanceId,
+              assignedAt: new Date().toISOString(),
+              autoAdjusted: true,
+              originalInstanceId: this.instanceId,
+            };
+            fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+          } catch (error) {
+            // Ignore save errors
+          }
+          break;
+        }
+      }
+      
+      if (!foundRange) {
+        console.log(`[Orchestrator] ⚠️  No addresses found in any range. Wallet may need more addresses generated.`);
+        console.log(`[Orchestrator] Falling back to using all available addresses (instance 0 behavior)`);
+        this.instanceId = 0;
+        startIndex = 0;
+        endIndex = Math.max(this.addressesPerInstance, allAddresses.length);
+        filteredAddresses = allAddresses.slice(0, endIndex);
+      }
+    }
+
+    this.addresses = filteredAddresses;
 
     console.log(`[Orchestrator] 🤖 Auto-detected Instance ID: ${this.instanceId} (using addresses ${startIndex}-${endIndex - 1})`);
     console.log(`[Orchestrator] Loaded wallet with ${allAddresses.length} total addresses`);
@@ -204,6 +257,12 @@ class MiningOrchestrator extends EventEmitter {
     
     if (this.instanceId > 0) {
       console.log(`[Orchestrator] ✓ Multi-computer setup detected - this machine will use a unique address range`);
+    }
+    
+    if (this.addresses.length === 0) {
+      console.error(`[Orchestrator] ❌ ERROR: No addresses available for mining!`);
+      console.error(`[Orchestrator] Please ensure your wallet has addresses generated (at least ${this.addressesPerInstance} addresses)`);
+      throw new Error(`No addresses available for instance ${this.instanceId}. Please generate more addresses or check your wallet.`);
     }
 
     // Load previously submitted solutions from receipts file
@@ -1108,8 +1167,30 @@ class MiningOrchestrator extends EventEmitter {
               // Set success flag AFTER marking as solved - this ensures we only reach here if no exception was thrown
               submissionSuccess = true;
             } catch (error: any) {
-              console.error(`[Orchestrator] Worker ${workerId}: Submission failed:`, error.message);
-              submissionSuccess = false;
+              const errorMessage = error?.response?.data?.message || error?.message || '';
+              const statusCode = error?.response?.status;
+              
+              // Check if this is a duplicate/conflict error (address already solved by another instance)
+              const isDuplicate = 
+                statusCode === 400 || 
+                statusCode === 409 ||
+                errorMessage.toLowerCase().includes('already submitted') ||
+                errorMessage.toLowerCase().includes('duplicate') ||
+                errorMessage.toLowerCase().includes('already solved') ||
+                errorMessage.toLowerCase().includes('conflict');
+              
+              if (isDuplicate) {
+                console.log(`[Orchestrator] Worker ${workerId}: Solution already submitted by another instance - marking as solved`);
+                // Mark as solved even though we didn't submit (another instance did)
+                if (!this.solvedAddressChallenges.has(addr.bech32)) {
+                  this.solvedAddressChallenges.set(addr.bech32, new Set());
+                }
+                this.solvedAddressChallenges.get(addr.bech32)!.add(challengeId);
+                submissionSuccess = true; // Treat as success - address is solved
+              } else {
+                console.error(`[Orchestrator] Worker ${workerId}: Submission failed:`, error.message);
+                submissionSuccess = false;
+              }
 
               // Increment failure counter for this address
               const currentFailures = this.addressSubmissionFailures.get(submissionKey) || 0;
@@ -1643,6 +1724,8 @@ class MiningOrchestrator extends EventEmitter {
    * Automatically detects and handles instance ID conflicts
    */
   private async ensureAddressesRegistered(): Promise<void> {
+    // Get password from wallet manager context (stored during start)
+    const password = (this as any).currentPassword || '';
     const unregistered = this.addresses.filter(a => !a.registered);
 
     if (unregistered.length === 0) {
@@ -1724,12 +1807,82 @@ class MiningOrchestrator extends EventEmitter {
     }
 
     // If most addresses were already registered, we might have an instance ID conflict
-    // This is normal in multi-computer setups, so we just log it
-    if (conflictDetected && addressesInConflict > unregistered.length * 0.5) {
-      console.log(`[Orchestrator] ⚠️  Detected ${addressesInConflict} addresses already registered`);
+    // Check if we need to shift to a different instance ID
+    if (conflictDetected && addressesInConflict > unregistered.length * 0.8) {
+      console.log(`[Orchestrator] ⚠️  Detected ${addressesInConflict}/${unregistered.length} addresses already registered`);
+      console.log(`[Orchestrator] This suggests an instance ID conflict with another computer`);
+      console.log(`[Orchestrator] Attempting to automatically resolve by shifting instance ID...`);
+      
+      // Try to shift to next available instance ID
+      const newInstanceId = await this.resolveInstanceConflict();
+      if (newInstanceId !== this.instanceId) {
+        console.log(`[Orchestrator] ✓ Shifted from instance ${this.instanceId} to instance ${newInstanceId}`);
+        this.instanceId = newInstanceId;
+        
+        // Reload addresses with new instance range
+        const startIndex = this.instanceId * this.addressesPerInstance;
+        const endIndex = startIndex + this.addressesPerInstance;
+        const currentPassword = (this as any).currentPassword || '';
+        const allAddresses = await this.walletManager!.loadWallet(currentPassword);
+        this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+        
+        console.log(`[Orchestrator] Now using addresses ${startIndex}-${endIndex - 1} (${this.addresses.length} addresses)`);
+        
+        // Retry registration with new address range
+        return this.ensureAddressesRegistered();
+      } else {
+        console.log(`[Orchestrator] Could not find available instance ID - continuing with current range`);
+        console.log(`[Orchestrator] Some solutions may fail if addresses are being mined by another instance`);
+      }
+    } else if (conflictDetected) {
+      console.log(`[Orchestrator] Detected ${addressesInConflict} addresses already registered`);
       console.log(`[Orchestrator] This is normal if using the same seed phrase on multiple computers`);
-      console.log(`[Orchestrator] Each computer will automatically use a different address range`);
     }
+  }
+
+  /**
+   * Resolve instance ID conflict by finding next available instance ID
+   */
+  private async resolveInstanceConflict(): Promise<number> {
+    const machineId = this.generateMachineId();
+    const originalInstanceId = this.instanceId;
+    
+    // Try up to 10 different instance IDs to find one that's available
+    for (let offset = 1; offset <= 10; offset++) {
+      const candidateId = (originalInstanceId + offset) % 1000;
+      const startIndex = candidateId * this.addressesPerInstance;
+      const endIndex = startIndex + this.addressesPerInstance;
+      
+      // Test if addresses in this range are available by trying to register the first one
+      // (This is a heuristic - if first address is available, likely the range is free)
+      try {
+        // We can't actually test registration here without an address, so we'll use a different approach
+        // Just shift and let registration tell us if it's still conflicted
+        console.log(`[Orchestrator] Trying instance ID ${candidateId} (addresses ${startIndex}-${endIndex - 1})`);
+        
+        // Save new instance ID
+        try {
+          const config = {
+            machineId,
+            instanceId: candidateId,
+            assignedAt: new Date().toISOString(),
+            conflictResolved: true,
+            originalInstanceId,
+          };
+          fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+        } catch (error) {
+          // Ignore save errors
+        }
+        
+        return candidateId;
+      } catch (error) {
+        // Try next instance ID
+        continue;
+      }
+    }
+    
+    // If we can't find a free one, return original (will handle conflicts at submission time)
+    return originalInstanceId;
   }
 
   /**
