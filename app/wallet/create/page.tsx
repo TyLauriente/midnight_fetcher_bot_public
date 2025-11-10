@@ -445,9 +445,12 @@ export default function CreateWallet() {
         )}
       </div>
       {showReplaceWalletModal && (
-        <Modal onClose={() => setShowReplaceWalletModal(false)}>
+        <Modal
+          isOpen={showReplaceWalletModal}
+          onClose={() => setShowReplaceWalletModal(false)}
+          title="Replace Existing Wallet?"
+        >
           <div className="p-6 text-center">
-            <h2 className="text-xl font-bold text-red-400 mb-4">Replace Existing Wallet?</h2>
             <p className="mb-3 text-gray-300">A wallet already exists on this computer. If you continue, <b>your old wallet and all previously mined addresses will be permanently deleted.</b> This cannot be undone.</p>
             <div className="flex gap-6 mt-6 justify-center">
               <Button variant="ghost" onClick={() => setShowReplaceWalletModal(false)}>Cancel</Button>

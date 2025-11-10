@@ -30,7 +30,7 @@ else
     sudo yum install -y tmux
   elif command -v zypper > /dev/null 2>&1; then
     sudo zypper install -y tmux
-  elif command -v pacman > /dev/null 2>&1; then
+   elif command -v pacman > /dev/null 2>&1; then
     sudo pacman -Sy --noconfirm tmux
   else
     echo "ERROR: Could not auto-install tmux. Please install tmux using your distro's package manager."
@@ -256,6 +256,8 @@ echo ""
 # ============================================================================
 echo "[5/6] Installing project dependencies..."
 npm install
+npm install react react-dom next lucide-react
+npm install --save-dev @types/react @types/react-dom
 echo "Dependencies installed!"
 echo ""
 
