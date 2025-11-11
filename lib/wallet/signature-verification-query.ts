@@ -47,10 +47,11 @@ export class SignatureVerificationQuery {
       });
 
       if (response.data && response.data.message) {
-        this.tandcMessage = response.data.message;
+        const message = response.data.message;
+        this.tandcMessage = message;
         this.tandcMessageFetched = true;
-        console.log(`[SignatureVerification] Fetched T&C message (${this.tandcMessage.length} chars)`);
-        return this.tandcMessage;
+        console.log(`[SignatureVerification] Fetched T&C message (${message.length} chars)`);
+        return message;
       }
 
       throw new Error('T&C message not found in response');

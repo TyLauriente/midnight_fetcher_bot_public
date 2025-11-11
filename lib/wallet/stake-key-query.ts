@@ -322,13 +322,14 @@ export class StakeKeyQuery {
         });
 
         if (response.status === 200 && response.data?.stake_address) {
-          stakeKey = response.data.stake_address;
-          console.log(`[StakeKeyQuery] Found stake key: ${stakeKey}`);
+          const retrievedStakeKey = response.data.stake_address;
+          stakeKey = retrievedStakeKey;
+          console.log(`[StakeKeyQuery] Found stake key: ${retrievedStakeKey}`);
           
           // Query blockchain for all addresses with this stake key
           // NOTE: This only returns addresses that have had ON-CHAIN transactions
           console.log('[StakeKeyQuery] Querying blockchain for addresses with on-chain activity...');
-          blockchainAddresses = await this.getAddressesByStakeKey(stakeKey);
+          blockchainAddresses = await this.getAddressesByStakeKey(retrievedStakeKey);
           console.log(`[StakeKeyQuery] Found ${blockchainAddresses.length} addresses with on-chain activity`);
           
           if (blockchainAddresses.length === 0) {
