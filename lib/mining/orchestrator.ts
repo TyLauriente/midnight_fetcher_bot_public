@@ -32,9 +32,8 @@ class MiningOrchestrator extends EventEmitter {
   private walletManager: WalletManager | null = null;
   private isDevFeeMining = false; // Flag to prevent multiple simultaneous dev fee mining operations
   private addresses: DerivedAddress[] = [];
-  private instanceId: number = 0; // Instance ID for multi-computer setups (0, 1, 2, ...)
-  private addressesPerInstance: number = 200; // Number of addresses per instance
-  private instanceConfigPath: string = path.join(process.cwd(), 'secure', 'instance-config.json');
+  private addressOffset: number = 0; // Address range offset (0 = addresses 0-199, 1 = 200-399, etc.)
+  private addressesPerRange: number = 200; // Number of addresses per range
   private solutionsFound = 0;
   private startTime: number | null = null;
   private isMining = false;
@@ -89,330 +88,47 @@ class MiningOrchestrator extends EventEmitter {
     return this.customBatchSize || 300; // Default BATCH_SIZE
   }
 
-  /**
-   * Automatically detect or assign instance ID based on machine characteristics
-   * This ensures each computer gets a unique, persistent address range
-   */
-  private async detectOrAssignInstanceId(): Promise<number> {
-    // Generate a unique machine identifier
-    const machineId = this.generateMachineId();
-    
-    // Check if we have a saved instance config
-    let instanceId: number;
-    
-    try {
-      if (fs.existsSync(this.instanceConfigPath)) {
-        const config = JSON.parse(fs.readFileSync(this.instanceConfigPath, 'utf8'));
-        
-        // CRITICAL: Verify it's for THIS EXACT machine (machine ID must match exactly)
-        if (config.machineId === machineId) {
-          instanceId = config.instanceId;
-          console.log(`[Orchestrator] ✓ Using saved instance ID: ${instanceId} (machine ID verified)`);
-          return instanceId;
-        } else {
-          console.log(`[Orchestrator] ⚠️  Instance config found but machine ID mismatch!`);
-          console.log(`[Orchestrator] Saved machine ID: ${config.machineId?.substring(0, 16)}...`);
-          console.log(`[Orchestrator] Current machine ID: ${machineId.substring(0, 16)}...`);
-          console.log(`[Orchestrator] This is a different machine - generating NEW random instance ID`);
-          // Delete the old config to prevent confusion
-          try {
-            fs.unlinkSync(this.instanceConfigPath);
-            console.log(`[Orchestrator] Deleted old instance config for different machine`);
-          } catch (e) {
-            // Ignore
-          }
-        }
-      }
-    } catch (error) {
-      console.log(`[Orchestrator] Could not read instance config - will create new one`);
-    }
-    
-    // No valid config found - assign a COMPLETELY RANDOM instance ID
-    // Use pure randomness to guarantee 100% uniqueness - no machine ID dependency
-    // This ensures even identical cloud VMs get different instance IDs
-    instanceId = Math.floor(Math.random() * 10000);
-    
-    // Add additional entropy from process ID and timestamp to ensure uniqueness
-    const processId = process.pid || 0;
-    const timestamp = Date.now();
-    const extraEntropy = (processId + timestamp) % 10000;
-    
-    // Combine random + extra entropy for maximum uniqueness
-    instanceId = (instanceId + extraEntropy) % 10000;
-    
-    console.log(`[Orchestrator] 🎲 Generated RANDOM instance ID: ${instanceId} (process: ${processId}, timestamp: ${timestamp})`);
-    console.log(`[Orchestrator] ✓ Pure randomness ensures this instance ID is 100% unique`);
-    
-    // Save the config for future runs
-    try {
-      const secureDir = path.dirname(this.instanceConfigPath);
-      if (!fs.existsSync(secureDir)) {
-        fs.mkdirSync(secureDir, { recursive: true, mode: 0o700 });
-      }
-      
-      const config = {
-        machineId,
-        instanceId,
-        assignedAt: new Date().toISOString(),
-      };
-      
-      fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-      console.log(`[Orchestrator] ✓ Assigned and saved instance ID: ${instanceId} (machine ID: ${machineId.substring(0, 16)}...)`);
-    } catch (error) {
-      console.warn(`[Orchestrator] Could not save instance config: ${error}`);
-    }
-    
-    return instanceId;
-  }
-
-  /**
-   * Generate a unique machine identifier using multiple entropy sources
-   * Enhanced for cloud VMs which may have similar hostnames/MACs
-   */
-  private generateMachineId(): string {
-    const hostname = os.hostname();
-    const networkInterfaces = os.networkInterfaces();
-    const cpus = os.cpus();
-    const platform = os.platform();
-    const arch = os.arch();
-    const totalMemory = os.totalmem();
-    
-    // Collect MAC addresses from network interfaces
-    const macAddresses: string[] = [];
-    const ipAddresses: string[] = [];
-    for (const iface of Object.values(networkInterfaces)) {
-      if (iface) {
-        for (const addr of iface) {
-          if (addr.mac && addr.mac !== '00:00:00:00:00:00') {
-            macAddresses.push(addr.mac);
-          }
-          if (addr.address && !addr.address.startsWith('127.') && !addr.address.startsWith('::1')) {
-            ipAddresses.push(addr.address);
-          }
-        }
-      }
-    }
-    
-    // Sort for consistency
-    macAddresses.sort();
-    ipAddresses.sort();
-    
-    // Get CPU model (often unique per VM instance)
-    const cpuModel = cpus[0]?.model || 'unknown';
-    const cpuCount = cpus.length;
-    
-    // Try to get system UUID (if available on Linux)
-    let systemUuid = '';
-    try {
-      if (platform === 'linux') {
-        // Try to read machine-id (systemd) or product_uuid
-        const machineIdPath = '/etc/machine-id';
-        const productUuidPath = '/sys/class/dmi/id/product_uuid';
-        
-        if (fs.existsSync(machineIdPath)) {
-          systemUuid = fs.readFileSync(machineIdPath, 'utf8').trim();
-        } else if (fs.existsSync(productUuidPath)) {
-          systemUuid = fs.readFileSync(productUuidPath, 'utf8').trim();
-        }
-      }
-    } catch (error) {
-      // Ignore - not critical
-    }
-    
-    // Combine multiple entropy sources for maximum uniqueness
-    // This ensures cloud VMs with similar configs still get unique IDs
-    const machineData = [
-      hostname,
-      macAddresses.join(','),
-      ipAddresses.join(','),
-      cpuModel,
-      cpuCount.toString(),
-      totalMemory.toString(),
-      platform,
-      arch,
-      systemUuid,
-      // Add process-specific entropy (PID at startup, but this changes, so we'll use a hash of the secure dir)
-      // Use the existence and modification time of secure directory as additional entropy
-      (() => {
-        try {
-          const secureDir = path.join(process.cwd(), 'secure');
-          if (fs.existsSync(secureDir)) {
-            const stats = fs.statSync(secureDir);
-            return stats.ino?.toString() || stats.dev?.toString() || '';
-          }
-        } catch {
-          return '';
-        }
-        return '';
-      })(),
-    ].filter(Boolean).join('|');
-    
-    const machineId = crypto.createHash('sha256').update(machineData).digest('hex');
-    
-    return machineId;
-  }
 
   /**
    * Start mining with loaded wallet
+   * @param password - Wallet password
+   * @param addressOffset - Address range offset (0 = addresses 0-199, 1 = 200-399, etc.)
    */
-  async start(password: string): Promise<void> {
+  async start(password: string, addressOffset: number = 0): Promise<void> {
     if (this.isRunning) {
       console.log('[Orchestrator] Mining already running, returning current state');
       return; // Just return without error if already running
     }
 
-    // Store password for use in conflict resolution
+    // Store password for address registration
     (this as any).currentPassword = password;
+    
+    // Set address offset (default 0)
+    this.addressOffset = addressOffset;
+    this.addressesPerRange = parseInt(process.env.MINING_ADDRESSES_PER_RANGE || '200', 10);
     
     // Load wallet
     this.walletManager = new WalletManager();
     const allAddresses = await this.walletManager.loadWallet(password);
 
-    // Automatically detect and assign instance ID based on machine characteristics
-    // This ensures each computer gets a unique address range without manual configuration
-    this.instanceId = await this.detectOrAssignInstanceId();
-    this.addressesPerInstance = parseInt(process.env.MINING_ADDRESSES_PER_INSTANCE || '200', 10);
-
-    // Filter addresses to this instance's range to avoid conflicts with other computers
-    let startIndex = this.instanceId * this.addressesPerInstance;
-    let endIndex = startIndex + this.addressesPerInstance;
-    let filteredAddresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
-
-    // If the assigned instance ID range doesn't have addresses, find the first available range
-    if (filteredAddresses.length === 0) {
-      console.log(`[Orchestrator] ⚠️  Instance ID ${this.instanceId} range (${startIndex}-${endIndex - 1}) has no addresses`);
-      console.log(`[Orchestrator] Finding first available address range...`);
-      
-      // Find the first instance ID that has addresses available
-      let foundRange = false;
-      for (let testInstanceId = 0; testInstanceId < 10000; testInstanceId++) {
-        const testStart = testInstanceId * this.addressesPerInstance;
-        const testEnd = testStart + this.addressesPerInstance;
-        const testFiltered = allAddresses.filter(addr => addr.index >= testStart && addr.index < testEnd);
-        
-        if (testFiltered.length > 0) {
-          console.log(`[Orchestrator] ✓ Found available range: Instance ID ${testInstanceId} (addresses ${testStart}-${testEnd - 1})`);
-          this.instanceId = testInstanceId;
-          startIndex = testStart;
-          endIndex = testEnd;
-          filteredAddresses = testFiltered;
-          foundRange = true;
-          
-          // Update saved instance config to use the working range
-          try {
-            const machineId = this.generateMachineId();
-            const config = {
-              machineId,
-              instanceId: testInstanceId,
-              assignedAt: new Date().toISOString(),
-              autoAdjusted: true,
-              originalInstanceId: this.instanceId,
-            };
-            fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-          } catch (error) {
-            // Ignore save errors
-          }
-          break;
-        }
-      }
-      
-      if (!foundRange) {
-        console.log(`[Orchestrator] ⚠️  No addresses found in any range. Wallet may need more addresses generated.`);
-        console.log(`[Orchestrator] Falling back to using all available addresses (instance 0 behavior)`);
-        this.instanceId = 0;
-        startIndex = 0;
-        endIndex = Math.max(this.addressesPerInstance, allAddresses.length);
-        filteredAddresses = allAddresses.slice(0, endIndex);
-      }
-    }
-
-    this.addresses = filteredAddresses;
+    // Filter addresses to the specified range (deterministic - always same addresses for same offset)
+    const startIndex = this.addressOffset * this.addressesPerRange;
+    const endIndex = startIndex + this.addressesPerRange;
+    this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
 
     console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
-    console.log(`[Orchestrator] ║ INSTANCE CONFIGURATION                                    ║`);
+    console.log(`[Orchestrator] ║ ADDRESS RANGE CONFIGURATION                               ║`);
     console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
-    console.log(`[Orchestrator] ║ Instance ID:              ${this.instanceId.toString().padStart(4, ' ')}                                    ║`);
-    console.log(`[Orchestrator] ║ Address Range:            ${startIndex.toString().padStart(4, ' ')} - ${(endIndex - 1).toString().padStart(4, ' ')}                              ║`);
-    console.log(`[Orchestrator] ║ Total Wallet Addresses:   ${allAddresses.length.toString().padStart(4, ' ')}                                    ║`);
-    console.log(`[Orchestrator] ║ Addresses for This VM:   ${this.addresses.length.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ║ Address Offset:            ${this.addressOffset.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ║ Address Range:             ${startIndex.toString().padStart(4, ' ')} - ${(endIndex - 1).toString().padStart(4, ' ')}                              ║`);
+    console.log(`[Orchestrator] ║ Total Wallet Addresses:    ${allAddresses.length.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ║ Addresses for This Miner:  ${this.addresses.length.toString().padStart(4, ' ')}                                    ║`);
     console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
     
-    // CRITICAL: Verify address indices to ensure no overlap - ENFORCE STRICT RANGE
-    const addressIndices = this.addresses.map(a => a.index).sort((a, b) => a - b);
-    if (addressIndices.length > 0) {
-      const minIndex = addressIndices[0];
-      const maxIndex = addressIndices[addressIndices.length - 1];
-      console.log(`[Orchestrator] ✓ Address indices verified: ${minIndex} to ${maxIndex} (expected: ${startIndex} to ${endIndex - 1})`);
-      
-      // CRITICAL: ENFORCE strict range - if addresses are outside expected range, regenerate instance ID
-      if (minIndex < startIndex || maxIndex >= endIndex) {
-        console.error(`[Orchestrator] ❌ CRITICAL: Address range violation detected!`);
-        console.error(`[Orchestrator] Instance ${this.instanceId} expected addresses ${startIndex}-${endIndex - 1}`);
-        console.error(`[Orchestrator] But addresses are ${minIndex}-${maxIndex} - OVERLAP RISK!`);
-        console.error(`[Orchestrator] Forcing new random instance ID...`);
-        
-        // Delete existing config and force new random ID
-        try {
-          if (fs.existsSync(this.instanceConfigPath)) {
-            fs.unlinkSync(this.instanceConfigPath);
-          }
-        } catch (e) {
-          // Ignore
-        }
-        
-        // Generate completely new random instance ID
-        this.instanceId = Math.floor(Math.random() * 10000);
-        const newStartIndex = this.instanceId * this.addressesPerInstance;
-        const newEndIndex = newStartIndex + this.addressesPerInstance;
-        this.addresses = allAddresses.filter(addr => addr.index >= newStartIndex && addr.index < newEndIndex);
-        
-        console.log(`[Orchestrator] ✓ Regenerated instance ID: ${this.instanceId}`);
-        console.log(`[Orchestrator] New address range: ${newStartIndex}-${newEndIndex - 1}`);
-        console.log(`[Orchestrator] Using ${this.addresses.length} addresses in correct range`);
-        
-        // Verify new range is correct
-        const newIndices = this.addresses.map(a => a.index);
-        if (newIndices.length > 0) {
-          const newMin = Math.min(...newIndices);
-          const newMax = Math.max(...newIndices);
-          if (newMin < newStartIndex || newMax >= newEndIndex) {
-            console.error(`[Orchestrator] ❌ STILL WRONG! Falling back to instance 0`);
-            this.instanceId = 0;
-            const fallbackStart = 0;
-            const fallbackEnd = Math.min(this.addressesPerInstance, allAddresses.length);
-            this.addresses = allAddresses.slice(0, fallbackEnd);
-            console.log(`[Orchestrator] Using instance 0 with addresses 0-${fallbackEnd - 1}`);
-          }
-        }
-        
-        // Save new config
-        try {
-          const machineId = this.generateMachineId();
-          const config = {
-            machineId,
-            instanceId: this.instanceId,
-            assignedAt: new Date().toISOString(),
-            autoRegenerated: true,
-          };
-          fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-        } catch (e) {
-          // Ignore
-        }
-      } else {
-        console.log(`[Orchestrator] ✓ Address range validation PASSED - no overlap risk`);
-      }
-    }
-    
-    if (this.instanceId > 0) {
-      console.log(`[Orchestrator] ✓ Multi-computer setup: This VM uses instance ID ${this.instanceId}`);
-    }
-    
     if (this.addresses.length === 0) {
-      console.error(`[Orchestrator] ❌ ERROR: No addresses available for mining!`);
-      console.error(`[Orchestrator] Instance ID ${this.instanceId} requires addresses ${startIndex}-${endIndex - 1}`);
-      console.error(`[Orchestrator] Your wallet only has ${allAddresses.length} addresses (indices 0-${allAddresses.length - 1})`);
-      console.error(`[Orchestrator] Please generate more addresses or delete instance-config.json to get a different instance ID`);
-      throw new Error(`No addresses available for instance ${this.instanceId}. Please generate more addresses or check your wallet.`);
+      console.warn(`[Orchestrator] ⚠️  No addresses found in range ${startIndex}-${endIndex - 1}`);
+      console.warn(`[Orchestrator] Wallet may need more addresses generated, or offset ${this.addressOffset} is out of range`);
+      throw new Error(`No addresses available for offset ${this.addressOffset} (range ${startIndex}-${endIndex - 1}). Please generate more addresses or use a different offset.`);
     }
 
     // Load previously submitted solutions from receipts file
@@ -447,7 +163,7 @@ class MiningOrchestrator extends EventEmitter {
     this.pollLoop();
 
     // Schedule hourly restart to clean workers and reset state
-    this.scheduleHourlyRestart(password);
+    this.scheduleHourlyRestart(password, addressOffset);
 
     this.emit('status', {
       type: 'status',
@@ -484,8 +200,10 @@ class MiningOrchestrator extends EventEmitter {
   /**
    * Reinitialize the orchestrator - called when start button is clicked
    * This ensures fresh state and kicks off mining again
+   * @param password - Wallet password
+   * @param addressOffset - Address range offset (0 = addresses 0-199, 1 = 200-399, etc.)
    */
-  async reinitialize(password: string): Promise<void> {
+  async reinitialize(password: string, addressOffset: number = 0): Promise<void> {
     console.log('[Orchestrator] Reinitializing orchestrator...');
 
     // Stop current mining if running
@@ -503,8 +221,8 @@ class MiningOrchestrator extends EventEmitter {
 
     console.log('[Orchestrator] Reinitialization complete, starting fresh mining session...');
 
-    // Start fresh
-    await this.start(password);
+    // Start fresh with address offset
+    await this.start(password, addressOffset);
   }
 
   /**
@@ -2031,102 +1749,12 @@ class MiningOrchestrator extends EventEmitter {
       }
     }
 
-    // If most addresses were already registered, we might have an instance ID conflict
-    // Check if we need to shift to a different instance ID
-    if (conflictDetected && addressesInConflict > unregistered.length * 0.8) {
-      console.log(`[Orchestrator] ⚠️  Detected ${addressesInConflict}/${unregistered.length} addresses already registered`);
-      console.log(`[Orchestrator] This suggests an instance ID conflict with another computer`);
-      console.log(`[Orchestrator] Attempting to automatically resolve by shifting instance ID...`);
-      
-      // Try to shift to next available instance ID
-      const newInstanceId = await this.resolveInstanceConflict();
-      if (newInstanceId !== this.instanceId) {
-        console.log(`[Orchestrator] ✓ Shifted from instance ${this.instanceId} to instance ${newInstanceId}`);
-        this.instanceId = newInstanceId;
-        
-        // Reload addresses with new instance range
-        const startIndex = this.instanceId * this.addressesPerInstance;
-        const endIndex = startIndex + this.addressesPerInstance;
-        const currentPassword = (this as any).currentPassword || '';
-        const allAddresses = await this.walletManager!.loadWallet(currentPassword);
-        this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
-        
-        console.log(`[Orchestrator] Now using addresses ${startIndex}-${endIndex - 1} (${this.addresses.length} addresses)`);
-        
-        // Retry registration with new address range
-        return this.ensureAddressesRegistered();
-      } else {
-        console.log(`[Orchestrator] Could not find available instance ID - continuing with current range`);
-        console.log(`[Orchestrator] Some solutions may fail if addresses are being mined by another instance`);
-      }
-    } else if (conflictDetected) {
+    // Note: If addresses are already registered, that's fine - just means another miner is using this range
+    if (conflictDetected) {
       console.log(`[Orchestrator] Detected ${addressesInConflict} addresses already registered`);
-      console.log(`[Orchestrator] This is normal if using the same seed phrase on multiple computers`);
+      console.log(`[Orchestrator] This is normal if using the same address range on multiple miners`);
+      console.log(`[Orchestrator] Each address can only solve once per challenge, so miners will coordinate automatically`);
     }
-  }
-
-  /**
-   * Resolve instance ID conflict by finding next available instance ID
-   */
-  private async resolveInstanceConflict(): Promise<number> {
-    const machineId = this.generateMachineId();
-    const originalInstanceId = this.instanceId;
-    
-    // Try up to 50 different instance IDs to find one that's available
-    // Use a wider search to avoid collisions in cloud environments
-    for (let offset = 1; offset <= 50; offset++) {
-      // Try both forward and backward offsets to find available range
-      const forwardId = (originalInstanceId + offset) % 10000;
-      const backwardId = (originalInstanceId - offset + 10000) % 10000;
-      
-      // Try forward first, then backward
-      for (const candidateId of [forwardId, backwardId]) {
-        const startIndex = candidateId * this.addressesPerInstance;
-        const endIndex = startIndex + this.addressesPerInstance;
-        
-        console.log(`[Orchestrator] Trying instance ID ${candidateId} (addresses ${startIndex}-${endIndex - 1})`);
-        
-        // Save new instance ID (we'll test it during registration)
-        try {
-          const config = {
-            machineId,
-            instanceId: candidateId,
-            assignedAt: new Date().toISOString(),
-            conflictResolved: true,
-            originalInstanceId,
-            attempt: offset,
-          };
-          fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-        } catch (error) {
-          // Ignore save errors
-        }
-        
-        // Return this candidate - registration will tell us if it's still conflicted
-        return candidateId;
-      }
-    }
-    
-    // If we can't find a free one, generate a completely new random instance ID
-    // This is a last resort to avoid collisions
-    console.log(`[Orchestrator] Could not find nearby available instance ID, generating random one...`);
-    const randomId = Math.floor(Math.random() * 10000);
-    console.log(`[Orchestrator] Generated random instance ID: ${randomId}`);
-    
-    try {
-      const config = {
-        machineId,
-        instanceId: randomId,
-        assignedAt: new Date().toISOString(),
-        conflictResolved: true,
-        originalInstanceId,
-        randomFallback: true,
-      };
-      fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-    } catch (error) {
-      // Ignore save errors
-    }
-    
-    return randomId;
   }
 
   /**
@@ -2188,7 +1816,7 @@ class MiningOrchestrator extends EventEmitter {
   /**
    * Schedule hourly restart to clean workers and prepare for new challenges
    */
-  private scheduleHourlyRestart(password: string): void {
+  private scheduleHourlyRestart(password: string, addressOffset: number): void {
     // Calculate milliseconds until the end of the current hour
     const now = new Date();
     const nextHour = new Date(now);
@@ -2272,7 +1900,7 @@ class MiningOrchestrator extends EventEmitter {
         }
 
         // Schedule next hourly restart
-        this.scheduleHourlyRestart(password);
+        this.scheduleHourlyRestart(password, addressOffset);
 
       } catch (error: any) {
         console.error('[Orchestrator] Hourly restart failed:', error.message);
@@ -2281,7 +1909,7 @@ class MiningOrchestrator extends EventEmitter {
           this.startMining();
         }
         // Still schedule next restart
-        this.scheduleHourlyRestart(password);
+        this.scheduleHourlyRestart(password, addressOffset);
       }
     }, msUntilNextHour);
   }

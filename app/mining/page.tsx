@@ -98,6 +98,7 @@ interface HistoryData {
 function MiningDashboardContent() {
   const router = useRouter();
   const [password, setPassword] = useState<string | null>(null);
+  const [addressOffset, setAddressOffset] = useState<number>(0); // Address range offset (0 = 0-199, 1 = 200-399, etc.)
 
   const [stats, setStats] = useState<MiningStats | null>(null);
   const [loading, setLoading] = useState(false);
@@ -371,11 +372,11 @@ function MiningDashboardContent() {
     setIsRegistering(true);
 
     try {
-      addLog('Loading wallet addresses...', 'info');
+      addLog(`Loading wallet addresses with offset ${addressOffset} (range ${addressOffset * 200}-${(addressOffset + 1) * 200 - 1})...`, 'info');
       const response = await fetch('/api/mining/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ password, addressOffset }),
       });
 
       const data = await response.json();
@@ -744,7 +745,27 @@ function MiningDashboardContent() {
               )}
             </div>
           </div>
-          <div className="flex gap-3">
+          <div className="flex gap-3 items-center flex-wrap">
+            {!stats.active && (
+              <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded border border-gray-700">
+                <label htmlFor="addressOffset" className="text-sm text-gray-300 whitespace-nowrap">
+                  Address Range:
+                </label>
+                <input
+                  id="addressOffset"
+                  type="number"
+                  min="0"
+                  value={addressOffset}
+                  onChange={(e) => setAddressOffset(Math.max(0, parseInt(e.target.value) || 0))}
+                  className="w-16 px-2 py-1 text-sm border border-gray-600 rounded bg-gray-900 text-white text-center"
+                  placeholder="0"
+                  title="Address range offset: 0 = addresses 0-199, 1 = 200-399, 2 = 400-599, etc."
+                />
+                <span className="text-xs text-gray-400 whitespace-nowrap">
+                  ({addressOffset * 200}-{(addressOffset + 1) * 200 - 1})
+                </span>
+              </div>
+            )}
             {!stats.active ? (
               <Button
                 onClick={handleStartMining}
