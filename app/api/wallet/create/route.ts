@@ -17,7 +17,7 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
-    const walletCount = count || 40;
+    const walletCount = count || 200; // Default to 200 addresses for mining (supports offset 0 by default)
     if (walletCount < 1 || walletCount > 50000) {
       return NextResponse.json(
         { error: 'Wallet count must be between 1 and 50000' },

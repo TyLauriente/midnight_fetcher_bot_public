@@ -111,24 +111,47 @@ class MiningOrchestrator extends EventEmitter {
     this.walletManager = new WalletManager();
     const allAddresses = await this.walletManager.loadWallet(password);
 
-    // Filter addresses to the specified range (deterministic - always same addresses for same offset)
+    // Calculate required address count for the selected offset
     const startIndex = this.addressOffset * this.addressesPerRange;
     const endIndex = startIndex + this.addressesPerRange;
-    this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+    const requiredAddressCount = endIndex; // Need addresses up to endIndex (exclusive)
+    
+    let finalAddressCount = allAddresses.length;
+    
+    // Check if we have enough addresses, if not, automatically expand
+    if (allAddresses.length < requiredAddressCount) {
+      console.log(`[Orchestrator] Wallet has ${allAddresses.length} addresses, but offset ${this.addressOffset} requires ${requiredAddressCount} addresses`);
+      console.log(`[Orchestrator] Automatically expanding wallet to ${requiredAddressCount} addresses...`);
+      
+      try {
+        await this.walletManager.expandAddresses(password, requiredAddressCount);
+        console.log(`[Orchestrator] ✓ Successfully expanded wallet to ${requiredAddressCount} addresses`);
+        
+        // Reload addresses after expansion
+        const expandedAddresses = await this.walletManager.loadWallet(password);
+        finalAddressCount = expandedAddresses.length;
+        this.addresses = expandedAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+      } catch (error: any) {
+        console.error(`[Orchestrator] Failed to expand addresses:`, error);
+        throw new Error(`Failed to generate required addresses. Offset ${this.addressOffset} requires ${requiredAddressCount} addresses, but wallet only has ${allAddresses.length}. Error: ${error.message}`);
+      }
+    } else {
+      // Filter addresses to the specified range (deterministic - always same addresses for same offset)
+      this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
+    }
 
     console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
     console.log(`[Orchestrator] ║ ADDRESS RANGE CONFIGURATION                               ║`);
     console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
     console.log(`[Orchestrator] ║ Address Offset:            ${this.addressOffset.toString().padStart(4, ' ')}                                    ║`);
     console.log(`[Orchestrator] ║ Address Range:             ${startIndex.toString().padStart(4, ' ')} - ${(endIndex - 1).toString().padStart(4, ' ')}                              ║`);
-    console.log(`[Orchestrator] ║ Total Wallet Addresses:    ${allAddresses.length.toString().padStart(4, ' ')}                                    ║`);
+    console.log(`[Orchestrator] ║ Total Wallet Addresses:    ${finalAddressCount.toString().padStart(4, ' ')}                                    ║`);
     console.log(`[Orchestrator] ║ Addresses for This Miner:  ${this.addresses.length.toString().padStart(4, ' ')}                                    ║`);
     console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
     
     if (this.addresses.length === 0) {
-      console.warn(`[Orchestrator] ⚠️  No addresses found in range ${startIndex}-${endIndex - 1}`);
-      console.warn(`[Orchestrator] Wallet may need more addresses generated, or offset ${this.addressOffset} is out of range`);
-      throw new Error(`No addresses available for offset ${this.addressOffset} (range ${startIndex}-${endIndex - 1}). Please generate more addresses or use a different offset.`);
+      console.error(`[Orchestrator] ❌ No addresses found in range ${startIndex}-${endIndex - 1} after expansion`);
+      throw new Error(`No addresses available for offset ${this.addressOffset} (range ${startIndex}-${endIndex - 1}). This should not happen after automatic expansion.`);
     }
 
     // Load previously submitted solutions from receipts file

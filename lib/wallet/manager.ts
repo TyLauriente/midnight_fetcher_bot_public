@@ -26,7 +26,7 @@ export class WalletManager {
   /**
    * Generate a new wallet with 24-word seed phrase
    */
-  async generateWallet(password: string, count: number = 40): Promise<WalletInfo> {
+  async generateWallet(password: string, count: number = 200): Promise<WalletInfo> {
     // Ensure secure directory exists
     if (!fs.existsSync(SECURE_DIR)) {
       fs.mkdirSync(SECURE_DIR, { recursive: true, mode: 0o700 });
@@ -64,7 +64,7 @@ export class WalletManager {
   /**
    * Create a wallet using a user-provided 24-word mnemonic (for import)
    */
-  async generateWalletFromMnemonic(mnemonic: string, password: string, count: number = 40): Promise<WalletInfo> {
+  async generateWalletFromMnemonic(mnemonic: string, password: string, count: number = 200): Promise<WalletInfo> {
     // Ensure secure directory exists
     if (!fs.existsSync(SECURE_DIR)) {
       fs.mkdirSync(SECURE_DIR, { recursive: true, mode: 0o700 });
