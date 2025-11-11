@@ -86,11 +86,69 @@ export default function CreateWallet() {
     router.push('/wallet/load');
   };
 
-  const handleCopy = async () => {
-    if (seedPhrase) {
-      await navigator.clipboard.writeText(seedPhrase);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+  const handleCopy = async (e?: React.MouseEvent) => {
+    // Prevent any default behavior
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+
+    if (!seedPhrase) {
+      console.error('No seed phrase to copy');
+      setError('No seed phrase to copy');
+      return;
+    }
+
+    console.log('Copy button clicked, seed phrase length:', seedPhrase.length);
+
+    try {
+      // Try modern clipboard API first (requires secure context - HTTPS or localhost)
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        console.log('Using modern clipboard API');
+        await navigator.clipboard.writeText(seedPhrase);
+        console.log('Successfully copied to clipboard');
+        setCopied(true);
+        setError(null); // Clear any previous errors
+        setTimeout(() => setCopied(false), 2000);
+      } else {
+        // Fallback for older browsers or non-secure contexts
+        console.log('Using fallback copy method');
+        const textArea = document.createElement('textarea');
+        textArea.value = seedPhrase;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        textArea.style.top = '-999999px';
+        textArea.style.opacity = '0';
+        textArea.setAttribute('readonly', '');
+        document.body.appendChild(textArea);
+        
+        // Select the text
+        textArea.select();
+        textArea.setSelectionRange(0, seedPhrase.length);
+        
+        try {
+          const successful = document.execCommand('copy');
+          if (successful) {
+            console.log('Successfully copied using fallback method');
+            setCopied(true);
+            setError(null); // Clear any previous errors
+            setTimeout(() => setCopied(false), 2000);
+          } else {
+            throw new Error('Copy command failed');
+          }
+        } catch (fallbackError: any) {
+          console.error('Fallback copy failed:', fallbackError);
+          throw new Error(`Fallback copy failed: ${fallbackError.message}`);
+        } finally {
+          document.body.removeChild(textArea);
+        }
+      }
+    } catch (err: any) {
+      console.error('Failed to copy seed phrase:', err);
+      const errorMessage = err.message || 'Unknown error';
+      setError(`Failed to copy to clipboard: ${errorMessage}. Please manually select and copy the seed phrase above.`);
+      // Don't set copied state on error
+      setCopied(false);
     }
   };
 
@@ -154,13 +212,20 @@ export default function CreateWallet() {
                     className="bg-gray-700/50 border border-gray-600 p-3 rounded-lg hover:bg-gray-700 transition-colors"
                   >
                     <span className="text-gray-400 text-xs mr-2 font-medium">{index + 1}.</span>
-                    <span className="font-mono font-semibold text-white">{word}</span>
+                    <span className="font-mono font-semibold text-white select-text">{word}</span>
                   </div>
                 ))}
               </div>
 
+              {/* Also show the full seed phrase as selectable text for manual copying */}
+              <div className="mb-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+                <p className="text-xs text-gray-400 mb-2">Full seed phrase (selectable):</p>
+                <p className="font-mono text-sm text-white break-words select-all cursor-text">{seedPhrase}</p>
+              </div>
+
               <Button
-                onClick={handleCopy}
+                type="button"
+                onClick={(e) => handleCopy(e)}
                 variant={copied ? 'success' : 'secondary'}
                 size="lg"
                 className="w-full"
@@ -380,13 +445,20 @@ export default function CreateWallet() {
                       className="bg-gray-700/50 border border-gray-600 p-3 rounded-lg hover:bg-gray-700 transition-colors"
                     >
                       <span className="text-gray-400 text-xs mr-2 font-medium">{index + 1}.</span>
-                      <span className="font-mono font-semibold text-white">{word}</span>
+                      <span className="font-mono font-semibold text-white select-text">{word}</span>
                     </div>
                   ))}
                 </div>
 
+                {/* Also show the full seed phrase as selectable text for manual copying */}
+                <div className="mb-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+                  <p className="text-xs text-gray-400 mb-2">Full seed phrase (selectable):</p>
+                  <p className="font-mono text-sm text-white break-words select-all cursor-text">{seedPhrase}</p>
+                </div>
+
                 <Button
-                  onClick={handleCopy}
+                  type="button"
+                  onClick={(e) => handleCopy(e)}
                   variant={copied ? 'success' : 'secondary'}
                   size="lg"
                   className="w-full"
