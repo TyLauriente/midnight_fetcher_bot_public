@@ -434,8 +434,8 @@ function MiningDashboardContent() {
         setStats(data.stats);
         // Load persisted config (offset, workers, batch size)
         if (data.config) {
-          if (data.config.addressOffset !== undefined && !stats?.active) {
-            // Only update offset if mining is not active (to avoid conflicts)
+          // Always update offset from config (it's read-only when mining is active)
+          if (data.config.addressOffset !== undefined) {
             setAddressOffset(data.config.addressOffset);
           }
           // Workers and batch size are loaded from scale tab
@@ -915,39 +915,48 @@ function MiningDashboardContent() {
             </div>
           </div>
           <div className="flex gap-3 items-center flex-wrap">
-            {!stats.active && (
-              <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded border border-gray-700">
-                <label htmlFor="addressOffset" className="text-sm text-gray-300 whitespace-nowrap">
-                  Address Range:
-                </label>
-                <input
-                  id="addressOffset"
-                  type="number"
-                  min="0"
-                  value={addressOffset}
-                  onChange={async (e) => {
-                    const newOffset = Math.max(0, parseInt(e.target.value) || 0);
-                    setAddressOffset(newOffset);
-                    // Save immediately to disk
-                    try {
-                      await fetch('/api/mining/update-config', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ addressOffset: newOffset }),
-                      });
-                    } catch (err) {
-                      console.warn('Failed to save address offset:', err);
-                    }
-                  }}
-                  className="w-16 px-2 py-1 text-sm border border-gray-600 rounded bg-gray-900 text-white text-center"
-                  placeholder="0"
-                  title="Address range offset: 0 = addresses 0-199, 1 = 200-399, 2 = 400-599, etc."
-                />
-                <span className="text-xs text-gray-400 whitespace-nowrap">
-                  ({addressOffset * 200}-{(addressOffset + 1) * 200 - 1})
-                </span>
-              </div>
-            )}
+            {/* Always show address offset, but disable input when mining is active */}
+            <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded border border-gray-700">
+              <label htmlFor="addressOffset" className="text-sm text-gray-300 whitespace-nowrap">
+                Address Range:
+              </label>
+              <input
+                id="addressOffset"
+                type="number"
+                min="0"
+                value={addressOffset}
+                onChange={async (e) => {
+                  if (stats?.active) return; // Prevent changes while mining
+                  const newOffset = Math.max(0, parseInt(e.target.value) || 0);
+                  setAddressOffset(newOffset);
+                  // Save immediately to disk
+                  try {
+                    await fetch('/api/mining/update-config', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ addressOffset: newOffset }),
+                    });
+                  } catch (err) {
+                    console.warn('Failed to save address offset:', err);
+                  }
+                }}
+                disabled={stats?.active === true}
+                className={cn(
+                  "w-16 px-2 py-1 text-sm border rounded text-center",
+                  stats?.active
+                    ? "border-gray-700 bg-gray-900/50 text-gray-500 cursor-not-allowed"
+                    : "border-gray-600 bg-gray-900 text-white"
+                )}
+                placeholder="0"
+                title={stats?.active 
+                  ? "Address range offset (cannot be changed while mining): 0 = addresses 0-199, 1 = 200-399, 2 = 400-599, etc."
+                  : "Address range offset: 0 = addresses 0-199, 1 = 200-399, 2 = 400-599, etc."
+                }
+              />
+              <span className="text-xs text-gray-400 whitespace-nowrap">
+                ({addressOffset * 200}-{(addressOffset + 1) * 200 - 1})
+              </span>
+            </div>
             <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded border border-gray-700">
               <label htmlFor="autoResume" className="text-sm text-gray-300 whitespace-nowrap flex items-center gap-2 cursor-pointer">
                 <input

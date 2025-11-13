@@ -37,6 +37,14 @@ class MiningOrchestrator extends EventEmitter {
     for (let i = 0; i < 256; i++) {
       this.hexLookup[i] = i.toString(16).padStart(2, '0');
     }
+    
+    // CRITICAL: Load persisted configuration on startup
+    // This ensures worker threads, batch size, and address offset are restored from disk
+    const persistedConfig = ConfigManager.loadConfig();
+    this.workerThreads = persistedConfig.workerThreads;
+    this.customBatchSize = persistedConfig.batchSize;
+    this.addressOffset = persistedConfig.addressOffset;
+    console.log(`[Orchestrator] Loaded persisted config: offset=${this.addressOffset}, workers=${this.workerThreads}, batch=${this.customBatchSize}`);
   }
   // Optimize polling interval for high-end systems
   // For systems with many workers, we can poll less frequently since we're processing more solutions
@@ -154,6 +162,7 @@ class MiningOrchestrator extends EventEmitter {
     (this as any).currentPassword = password;
     
     // Load persisted config or use provided values
+    // NOTE: Config is already loaded in constructor, but we reload here to get latest from disk
     const persistedConfig = ConfigManager.loadConfig();
     
     // Use provided offset, or persisted offset, or default to 0
@@ -161,14 +170,15 @@ class MiningOrchestrator extends EventEmitter {
       this.addressOffset = addressOffset;
       ConfigManager.setAddressOffset(addressOffset);
     } else {
+      // Use persisted offset (already loaded in constructor, but ensure it's saved)
       this.addressOffset = persistedConfig.addressOffset;
     }
     
-    // Load persisted worker threads and batch size
-    if (this.workerThreads === 11) { // Only if still at default
-      this.workerThreads = persistedConfig.workerThreads;
-    }
-    if (this.customBatchSize === null) { // Only if still at default
+    // CRITICAL FIX: Always use persisted worker threads and batch size (not just when at defaults)
+    // This ensures settings are restored after app restart
+    this.workerThreads = persistedConfig.workerThreads;
+    if (this.customBatchSize === null) {
+      // Only set if not already set (allows runtime updates to persist)
       this.customBatchSize = persistedConfig.batchSize;
     }
     
