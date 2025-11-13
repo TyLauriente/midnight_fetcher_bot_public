@@ -23,7 +23,8 @@ class HashEngine {
     const maxConnections = Math.max(200, workerThreads * 2);
     
     // Increase timeout for very large batches (50k hashes can take 30-60 seconds)
-    const requestTimeout = Math.max(10000, 60000); // At least 60 seconds for large batches
+    // CRITICAL: Must be at least 120 seconds to match batchTimeout cap in hashBatch
+    const requestTimeout = Math.max(10000, 120000); // At least 120 seconds for very large batches
     
     this.hashClient = new HashClient(hashServiceUrl, {
       maxConnectionsPerUrl: maxConnections,

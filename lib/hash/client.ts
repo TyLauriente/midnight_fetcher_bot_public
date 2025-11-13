@@ -140,18 +140,25 @@ export class HashClient {
     // - Rayon parallel processing: ~1-2ms per hash on high-end CPUs
     // - Network overhead: ~100-200ms per batch
     // - Safety margin: 2x the expected time
+    // CRITICAL: Ensure timeout doesn't exceed the axios instance timeout (requestTimeout)
     const estimatedTimePerHash = 2; // ms per hash (optimistic for high-end systems)
     const networkOverhead = 500; // ms for network/JSON serialization
-    const batchTimeout = Math.max(60000, (preimages.length * estimatedTimePerHash) + networkOverhead);
+    const calculatedTimeout = (preimages.length * estimatedTimePerHash) + networkOverhead;
+    // Cap at 120 seconds max, and ensure it's at least 60 seconds for large batches
+    const batchTimeout = Math.min(120000, Math.max(60000, calculatedTimeout));
 
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       try {
+        // CRITICAL FIX: Use the keep-alive agent from the instance instead of creating a new one
+        // Creating a new agent per request causes connection pool exhaustion and timeouts
+        // The keep-alive agent properly manages connection pooling and reuse
         const response = await this.axiosInstance.post('/hash-batch',
           { preimages },
           {
             timeout: batchTimeout,
-            // Don't use keep-alive agent for large batch requests to avoid connection reuse issues
-            httpAgent: new (require('http').Agent)({ keepAlive: false })
+            // Use the keep-alive agent for proper connection pooling
+            // This prevents connection exhaustion when many workers send batches simultaneously
+            httpAgent: this.keepAliveAgent
           }
         );
         return response.data.hashes;
