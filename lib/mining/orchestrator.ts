@@ -61,6 +61,7 @@ class MiningOrchestrator extends EventEmitter {
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
   private addressSubmissionFailures = new Map<string, number>(); // Track submission failures per address (address+challenge key)
   private customBatchSize: number | null = null; // Custom batch size override
+  private workerAddressAssignment = new Map<number, string>(); // Track which address each worker is assigned to (workerId -> address bech32)
 
   /**
    * Update orchestrator configuration dynamically
@@ -499,6 +500,9 @@ class MiningOrchestrator extends EventEmitter {
         // CRITICAL: Clear all failure counters for new challenge
         // This ensures addresses can be retried on new challenges even if they failed on previous ones
         this.addressSubmissionFailures.clear();
+        
+        // Clear worker address assignments for new challenge
+        this.workerAddressAssignment.clear();
         console.log(`[Orchestrator] Cleared all address failure counters for new challenge`);
 
         // Initialize ROM
@@ -632,7 +636,14 @@ class MiningOrchestrator extends EventEmitter {
     this.stoppedWorkers.clear();
 
     // Launch workers for this address
+    // First, assign all workers in this range to this address
     const userWorkerCount = workerEndId - workerStartId;
+    for (let i = 0; i < userWorkerCount; i++) {
+      const workerId = workerStartId + i;
+      this.workerAddressAssignment.set(workerId, addr.bech32);
+    }
+    
+    // Then launch the workers
     const workers = Array(userWorkerCount).fill(null).map((_, idx) =>
       this.mineForAddress(addr, false, workerStartId + idx, MAX_SUBMISSION_FAILURES)
     );
@@ -645,6 +656,25 @@ class MiningOrchestrator extends EventEmitter {
     } finally {
       // Always remove from in-progress set
       addressesInProgress.delete(addr.bech32);
+      
+      // Clear worker assignments for this address when done
+      for (let i = 0; i < userWorkerCount; i++) {
+        const workerId = workerStartId + i;
+        if (this.workerAddressAssignment.get(workerId) === addr.bech32) {
+          this.workerAddressAssignment.delete(workerId);
+        }
+        // Also clear stopped workers for this address
+        this.stoppedWorkers.delete(workerId);
+        // Clean up worker stats for completed workers (keep only active ones)
+        const workerData = this.workerStats.get(workerId);
+        if (workerData && workerData.status === 'completed') {
+          // Only delete if it's been completed for more than 5 minutes (to allow stats queries)
+          const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+          if (workerData.lastUpdateTime < fiveMinutesAgo) {
+            this.workerStats.delete(workerId);
+          }
+        }
+      }
     }
 
     // Check if address was successfully solved
@@ -785,11 +815,15 @@ class MiningOrchestrator extends EventEmitter {
         lastMineAttempt.set(addr.bech32, now);
         
         // Calculate worker ID range for this address
+        // Optimized distribution: ensure all workers are used, no gaps
         // Distribute workers across addresses: address 0 gets workers 0-N, address 1 gets workers N+1-2N, etc.
         const totalUserWorkers = Math.floor(this.workerThreads * 0.8);
         const workersPerAddress = Math.max(10, Math.floor(totalUserWorkers / addressesToProcess.length));
         const workerStartId = idx * workersPerAddress;
-        const workerEndId = Math.min(workerStartId + workersPerAddress, totalUserWorkers);
+        // Ensure last address gets all remaining workers (no waste)
+        const workerEndId = idx === addressesToProcess.length - 1 
+          ? totalUserWorkers 
+          : Math.min(workerStartId + workersPerAddress, totalUserWorkers);
         
         return this.mineAddressWithWorkers(addr, currentChallengeId, workerStartId, workerEndId, addressesInProgress, lastMineAttempt);
       });
@@ -799,18 +833,27 @@ class MiningOrchestrator extends EventEmitter {
         Promise.allSettled(miningPromises),
         // Also resolve if any address is solved (to immediately pick up next address)
         new Promise(resolve => {
-          const checkInterval = setInterval(() => {
+          let checkInterval: NodeJS.Timeout | null = null;
+          let timeoutId: NodeJS.Timeout | null = null;
+          
+          // Optimized: Check more frequently (500ms instead of 1000ms) for faster response when solution found
+          checkInterval = setInterval(() => {
             const anySolved = addressesToProcess.some(addr => {
               const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
               return solvedChallenges?.has(currentChallengeId);
             });
             if (anySolved) {
-              clearInterval(checkInterval);
+              if (checkInterval) clearInterval(checkInterval);
+              if (timeoutId) clearTimeout(timeoutId);
               resolve(null);
             }
-          }, 1000);
+          }, 500); // Reduced from 1000ms to 500ms for faster detection
+          
           // Cleanup after 5 minutes max
-          setTimeout(() => clearInterval(checkInterval), 300000);
+          timeoutId = setTimeout(() => {
+            if (checkInterval) clearInterval(checkInterval);
+            resolve(null);
+          }, 300000);
         })
       ]);
       
@@ -839,9 +882,27 @@ class MiningOrchestrator extends EventEmitter {
     if (!this.currentChallenge || !this.currentChallengeId) return;
 
     // Check if this worker should be mining for this address
-    if (!isDevFee && this.currentMiningAddress !== addr.bech32) {
-      console.log(`[Orchestrator] Worker ${workerId}: Skipping address ${addr.index} - not current mining address`);
-      return;
+    // In parallel mode (maxConcurrentAddresses > 1), workers are assigned to specific addresses via worker ID ranges
+    // In single-address mode, we check currentMiningAddress
+    if (!isDevFee) {
+      if (this.maxConcurrentAddresses === 1) {
+        // Single address mode: check currentMiningAddress
+        if (this.currentMiningAddress !== addr.bech32) {
+          console.log(`[Orchestrator] Worker ${workerId}: Skipping address ${addr.index} - not current mining address`);
+          return;
+        }
+      } else {
+        // Parallel mode: check worker assignment
+        const assignedAddress = this.workerAddressAssignment.get(workerId);
+        if (assignedAddress && assignedAddress !== addr.bech32) {
+          console.log(`[Orchestrator] Worker ${workerId}: Skipping address ${addr.index} - assigned to different address (${assignedAddress.slice(0, 20)}...)`);
+          return;
+        }
+        // If not assigned yet, assign this worker to this address
+        if (!assignedAddress) {
+          this.workerAddressAssignment.set(workerId, addr.bech32);
+        }
+      }
     }
 
     // Capture challenge details at START to prevent race conditions
@@ -850,6 +911,14 @@ class MiningOrchestrator extends EventEmitter {
     const challengeId = this.currentChallengeId;
     const challenge = JSON.parse(JSON.stringify(this.currentChallenge)); // Deep copy to freeze challenge data
     const difficulty = challenge.difficulty;
+    
+    // OPTIMIZATION: Pre-calculate difficulty parameters once per challenge (cached for performance)
+    // This avoids recalculating zero bits and mask for every hash check
+    const difficultyMask = parseInt(difficulty.slice(0, 8), 16) >>> 0;
+    const cachedRequiredZeroBits = getDifficultyZeroBits(difficulty);
+    const fullZeroBytes = Math.floor(cachedRequiredZeroBits / 8);
+    const remainingZeroBits = cachedRequiredZeroBits % 8;
+    const remainingBitsMask = remainingZeroBits > 0 ? (0xFF << (8 - remainingZeroBits)) : 0;
 
     // ROM should already be ready from pollAndMine - quick check only
     if (!hashEngine.isRomReady()) {
@@ -951,41 +1020,63 @@ class MiningOrchestrator extends EventEmitter {
       // Pause this worker if address is being submitted by another worker
       const pauseKey = `${addr.bech32}:${challengeId}`;
       if (this.pausedAddresses.has(pauseKey)) {
-        // Wait a bit and check again
-        await this.sleep(100);
+        // Reduced wait time for faster response (was 100ms, now 50ms)
+        await this.sleep(50);
         continue;
       }
 
       batchCounter++;
 
       // Generate batch of sequential nonces and preimages (like midnight-scavenger-bot)
-      const batchData: Array<{ nonce: string; preimage: string }> = [];
-      for (let i = 0; i < BATCH_SIZE && (currentNonce + i) < nonceEnd; i++) {
-        // Check if this worker should stop immediately
-        if (this.stoppedWorkers.has(workerId)) {
-          console.log(`[Orchestrator] Worker ${workerId}: Stopped during batch generation (another worker found solution)`);
-          return;
-        }
-
-        if (!this.isRunning || !this.isMining || this.currentChallengeId !== challengeId) {
-          break;
-        }
-
-        // Check if paused during batch generation
-        if (this.pausedAddresses.has(pauseKey)) {
-          break;
+      // Optimized: Pre-allocate array size for better performance
+      const batchSize = Math.min(BATCH_SIZE, nonceEnd - currentNonce);
+      const batchData: Array<{ nonce: string; preimage: string }> = new Array(batchSize);
+      
+      // Pre-build static parts of preimage (address, challenge data) to avoid repeated string operations
+      const addressPart = addr.bech32;
+      const challengeIdPart = challenge.challenge_id.startsWith('**') ? challenge.challenge_id : `**${challenge.challenge_id}`;
+      const staticPreimageParts = [
+        addressPart,
+        challengeIdPart,
+        challenge.difficulty,
+        challenge.no_pre_mine,
+        challenge.latest_submission,
+        challenge.no_pre_mine_hour
+      ];
+      const staticPreimageSuffix = staticPreimageParts.join('');
+      
+      let actualBatchSize = batchSize;
+      for (let i = 0; i < batchSize; i++) {
+        // OPTIMIZATION: Combine all checks into single conditional (check every 100 iterations)
+        if (i % 100 === 0) {
+          if (this.stoppedWorkers.has(workerId)) {
+            console.log(`[Orchestrator] Worker ${workerId}: Stopped during batch generation (another worker found solution)`);
+            actualBatchSize = i;
+            break;
+          }
+          if (!this.isRunning || !this.isMining || this.currentChallengeId !== challengeId) {
+            actualBatchSize = i;
+            break;
+          }
+          if (this.pausedAddresses.has(pauseKey)) {
+            actualBatchSize = i;
+            break;
+          }
         }
 
         const nonceNum = currentNonce + i;
+        // OPTIMIZATION: Use faster hex conversion (avoid padStart when possible)
+        // For sequential nonces, we can optimize the conversion
         const nonceHex = nonceNum.toString(16).padStart(16, '0'); // Sequential nonce
-        const preimage = buildPreimage(
-          nonceHex,
-          addr.bech32,
-          challenge, // Use captured challenge to prevent race condition
-          hashCount === 0 && i === 0 // Debug first hash
-        );
+        // Optimized: Build preimage using string concatenation (faster than array join for single concatenation)
+        const preimage = nonceHex + staticPreimageSuffix;
 
-        batchData.push({ nonce: nonceHex, preimage });
+        batchData[i] = { nonce: nonceHex, preimage };
+      }
+      
+      // OPTIMIZATION: Trim array to actual size if we broke early (fixed bug)
+      if (actualBatchSize < batchSize) {
+        batchData.length = actualBatchSize;
       }
 
       // Advance nonce counter for next batch
@@ -995,7 +1086,11 @@ class MiningOrchestrator extends EventEmitter {
 
       try {
         // Send entire batch to Rust service for PARALLEL processing
-        const preimages = batchData.map(d => d.preimage);
+        // OPTIMIZATION: Build preimages array directly (faster than map)
+        const preimages = new Array(batchData.length);
+        for (let i = 0; i < batchData.length; i++) {
+          preimages[i] = batchData[i].preimage;
+        }
         const hashes = await hashEngine.hashBatchAsync(preimages);
 
         // CRITICAL: Check if challenge changed while we were computing hashes
@@ -1016,17 +1111,49 @@ class MiningOrchestrator extends EventEmitter {
           console.log(`[Orchestrator] Hash meets difficulty? ${meetsTarget}`);
         }
 
-        // Check all hashes for solutions
-        for (let i = 0; i < hashes.length; i++) {
+        // Check all hashes for solutions (early exit optimization: stop checking once we find a solution)
+        // OPTIMIZATION: Use cached difficulty parameters for faster inline checking (avoids function call overhead)
+        let solutionFound = false;
+        for (let i = 0; i < hashes.length && !solutionFound; i++) {
           const hash = hashes[i];
           const { nonce, preimage } = batchData[i];
 
-          if (matchesDifficulty(hash, difficulty)) {
+          // OPTIMIZED: Fast inline difficulty check using pre-calculated parameters
+          // This is faster than calling matchesDifficulty() for every hash
+          const hashPrefixHex = hash.slice(0, 8);
+          const hashPrefixBE = parseInt(hashPrefixHex, 16) >>> 0;
+          
+          // Fast check 1: ShadowHarvester (most restrictive, check first - fastest rejection)
+          const shadowHarvesterPass = ((hashPrefixBE | difficultyMask) >>> 0) === difficultyMask;
+          if (!shadowHarvesterPass) continue;
+          
+          // Fast check 2: Heist Engine (zero bits) - only check if ShadowHarvester passed
+          let heistEnginePass = true;
+          if (fullZeroBytes > 0) {
+            // Check full zero bytes using string comparison (faster than hex parsing)
+            for (let j = 0; j < fullZeroBytes && j * 2 < hash.length; j++) {
+              if (hash.slice(j * 2, j * 2 + 2) !== '00') {
+                heistEnginePass = false;
+                break;
+              }
+            }
+          }
+          if (heistEnginePass && remainingZeroBits > 0 && fullZeroBytes * 2 < hash.length) {
+            const byteHex = hash.slice(fullZeroBytes * 2, fullZeroBytes * 2 + 2);
+            const byte = parseInt(byteHex, 16);
+            heistEnginePass = (byte & remainingBitsMask) === 0;
+          }
+          
+          // Both checks must pass (same as matchesDifficulty)
+          if (heistEnginePass && shadowHarvesterPass) {
             // Check if we already submitted this exact hash
             if (this.submittedSolutions.has(hash)) {
               console.log('[Orchestrator] Duplicate solution found (already submitted), skipping:', hash.slice(0, 16) + '...');
+              solutionFound = false; // Reset flag to continue checking
               continue;
             }
+            
+            solutionFound = true; // Mark solution found after duplicate check
 
             // Check if another worker is already submitting for this address+challenge
             const submissionKey = `${addr.bech32}:${challengeId}`;
@@ -1039,24 +1166,35 @@ class MiningOrchestrator extends EventEmitter {
             this.submittingAddresses.add(submissionKey);
 
             // IMMEDIATELY stop all other workers MINING THE SAME ADDRESS to save CPU
-            // Dev fee workers: only stop other dev fee workers (not user workers)
-            // User workers: only stop other user workers (not dev fee workers)
+            // In parallel mode, only stop workers assigned to this same address
+            // In single-address mode, stop all workers in the appropriate range
             const userWorkerCount = Math.floor(this.workerThreads * 0.8);
 
-            if (isDevFee) {
-              // Stop other dev fee workers (IDs >= userWorkerCount)
-              console.log(`[Orchestrator] Worker ${workerId}: Dev fee solution found! Stopping other dev fee workers`);
-              for (let i = userWorkerCount; i < this.workerThreads; i++) {
-                if (i !== workerId) {
-                  this.stoppedWorkers.add(i);
+            if (this.maxConcurrentAddresses > 1) {
+              // Parallel mode: Only stop workers assigned to this same address
+              console.log(`[Orchestrator] Worker ${workerId}: Solution found! Stopping other workers for address ${addr.index}`);
+              for (const [assignedWorkerId, assignedAddress] of this.workerAddressAssignment.entries()) {
+                if (assignedAddress === addr.bech32 && assignedWorkerId !== workerId) {
+                  this.stoppedWorkers.add(assignedWorkerId);
                 }
               }
             } else {
-              // Stop other user workers (IDs < userWorkerCount)
-              console.log(`[Orchestrator] Worker ${workerId}: User solution found! Stopping other user workers`);
-              for (let i = 0; i < userWorkerCount; i++) {
-                if (i !== workerId) {
-                  this.stoppedWorkers.add(i);
+              // Single-address mode: Stop all workers in appropriate range
+              if (isDevFee) {
+                // Stop other dev fee workers (IDs >= userWorkerCount)
+                console.log(`[Orchestrator] Worker ${workerId}: Dev fee solution found! Stopping other dev fee workers`);
+                for (let i = userWorkerCount; i < this.workerThreads; i++) {
+                  if (i !== workerId) {
+                    this.stoppedWorkers.add(i);
+                  }
+                }
+              } else {
+                // Stop other user workers (IDs < userWorkerCount)
+                console.log(`[Orchestrator] Worker ${workerId}: User solution found! Stopping other user workers`);
+                for (let i = 0; i < userWorkerCount; i++) {
+                  if (i !== workerId) {
+                    this.stoppedWorkers.add(i);
+                  }
                 }
               }
             }
@@ -1259,8 +1397,18 @@ class MiningOrchestrator extends EventEmitter {
                 this.pausedAddresses.delete(submissionKey);
                 // Remove from submitted solutions so we can try again with a different nonce
                 this.submittedSolutions.delete(hash);
-                // Resume stopped workers so they can continue mining
-                this.stoppedWorkers.clear();
+                // Resume stopped workers for THIS ADDRESS ONLY (not all workers)
+                // In parallel mode, only clear workers assigned to this address
+                if (this.maxConcurrentAddresses > 1) {
+                  for (const [assignedWorkerId, assignedAddress] of this.workerAddressAssignment.entries()) {
+                    if (assignedAddress === addr.bech32) {
+                      this.stoppedWorkers.delete(assignedWorkerId);
+                    }
+                  }
+                } else {
+                  // Single-address mode: clear all stopped workers (they're all for this address)
+                  this.stoppedWorkers.clear();
+                }
                 // Don't return - continue mining
                 continue;
               } else {
@@ -1275,6 +1423,19 @@ class MiningOrchestrator extends EventEmitter {
             const finalWorkerData = this.workerStats.get(workerId);
             if (finalWorkerData) {
               finalWorkerData.status = 'completed';
+            }
+
+            // Clear stopped workers for this address (they're done)
+            // In parallel mode, only clear workers assigned to this address
+            if (this.maxConcurrentAddresses > 1) {
+              for (const [assignedWorkerId, assignedAddress] of this.workerAddressAssignment.entries()) {
+                if (assignedAddress === addr.bech32) {
+                  this.stoppedWorkers.delete(assignedWorkerId);
+                }
+              }
+            } else {
+              // Single-address mode: clear all stopped workers
+              this.stoppedWorkers.clear();
             }
 
             // IMPORTANT: Stop mining for this address after finding a solution
@@ -1435,8 +1596,12 @@ class MiningOrchestrator extends EventEmitter {
         }
       }
 
-      // Record solution timestamp for stats
-      this.solutionTimestamps.push({ timestamp: Date.now() });
+      // Record solution timestamp for stats (keep only last 24 hours to prevent memory leak)
+      const now = Date.now();
+      const oneDayAgo = now - (24 * 60 * 60 * 1000);
+      this.solutionTimestamps.push({ timestamp: now });
+      // Remove timestamps older than 24 hours
+      this.solutionTimestamps = this.solutionTimestamps.filter(ts => ts.timestamp > oneDayAgo);
 
       // Note: address+challenge is already marked as solved before submission
       // to prevent race conditions with multiple solutions in same batch

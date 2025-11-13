@@ -43,15 +43,16 @@ export function buildPreimage(
     : `**${challenge.challenge_id}`;
 
   // Build preimage: nonce + address + challengeId + difficulty + no_pre_mine + latest_submission + no_pre_mine_hour
-  const preimage = (
-    nonce +
-    address +
-    challengeId +
-    challenge.difficulty +
-    challenge.no_pre_mine +
-    challenge.latest_submission +
+  // Optimized: Use array join instead of string concatenation for better performance
+  const preimage = [
+    nonce,
+    address,
+    challengeId,
+    challenge.difficulty,
+    challenge.no_pre_mine,
+    challenge.latest_submission,
     challenge.no_pre_mine_hour
-  );
+  ].join('');
 
   if (debug || process.env.DEBUG_PREIMAGE) {
     console.log(`[Preimage] nonce=${nonce} addr=${address.slice(0, 20)}... chal=${challengeId} diff=${challenge.difficulty}`);
