@@ -152,6 +152,8 @@ function MiningDashboardContent() {
 
   // DevFee state
   const [devFeeEnabled, setDevFeeEnabled] = useState<boolean>(true);
+  const [autoResumeEnabled, setAutoResumeEnabled] = useState<boolean>(false);
+  const [autoResumeLoading, setAutoResumeLoading] = useState(false);
   const [devFeeLoading, setDevFeeLoading] = useState(false);
   const [devFeeData, setDevFeeData] = useState<any | null>(null);
   const [historyLastRefresh, setHistoryLastRefresh] = useState<number | null>(null);
@@ -263,6 +265,57 @@ function MiningDashboardContent() {
     };
     loadPersistedConfig();
   }, []);
+
+  // Check auto-resume status after component mounts and handlers are available
+  useEffect(() => {
+    if (!password) return; // Wait for password to be loaded
+    
+    const checkAutoResume = async () => {
+      try {
+        const response = await fetch('/api/mining/auto-resume');
+        const data = await response.json();
+        
+        if (data.success) {
+          setAutoResumeEnabled(data.autoResume || false);
+          
+          // Auto-resume if enabled, mining was active, and we have a password
+          if (data.autoResume && data.wasMiningActive && (data.password || password)) {
+            // Use decrypted password from API if available, otherwise use current password
+            const resumePassword = data.password || password;
+            
+            if (resumePassword) {
+              // Set password in state if using decrypted password
+              if (data.password && data.password !== password) {
+                setPassword(data.password);
+                sessionStorage.setItem('walletPassword', data.password);
+              }
+              
+              // Auto-resume is enabled and mining was active
+              console.log('[Auto-Resume] Mining was active, auto-resuming...');
+              
+              // Wait a bit for the app to fully load
+              setTimeout(async () => {
+                try {
+                  console.log('[Auto-Resume] Auto-resuming mining...');
+                  addLog('Auto-resuming mining from previous session...', 'info');
+                  await handleStartMining();
+                } catch (err: any) {
+                  console.error('[Auto-Resume] Failed to auto-resume:', err);
+                  addLog(`Auto-resume failed: ${err.message}`, 'error');
+                }
+              }, 2000);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to check auto-resume status:', err);
+      }
+    };
+    
+    // Only check once after a short delay to ensure everything is loaded
+    const timer = setTimeout(checkAutoResume, 1000);
+    return () => clearTimeout(timer);
+  }, [password]);
 
   const addLog = (message: string, type: LogEntry['type'] = 'info') => {
     // Only add logs if not paused
@@ -422,6 +475,17 @@ function MiningDashboardContent() {
       addLog('Mining started successfully', 'success');
       addLog(`Starting registration of ${data.stats.totalAddresses} addresses...`, 'info');
       setStats(data.stats);
+      
+      // Save mining state for auto-resume
+      try {
+        await fetch('/api/mining/save-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active: true }),
+        });
+      } catch (stateErr) {
+        console.warn('Failed to save mining state:', stateErr);
+      }
     } catch (err: any) {
       setError(err.message);
       addLog(`Failed to start mining: ${err.message}`, 'error');
@@ -447,6 +511,17 @@ function MiningDashboardContent() {
       }
 
       await checkStatus();
+      
+      // Save mining state for auto-resume
+      try {
+        await fetch('/api/mining/save-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active: false }),
+        });
+      } catch (stateErr) {
+        console.warn('Failed to save mining state:', stateErr);
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -604,6 +679,39 @@ function MiningDashboardContent() {
       setDevFeeEnabled(!enabled);
     } finally {
       setDevFeeLoading(false);
+    }
+  };
+
+  const toggleAutoResume = async (enabled: boolean) => {
+    setAutoResumeLoading(true);
+    try {
+      const response = await fetch('/api/mining/auto-resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          enabled,
+          password: enabled ? password : undefined, // Only send password when enabling
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setAutoResumeEnabled(data.autoResume);
+        addLog(data.message, 'success');
+      } else {
+        console.error('Failed to update auto-resume status:', data.error);
+        addLog(`Failed to update auto-resume: ${data.error}`, 'error');
+        // Revert toggle on error
+        setAutoResumeEnabled(!enabled);
+      }
+    } catch (err: any) {
+      console.error('Failed to update auto-resume status:', err.message);
+      addLog(`Failed to update auto-resume: ${err.message}`, 'error');
+      // Revert toggle on error
+      setAutoResumeEnabled(!enabled);
+    } finally {
+      setAutoResumeLoading(false);
     }
   };
 
@@ -811,6 +919,21 @@ function MiningDashboardContent() {
                 </span>
               </div>
             )}
+            <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded border border-gray-700">
+              <label htmlFor="autoResume" className="text-sm text-gray-300 whitespace-nowrap flex items-center gap-2 cursor-pointer">
+                <input
+                  id="autoResume"
+                  type="checkbox"
+                  checked={autoResumeEnabled}
+                  onChange={(e) => toggleAutoResume(e.target.checked)}
+                  disabled={autoResumeLoading || !password}
+                  className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-500 focus:ring-2 focus:ring-blue-500"
+                  title={!password ? "Unlock wallet first to enable auto-resume" : "Automatically resume mining on app restart"}
+                />
+                <span>Auto-Resume Mining</span>
+                {autoResumeLoading && <Loader2 className="w-3 h-3 animate-spin text-gray-400" />}
+              </label>
+            </div>
             {!stats.active ? (
               <Button
                 onClick={handleStartMining}
