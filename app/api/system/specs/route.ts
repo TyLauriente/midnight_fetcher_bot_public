@@ -14,22 +14,7 @@ function getCpuCoreCount(platform: string): { logical: number; physical: number 
   // Try to get physical cores on Linux
   if (platform === 'linux') {
     try {
-      // Method 1: Check /proc/cpuinfo for physical cores
-      const cpuinfo = execSync('grep -c "^physical id" /proc/cpuinfo 2>/dev/null || echo 0', { encoding: 'utf8' }).trim();
-      const physicalIds = parseInt(cpuinfo) || 0;
-      
-      if (physicalIds > 0) {
-        // Count unique physical IDs
-        const coresPerPhysical = execSync('grep "^cpu cores" /proc/cpuinfo | head -1 | cut -d: -f2 | tr -d " "', { encoding: 'utf8' }).trim();
-        const coresPerPackage = parseInt(coresPerPhysical) || 0;
-        
-        if (coresPerPackage > 0) {
-          const physicalCores = physicalIds * coresPerPackage;
-          return { logical: logicalCores, physical: physicalCores };
-        }
-      }
-      
-      // Method 2: Use lscpu if available (more reliable)
+      // Method 1: Use lscpu if available (most reliable)
       try {
         const lscpuOutput = execSync('lscpu 2>/dev/null', { encoding: 'utf8' });
         const socketsMatch = lscpuOutput.match(/^Socket\(s\):\s*(\d+)/m);
@@ -54,6 +39,29 @@ function getCpuCoreCount(platform: string): { logical: number; physical: number 
         }
       } catch (lscpuErr) {
         // lscpu not available, continue with other methods
+      }
+      
+      // Method 2: Check /proc/cpuinfo for physical cores
+      // Count UNIQUE physical IDs (not total count)
+      try {
+        const uniquePhysicalIds = execSync('grep "^physical id" /proc/cpuinfo | sort -u | wc -l', { encoding: 'utf8' }).trim();
+        const numSockets = parseInt(uniquePhysicalIds) || 0;
+        
+        if (numSockets > 0) {
+          // Get cores per socket
+          const coresPerSocket = execSync('grep "^cpu cores" /proc/cpuinfo | head -1 | cut -d: -f2 | tr -d " "', { encoding: 'utf8' }).trim();
+          const coresPerPackage = parseInt(coresPerSocket) || 0;
+          
+          if (coresPerPackage > 0) {
+            const physicalCores = numSockets * coresPerPackage;
+            // Sanity check: physical cores should be <= logical cores
+            if (physicalCores > 0 && physicalCores <= logicalCores) {
+              return { logical: logicalCores, physical: physicalCores };
+            }
+          }
+        }
+      } catch (cpuinfoErr) {
+        // Continue to next method
       }
       
       // Method 3: Count unique core IDs (fallback)
