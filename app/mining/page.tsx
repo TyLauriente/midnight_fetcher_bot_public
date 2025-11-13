@@ -266,12 +266,24 @@ function MiningDashboardContent() {
     loadPersistedConfig();
   }, []);
 
-  // Check auto-resume status after component mounts and handlers are available
+  // Check auto-resume status after component mounts and status is loaded
   useEffect(() => {
     if (!password) return; // Wait for password to be loaded
     
+    // Also wait for initial status check to complete
     const checkAutoResume = async () => {
       try {
+        // First check current mining status
+        const statusResponse = await fetch('/api/mining/status');
+        const statusData = await statusResponse.json();
+        
+        // If already mining, don't auto-resume (already running)
+        if (statusData.success && statusData.stats?.active) {
+          console.log('[Auto-Resume] Mining is already active, skipping auto-resume');
+          return;
+        }
+        
+        // Check auto-resume configuration
         const response = await fetch('/api/mining/auto-resume');
         const data = await response.json();
         
@@ -292,12 +304,12 @@ function MiningDashboardContent() {
               
               // Auto-resume is enabled and mining was active
               console.log('[Auto-Resume] Mining was active, auto-resuming...');
+              addLog('Auto-resuming mining from previous session...', 'info');
               
-              // Wait a bit for the app to fully load
+              // Wait a bit for the app to fully load, then start mining
               setTimeout(async () => {
                 try {
                   console.log('[Auto-Resume] Auto-resuming mining...');
-                  addLog('Auto-resuming mining from previous session...', 'info');
                   await handleStartMining();
                 } catch (err: any) {
                   console.error('[Auto-Resume] Failed to auto-resume:', err);
@@ -312,10 +324,10 @@ function MiningDashboardContent() {
       }
     };
     
-    // Only check once after a short delay to ensure everything is loaded
-    const timer = setTimeout(checkAutoResume, 1000);
+    // Check after status is loaded (give it a moment for initial status check)
+    const timer = setTimeout(checkAutoResume, 2000);
     return () => clearTimeout(timer);
-  }, [password]);
+  }, [password, stats]);
 
   const addLog = (message: string, type: LogEntry['type'] = 'info') => {
     // Only add logs if not paused
@@ -476,15 +488,19 @@ function MiningDashboardContent() {
       addLog(`Starting registration of ${data.stats.totalAddresses} addresses...`, 'info');
       setStats(data.stats);
       
-      // Save mining state for auto-resume
+      // Save mining state for auto-resume IMMEDIATELY
+      // This ensures auto-resume will work even if the app crashes or is closed
       try {
-        await fetch('/api/mining/save-state', {
+        const stateResponse = await fetch('/api/mining/save-state', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ active: true }),
         });
+        if (stateResponse.ok) {
+          console.log('[Mining] Mining state saved for auto-resume');
+        }
       } catch (stateErr) {
-        console.warn('Failed to save mining state:', stateErr);
+        console.error('[Mining] Failed to save mining state:', stateErr);
       }
     } catch (err: any) {
       setError(err.message);
@@ -909,7 +925,20 @@ function MiningDashboardContent() {
                   type="number"
                   min="0"
                   value={addressOffset}
-                  onChange={(e) => setAddressOffset(Math.max(0, parseInt(e.target.value) || 0))}
+                  onChange={async (e) => {
+                    const newOffset = Math.max(0, parseInt(e.target.value) || 0);
+                    setAddressOffset(newOffset);
+                    // Save immediately to disk
+                    try {
+                      await fetch('/api/mining/update-config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ addressOffset: newOffset }),
+                      });
+                    } catch (err) {
+                      console.warn('Failed to save address offset:', err);
+                    }
+                  }}
                   className="w-16 px-2 py-1 text-sm border border-gray-600 rounded bg-gray-900 text-white text-center"
                   placeholder="0"
                   title="Address range offset: 0 = addresses 0-199, 1 = 200-399, 2 = 400-599, etc."
@@ -2550,12 +2579,41 @@ function MiningDashboardContent() {
                             max={scaleRecommendations.workerThreads.max}
                             value={editedWorkerThreads || ''}
                             onChange={(e) => setEditedWorkerThreads(parseInt(e.target.value) || 1)}
+                            onBlur={async () => {
+                              // Save immediately when user finishes editing
+                              if (editedWorkerThreads !== null && editedWorkerThreads > 0) {
+                                try {
+                                  await fetch('/api/mining/update-config', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ workerThreads: editedWorkerThreads }),
+                                  });
+                                  console.log('[Settings] Worker threads saved:', editedWorkerThreads);
+                                } catch (err) {
+                                  console.warn('Failed to save worker threads:', err);
+                                }
+                              }
+                            }}
                             className="w-24 px-3 py-2 text-2xl font-bold text-center bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-yellow-500 text-white"
                           />
                         </div>
 
                         <div className="flex items-center justify-between p-3 bg-green-900/20 border border-green-700/50 rounded-lg cursor-pointer hover:bg-green-900/30 transition-colors"
-                          onClick={() => setEditedWorkerThreads(scaleRecommendations.workerThreads.optimal)}>
+                          onClick={async () => {
+                            const optimal = scaleRecommendations.workerThreads.optimal;
+                            setEditedWorkerThreads(optimal);
+                            // Save immediately
+                            try {
+                              await fetch('/api/mining/update-config', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ workerThreads: optimal }),
+                              });
+                              console.log('[Settings] Worker threads saved (optimal):', optimal);
+                            } catch (err) {
+                              console.warn('Failed to save worker threads:', err);
+                            }
+                          }}>
                           <div className="flex items-center gap-2">
                             <CheckCircle2 className="w-5 h-5 text-green-400" />
                             <span className="text-green-400 font-semibold">Optimal:</span>
@@ -2616,12 +2674,41 @@ function MiningDashboardContent() {
                             step="50"
                             value={editedBatchSize || ''}
                             onChange={(e) => setEditedBatchSize(parseInt(e.target.value) || 50)}
+                            onBlur={async () => {
+                              // Save immediately when user finishes editing
+                              if (editedBatchSize !== null && editedBatchSize >= 50) {
+                                try {
+                                  await fetch('/api/mining/update-config', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ batchSize: editedBatchSize }),
+                                  });
+                                  console.log('[Settings] Batch size saved:', editedBatchSize);
+                                } catch (err) {
+                                  console.warn('Failed to save batch size:', err);
+                                }
+                              }
+                            }}
                             className="w-24 px-3 py-2 text-2xl font-bold text-center bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-yellow-500 text-white"
                           />
                         </div>
 
                         <div className="flex items-center justify-between p-3 bg-green-900/20 border border-green-700/50 rounded-lg cursor-pointer hover:bg-green-900/30 transition-colors"
-                          onClick={() => setEditedBatchSize(scaleRecommendations.batchSize.optimal)}>
+                          onClick={async () => {
+                            const optimal = scaleRecommendations.batchSize.optimal;
+                            setEditedBatchSize(optimal);
+                            // Save immediately
+                            try {
+                              await fetch('/api/mining/update-config', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ batchSize: optimal }),
+                              });
+                              console.log('[Settings] Batch size saved (optimal):', optimal);
+                            } catch (err) {
+                              console.warn('Failed to save batch size:', err);
+                            }
+                          }}>
                           <div className="flex items-center gap-2">
                             <CheckCircle2 className="w-5 h-5 text-green-400" />
                             <span className="text-green-400 font-semibold">Optimal:</span>
