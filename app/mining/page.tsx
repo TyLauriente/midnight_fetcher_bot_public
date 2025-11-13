@@ -246,8 +246,22 @@ function MiningDashboardContent() {
     }
     setPassword(storedPassword);
 
-    // Check mining status on load
+    // Check mining status on load (this will also load persisted config)
     checkStatus();
+    
+    // Load persisted offset from config
+    const loadPersistedConfig = async () => {
+      try {
+        const response = await fetch('/api/mining/status');
+        const data = await response.json();
+        if (data.success && data.config && data.config.addressOffset !== undefined) {
+          setAddressOffset(data.config.addressOffset);
+        }
+      } catch (err) {
+        console.warn('Failed to load persisted config:', err);
+      }
+    };
+    loadPersistedConfig();
   }, []);
 
   const addLog = (message: string, type: LogEntry['type'] = 'info') => {
@@ -353,6 +367,14 @@ function MiningDashboardContent() {
       const data = await response.json();
       if (data.success) {
         setStats(data.stats);
+        // Load persisted config (offset, workers, batch size)
+        if (data.config) {
+          if (data.config.addressOffset !== undefined && !stats?.active) {
+            // Only update offset if mining is not active (to avoid conflicts)
+            setAddressOffset(data.config.addressOffset);
+          }
+          // Workers and batch size are loaded from scale tab
+        }
       }
     } catch (err: any) {
       console.error('Failed to check status:', err);
@@ -373,6 +395,18 @@ function MiningDashboardContent() {
 
     try {
       addLog(`Loading wallet addresses with offset ${addressOffset} (range ${addressOffset * 200}-${(addressOffset + 1) * 200 - 1})...`, 'info');
+      
+      // Save offset to persistent storage via API
+      try {
+        await fetch('/api/mining/update-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ addressOffset }),
+        });
+      } catch (configErr) {
+        console.warn('Failed to save offset to config:', configErr);
+      }
+      
       const response = await fetch('/api/mining/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -502,9 +536,20 @@ function MiningDashboardContent() {
       if (data.success) {
         setScaleSpecs(data.specs);
         setScaleRecommendations(data.recommendations);
-        // Initialize edited values with current values
-        setEditedWorkerThreads(data.recommendations.workerThreads.current);
-        setEditedBatchSize(data.recommendations.batchSize.current);
+        
+        // Load persisted config values (from status API)
+        const statusResponse = await fetch('/api/mining/status');
+        const statusData = await statusResponse.json();
+        
+        if (statusData.success && statusData.config) {
+          // Use persisted values if available, otherwise use current recommendations
+          setEditedWorkerThreads(statusData.config.workerThreads || data.recommendations.workerThreads.current);
+          setEditedBatchSize(statusData.config.batchSize || data.recommendations.batchSize.current);
+        } else {
+          // Fallback to current values from recommendations
+          setEditedWorkerThreads(data.recommendations.workerThreads.current);
+          setEditedBatchSize(data.recommendations.batchSize.current);
+        }
       } else {
         setScaleError(data.error || 'Failed to load system specifications');
       }

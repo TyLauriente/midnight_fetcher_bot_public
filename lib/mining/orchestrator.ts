@@ -14,6 +14,7 @@ import { receiptsLogger } from '@/lib/storage/receipts-logger';
 import { generateNonce } from './nonce';
 import { buildPreimage } from './preimage';
 import { devFeeManager } from '@/lib/devfee/manager';
+import { ConfigManager } from './config-manager';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -60,24 +61,32 @@ class MiningOrchestrator extends EventEmitter {
   /**
    * Update orchestrator configuration dynamically
    */
-  updateConfiguration(config: { workerThreads?: number; batchSize?: number }): void {
+  updateConfiguration(config: { workerThreads?: number; batchSize?: number; addressOffset?: number }): void {
     if (config.workerThreads !== undefined) {
       console.log(`[Orchestrator] Updating workerThreads: ${this.workerThreads} -> ${config.workerThreads}`);
       this.workerThreads = config.workerThreads;
+      ConfigManager.setWorkerThreads(config.workerThreads);
     }
     if (config.batchSize !== undefined) {
       console.log(`[Orchestrator] Updating batchSize: ${this.customBatchSize || 'default'} -> ${config.batchSize}`);
       this.customBatchSize = config.batchSize;
+      ConfigManager.setBatchSize(config.batchSize);
+    }
+    if (config.addressOffset !== undefined) {
+      console.log(`[Orchestrator] Updating addressOffset: ${this.addressOffset} -> ${config.addressOffset}`);
+      this.addressOffset = config.addressOffset;
+      ConfigManager.setAddressOffset(config.addressOffset);
     }
   }
 
   /**
    * Get current configuration
    */
-  getCurrentConfiguration(): { workerThreads: number; batchSize: number } {
+  getCurrentConfiguration(): { workerThreads: number; batchSize: number; addressOffset: number } {
     return {
       workerThreads: this.workerThreads,
       batchSize: this.getBatchSize(),
+      addressOffset: this.addressOffset,
     };
   }
 
@@ -94,7 +103,7 @@ class MiningOrchestrator extends EventEmitter {
    * @param password - Wallet password
    * @param addressOffset - Address range offset (0 = addresses 0-199, 1 = 200-399, etc.)
    */
-  async start(password: string, addressOffset: number = 0): Promise<void> {
+  async start(password: string, addressOffset?: number): Promise<void> {
     if (this.isRunning) {
       console.log('[Orchestrator] Mining already running, returning current state');
       return; // Just return without error if already running
@@ -103,8 +112,25 @@ class MiningOrchestrator extends EventEmitter {
     // Store password for address registration
     (this as any).currentPassword = password;
     
-    // Set address offset (default 0)
-    this.addressOffset = addressOffset;
+    // Load persisted config or use provided values
+    const persistedConfig = ConfigManager.loadConfig();
+    
+    // Use provided offset, or persisted offset, or default to 0
+    if (addressOffset !== undefined) {
+      this.addressOffset = addressOffset;
+      ConfigManager.setAddressOffset(addressOffset);
+    } else {
+      this.addressOffset = persistedConfig.addressOffset;
+    }
+    
+    // Load persisted worker threads and batch size
+    if (this.workerThreads === 11) { // Only if still at default
+      this.workerThreads = persistedConfig.workerThreads;
+    }
+    if (this.customBatchSize === null) { // Only if still at default
+      this.customBatchSize = persistedConfig.batchSize;
+    }
+    
     this.addressesPerRange = parseInt(process.env.MINING_ADDRESSES_PER_RANGE || '200', 10);
     
     // Load wallet
@@ -186,7 +212,7 @@ class MiningOrchestrator extends EventEmitter {
     this.pollLoop();
 
     // Schedule hourly restart to clean workers and reset state
-    this.scheduleHourlyRestart(password, addressOffset);
+    this.scheduleHourlyRestart(password, this.addressOffset);
 
     this.emit('status', {
       type: 'status',
@@ -224,9 +250,9 @@ class MiningOrchestrator extends EventEmitter {
    * Reinitialize the orchestrator - called when start button is clicked
    * This ensures fresh state and kicks off mining again
    * @param password - Wallet password
-   * @param addressOffset - Address range offset (0 = addresses 0-199, 1 = 200-399, etc.)
+   * @param addressOffset - Address range offset (0 = addresses 0-199, 1 = 200-399, etc.). If undefined, uses persisted value.
    */
-  async reinitialize(password: string, addressOffset: number = 0): Promise<void> {
+  async reinitialize(password: string, addressOffset?: number): Promise<void> {
     console.log('[Orchestrator] Reinitializing orchestrator...');
 
     // Stop current mining if running
@@ -244,7 +270,7 @@ class MiningOrchestrator extends EventEmitter {
 
     console.log('[Orchestrator] Reinitialization complete, starting fresh mining session...');
 
-    // Start fresh with address offset
+    // Start fresh with address offset (will use persisted if not provided)
     await this.start(password, addressOffset);
   }
 
@@ -1688,11 +1714,12 @@ class MiningOrchestrator extends EventEmitter {
   /**
    * Ensure all addresses are registered
    * Automatically detects and handles instance ID conflicts
+   * Includes retry logic for failed registrations
    */
   private async ensureAddressesRegistered(): Promise<void> {
     // Get password from wallet manager context (stored during start)
     const password = (this as any).currentPassword || '';
-    const unregistered = this.addresses.filter(a => !a.registered);
+    let unregistered = this.addresses.filter(a => !a.registered);
 
     if (unregistered.length === 0) {
       console.log('[Orchestrator] All addresses already registered');
@@ -1704,61 +1731,18 @@ class MiningOrchestrator extends EventEmitter {
     let registeredCount = 0;
     let conflictDetected = false;
     let addressesInConflict = 0;
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 5000; // 5 seconds between retries
+    const failedAddresses: DerivedAddress[] = [];
 
+    // First pass: attempt registration for all unregistered addresses
     for (const addr of unregistered) {
-      try {
-        // Emit registration start event
-        this.emit('registration_progress', {
-          type: 'registration_progress',
-          addressIndex: addr.index,
-          address: addr.bech32,
-          current: registeredCount,
-          total: totalToRegister,
-          success: false,
-          message: `Registering address ${addr.index}...`,
-        } as MiningEvent);
+      let success = false;
+      let retries = 0;
 
-        await this.registerAddress(addr);
-        registeredCount++;
-        console.log('[Orchestrator] Registered address', addr.index);
-
-        // Emit registration success event
-        this.emit('registration_progress', {
-          type: 'registration_progress',
-          addressIndex: addr.index,
-          address: addr.bech32,
-          current: registeredCount,
-          total: totalToRegister,
-          success: true,
-          message: `Address ${addr.index} registered successfully`,
-        } as MiningEvent);
-
-        // Rate limiting
-        await this.sleep(1500);
-      } catch (error: any) {
-        // Check if the address was actually registered (handled in registerAddress)
-        if (addr.registered) {
-          // Address was marked as registered (likely already registered from another computer)
-          registeredCount++;
-          addressesInConflict++;
-          conflictDetected = true;
-          console.log(`[Orchestrator] Address ${addr.index} was already registered - continuing`);
-          
-          // Emit registration success event (even though we didn't register it)
-          this.emit('registration_progress', {
-            type: 'registration_progress',
-            addressIndex: addr.index,
-            address: addr.bech32,
-            current: registeredCount,
-            total: totalToRegister,
-            success: true,
-            message: `Address ${addr.index} already registered (from another instance)`,
-          } as MiningEvent);
-        } else {
-          // Genuine registration failure
-          Logger.error('mining', `Failed to register address ${addr.index}`, error);
-
-          // Emit registration failure event
+      while (retries < MAX_RETRIES && !success) {
+        try {
+          // Emit registration start event
           this.emit('registration_progress', {
             type: 'registration_progress',
             addressIndex: addr.index,
@@ -1766,10 +1750,153 @@ class MiningOrchestrator extends EventEmitter {
             current: registeredCount,
             total: totalToRegister,
             success: false,
-            message: `Failed to register address ${addr.index}: ${error.message}`,
+            message: retries > 0 ? `Retrying registration for address ${addr.index} (attempt ${retries + 1}/${MAX_RETRIES})...` : `Registering address ${addr.index}...`,
           } as MiningEvent);
+
+          await this.registerAddress(addr);
+          
+          // Verify registration was saved
+          if (addr.registered) {
+            success = true;
+            registeredCount++;
+            console.log(`[Orchestrator] ✓ Registered address ${addr.index}${retries > 0 ? ` (after ${retries} retries)` : ''}`);
+
+            // Emit registration success event
+            this.emit('registration_progress', {
+              type: 'registration_progress',
+              addressIndex: addr.index,
+              address: addr.bech32,
+              current: registeredCount,
+              total: totalToRegister,
+              success: true,
+              message: `Address ${addr.index} registered successfully`,
+            } as MiningEvent);
+          } else {
+            throw new Error('Address not marked as registered after registration attempt');
+          }
+
+          // Rate limiting (only on success, not retries)
+          if (success && retries === 0) {
+            await this.sleep(1500);
+          }
+        } catch (error: any) {
+          retries++;
+          
+          // Check if the address was actually registered (handled in registerAddress)
+          if (addr.registered) {
+            // Address was marked as registered (likely already registered from another computer)
+            success = true;
+            registeredCount++;
+            addressesInConflict++;
+            conflictDetected = true;
+            console.log(`[Orchestrator] Address ${addr.index} was already registered - continuing`);
+            
+            // Emit registration success event
+            this.emit('registration_progress', {
+              type: 'registration_progress',
+              addressIndex: addr.index,
+              address: addr.bech32,
+              current: registeredCount,
+              total: totalToRegister,
+              success: true,
+              message: `Address ${addr.index} already registered (from another instance)`,
+            } as MiningEvent);
+          } else if (retries < MAX_RETRIES) {
+            // Retry after delay
+            console.warn(`[Orchestrator] Registration attempt ${retries} failed for address ${addr.index}: ${error.message}, retrying in ${RETRY_DELAY/1000}s...`);
+            await this.sleep(RETRY_DELAY);
+          } else {
+            // Max retries reached
+            Logger.error('mining', `Failed to register address ${addr.index} after ${MAX_RETRIES} attempts`, error);
+            failedAddresses.push(addr);
+
+            // Emit registration failure event
+            this.emit('registration_progress', {
+              type: 'registration_progress',
+              addressIndex: addr.index,
+              address: addr.bech32,
+              current: registeredCount,
+              total: totalToRegister,
+              success: false,
+              message: `Failed to register address ${addr.index} after ${MAX_RETRIES} attempts: ${error.message}`,
+            } as MiningEvent);
+          }
         }
       }
+    }
+
+    // Second pass: retry failed addresses one more time with longer delay
+    if (failedAddresses.length > 0) {
+      console.warn(`[Orchestrator] ⚠️  ${failedAddresses.length} addresses failed to register. Retrying with extended delay...`);
+      await this.sleep(10000); // Wait 10 seconds before retry pass
+
+      const stillFailed: DerivedAddress[] = [];
+      for (const addr of failedAddresses) {
+        try {
+          this.emit('registration_progress', {
+            type: 'registration_progress',
+            addressIndex: addr.index,
+            address: addr.bech32,
+            current: registeredCount,
+            total: totalToRegister,
+            success: false,
+            message: `Final retry for address ${addr.index}...`,
+          } as MiningEvent);
+
+          await this.registerAddress(addr);
+          
+          if (addr.registered) {
+            registeredCount++;
+            console.log(`[Orchestrator] ✓ Address ${addr.index} registered on final retry`);
+            
+            this.emit('registration_progress', {
+              type: 'registration_progress',
+              addressIndex: addr.index,
+              address: addr.bech32,
+              current: registeredCount,
+              total: totalToRegister,
+              success: true,
+              message: `Address ${addr.index} registered successfully (final retry)`,
+            } as MiningEvent);
+          } else {
+            stillFailed.push(addr);
+          }
+        } catch (error: any) {
+          if (!addr.registered) {
+            stillFailed.push(addr);
+            Logger.error('mining', `Final retry failed for address ${addr.index}`, error);
+          } else {
+            registeredCount++;
+          }
+        }
+      }
+
+      if (stillFailed.length > 0) {
+        console.error(`[Orchestrator] ❌ ${stillFailed.length} addresses could not be registered after all retries:`);
+        stillFailed.forEach(addr => {
+          console.error(`[Orchestrator]   - Address ${addr.index} (${addr.bech32.substring(0, 20)}...)`);
+        });
+        console.warn(`[Orchestrator] Mining will continue with ${registeredCount}/${totalToRegister} registered addresses`);
+      }
+    }
+
+    // Reload addresses from disk to ensure we have the latest registration status
+    try {
+      const reloadedAddresses = await this.walletManager!.loadWallet(password);
+      const addressMap = new Map(reloadedAddresses.map(a => [a.index, a]));
+      
+      // Update in-memory addresses with latest registration status
+      for (const addr of this.addresses) {
+        const reloaded = addressMap.get(addr.index);
+        if (reloaded) {
+          addr.registered = reloaded.registered;
+        }
+      }
+      
+      const finalRegistered = this.addresses.filter(a => a.registered).length;
+      console.log(`[Orchestrator] Registration complete: ${finalRegistered}/${this.addresses.length} addresses registered`);
+    } catch (error: any) {
+      console.warn(`[Orchestrator] Could not reload addresses to verify registration status: ${error.message}`);
     }
 
     // Note: If addresses are already registered, that's fine - just means another miner is using this range
@@ -1801,9 +1928,23 @@ class MiningOrchestrator extends EventEmitter {
       const registerUrl = `${this.apiBase}/register/${addr.bech32}/${signature}/${addr.publicKeyHex}`;
       await axios.post(registerUrl, {});
 
-      // Mark as registered
+      // Mark as registered and save to disk
       this.walletManager.markAddressRegistered(addr.index);
       addr.registered = true;
+      
+      // Verify the address was saved by reloading from disk
+      // This ensures persistence even if there's a sync issue
+      try {
+        const password = (this as any).currentPassword || '';
+        const reloaded = await this.walletManager.loadWallet(password);
+        const reloadedAddr = reloaded.find(a => a.index === addr.index);
+        if (reloadedAddr && !reloadedAddr.registered) {
+          console.warn(`[Orchestrator] Address ${addr.index} registration not persisted, retrying save...`);
+          this.walletManager.markAddressRegistered(addr.index);
+        }
+      } catch (verifyErr) {
+        console.warn(`[Orchestrator] Could not verify registration persistence: ${verifyErr}`);
+      }
     } catch (error: any) {
       // Check if address is already registered (common in multi-computer setups)
       const errorMessage = error?.response?.data?.message || error?.message || '';

@@ -4,10 +4,12 @@ import { miningOrchestrator } from '@/lib/mining/orchestrator';
 export async function GET() {
   try {
     const stats = miningOrchestrator.getStats();
+    const config = miningOrchestrator.getCurrentConfiguration();
 
     return NextResponse.json({
       success: true,
       stats,
+      config,
     });
   } catch (error: any) {
     console.error('[API] Mining status error:', error);

@@ -224,17 +224,43 @@ export class WalletManager {
 
   /**
    * Mark address as registered
+   * Ensures the address is saved to disk even if not in current in-memory list
    */
   markAddressRegistered(index: number): void {
-    const addr = this.derivedAddresses.find(a => a.index === index);
+    // Reload addresses from disk to ensure we have the latest state
+    let addresses: DerivedAddress[] = [];
+    if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
+      try {
+        addresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+      } catch (err) {
+        console.warn(`[WalletManager] Failed to reload addresses for registration: ${err}`);
+        addresses = this.derivedAddresses;
+      }
+    } else {
+      addresses = this.derivedAddresses;
+    }
+    
+    // Find and update the address
+    const addr = addresses.find(a => a.index === index);
     if (addr) {
       addr.registered = true;
-      // Save updated addresses
+      // Update in-memory list too
+      const inMemoryAddr = this.derivedAddresses.find(a => a.index === index);
+      if (inMemoryAddr) {
+        inMemoryAddr.registered = true;
+      }
+      
+      // Save updated addresses to disk
       fs.writeFileSync(
         DERIVED_ADDRESSES_FILE,
-        JSON.stringify(this.derivedAddresses, null, 2),
+        JSON.stringify(addresses, null, 2),
         { mode: 0o600 }
       );
+      
+      // Update in-memory list to match disk
+      this.derivedAddresses = addresses;
+    } else {
+      console.warn(`[WalletManager] Address ${index} not found when marking as registered`);
     }
   }
 
