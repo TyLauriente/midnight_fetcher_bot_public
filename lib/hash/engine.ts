@@ -17,10 +17,22 @@ class HashEngine {
     const hashServiceUrl = process.env.HASH_SERVICE_URL || 'http://127.0.0.1:9001';
     
     // Dynamically calculate connection pool size based on worker threads
-    // For high-end systems (100-200 vCPUs), we need much larger connection pools
-    // Formula: max(200, workerThreads * 2) to handle concurrent batches
+    // CRITICAL FIX: For low-end systems, use smaller connection pools to avoid resource exhaustion
+    // Low-end systems (< 10 workers): 20-50 connections
+    // Mid-range (10-50 workers): workers * 2
+    // High-end (50+ workers): larger pools for concurrent batches
     const workerThreads = parseInt(process.env.MINING_WORKER_THREADS || '11', 10);
-    const maxConnections = Math.max(200, workerThreads * 2);
+    let maxConnections: number;
+    if (workerThreads < 10) {
+      // Low-end systems: smaller connection pool
+      maxConnections = Math.max(20, workerThreads * 5);
+    } else if (workerThreads < 50) {
+      // Mid-range: moderate connection pool
+      maxConnections = workerThreads * 2;
+    } else {
+      // High-end: large connection pool for concurrent batches
+      maxConnections = Math.max(200, workerThreads * 2);
+    }
     
     // Increase timeout for very large batches (50k hashes can take 30-60 seconds)
     // CRITICAL: Must be at least 120 seconds to match batchTimeout cap in hashBatch

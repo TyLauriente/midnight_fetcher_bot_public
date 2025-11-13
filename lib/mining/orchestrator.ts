@@ -138,10 +138,16 @@ class MiningOrchestrator extends EventEmitter {
       return this.customBatchSize;
     }
     
-    // Dynamic batch size based on worker count for high-end systems
-    // More workers = larger batches for better throughput
-    // Formula: min(300 + (workers * 10), 50000)
-    // Example: 100 workers = 1300 batch size, 200 workers = 2300 batch size
+    // Dynamic batch size based on worker count
+    // CRITICAL FIX: For low-end systems, use smaller batches to avoid overwhelming the system
+    // Low-end systems (< 10 workers): 200-300 batch size
+    // Mid-range (10-50 workers): 300 + (workers * 10)
+    // High-end (50+ workers): larger batches for better throughput
+    if (this.workerThreads < 10) {
+      // Low-end systems: smaller batches for stability
+      return Math.max(200, Math.min(300, 200 + (this.workerThreads * 10)));
+    }
+    // Mid-range and high-end: larger batches
     const dynamicBatchSize = Math.min(300 + (this.workerThreads * 10), 50000);
     return dynamicBatchSize;
   }
@@ -185,8 +191,11 @@ class MiningOrchestrator extends EventEmitter {
     // Optimize for high-end systems: mine multiple addresses in parallel
     // For systems with 100+ vCPUs, we can mine multiple addresses simultaneously
     // Formula: min(workerThreads / 10, 10) - allows up to 10 parallel addresses
-    // This ensures we have enough workers per address (at least 10 workers per address)
-    const optimalConcurrentAddresses = Math.min(Math.max(1, Math.floor(this.workerThreads / 10)), 10);
+    // CRITICAL FIX: For low-end systems (< 20 workers), always use 1 address to avoid spreading workers too thin
+    // This ensures low-end systems have all workers focused on one address for better solution rates
+    const optimalConcurrentAddresses = this.workerThreads >= 20 
+      ? Math.min(Math.max(1, Math.floor(this.workerThreads / 10)), 10)
+      : 1; // Low-end systems: single address mode for better performance
     this.maxConcurrentAddresses = parseInt(process.env.MINING_MAX_CONCURRENT_ADDRESSES || optimalConcurrentAddresses.toString(), 10);
     console.log(`[Orchestrator] Max concurrent addresses: ${this.maxConcurrentAddresses} (${this.workerThreads} total workers)`);
     
@@ -940,8 +949,12 @@ class MiningOrchestrator extends EventEmitter {
           // Calculate worker ID range for this address
           // Optimized distribution: ensure all workers are used, no gaps
           // Distribute workers across addresses: address 0 gets workers 0-N, address 1 gets workers N+1-2N, etc.
-          const totalUserWorkers = Math.floor(this.workerThreads * 0.8);
-          const workersPerAddress = Math.max(10, Math.floor(totalUserWorkers / addressesToProcess.length));
+          // CRITICAL FIX: For low-end systems, use all workers (not 80%) and ensure minimum of 1 worker per address
+          const totalUserWorkers = this.workerThreads; // Use all workers for low-end systems
+          // Minimum workers per address: 1 for low-end systems, 10 for high-end systems
+          // This ensures low-end systems (4-8 cores) can still mine effectively
+          const minWorkersPerAddress = this.workerThreads >= 20 ? 10 : 1;
+          const workersPerAddress = Math.max(minWorkersPerAddress, Math.floor(totalUserWorkers / addressesToProcess.length));
           const workerStartId = idx * workersPerAddress;
           // Ensure last address gets all remaining workers (no waste)
           const workerEndId = idx === addressesToProcess.length - 1 
