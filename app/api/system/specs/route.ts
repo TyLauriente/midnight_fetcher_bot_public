@@ -1,6 +1,80 @@
 import { NextResponse } from 'next/server';
 import * as os from 'os';
+import { execSync } from 'child_process';
 import { miningOrchestrator } from '@/lib/mining/orchestrator';
+
+/**
+ * Get CPU core count, trying to detect physical cores on Linux
+ * Falls back to logical cores if detection fails
+ */
+function getCpuCoreCount(platform: string): { logical: number; physical: number | null } {
+  const cpus = os.cpus();
+  const logicalCores = cpus.length;
+  
+  // Try to get physical cores on Linux
+  if (platform === 'linux') {
+    try {
+      // Method 1: Check /proc/cpuinfo for physical cores
+      const cpuinfo = execSync('grep -c "^physical id" /proc/cpuinfo 2>/dev/null || echo 0', { encoding: 'utf8' }).trim();
+      const physicalIds = parseInt(cpuinfo) || 0;
+      
+      if (physicalIds > 0) {
+        // Count unique physical IDs
+        const coresPerPhysical = execSync('grep "^cpu cores" /proc/cpuinfo | head -1 | cut -d: -f2 | tr -d " "', { encoding: 'utf8' }).trim();
+        const coresPerPackage = parseInt(coresPerPhysical) || 0;
+        
+        if (coresPerPackage > 0) {
+          const physicalCores = physicalIds * coresPerPackage;
+          return { logical: logicalCores, physical: physicalCores };
+        }
+      }
+      
+      // Method 2: Use lscpu if available (more reliable)
+      try {
+        const lscpuOutput = execSync('lscpu 2>/dev/null', { encoding: 'utf8' });
+        const socketsMatch = lscpuOutput.match(/^Socket\(s\):\s*(\d+)/m);
+        const coresPerSocketMatch = lscpuOutput.match(/^Core\(s\) per socket:\s*(\d+)/m);
+        const threadsPerCoreMatch = lscpuOutput.match(/^Thread\(s\) per core:\s*(\d+)/m);
+        
+        if (socketsMatch && coresPerSocketMatch) {
+          const sockets = parseInt(socketsMatch[1]);
+          const coresPerSocket = parseInt(coresPerSocketMatch[1]);
+          const physicalCores = sockets * coresPerSocket;
+          
+          // Verify: logical should equal physical * threads_per_core
+          if (threadsPerCoreMatch) {
+            const threadsPerCore = parseInt(threadsPerCoreMatch[1]);
+            const expectedLogical = physicalCores * threadsPerCore;
+            if (Math.abs(expectedLogical - logicalCores) <= 2) { // Allow small variance
+              return { logical: logicalCores, physical: physicalCores };
+            }
+          } else {
+            return { logical: logicalCores, physical: physicalCores };
+          }
+        }
+      } catch (lscpuErr) {
+        // lscpu not available, continue with other methods
+      }
+      
+      // Method 3: Count unique core IDs (fallback)
+      try {
+        const coreIds = execSync('grep "^core id" /proc/cpuinfo | sort -u | wc -l', { encoding: 'utf8' }).trim();
+        const physicalCores = parseInt(coreIds) || null;
+        if (physicalCores && physicalCores > 0 && physicalCores <= logicalCores) {
+          return { logical: logicalCores, physical: physicalCores };
+        }
+      } catch (coreIdErr) {
+        // Fall through to default
+      }
+    } catch (err) {
+      // If all methods fail, fall back to logical cores
+      console.warn('[System Specs] Failed to detect physical cores on Linux:', err);
+    }
+  }
+  
+  // Default: return logical cores, physical unknown
+  return { logical: logicalCores, physical: null };
+}
 
 /**
  * System Specs API - Returns hardware specifications for scaling recommendations
@@ -14,9 +88,12 @@ export async function GET() {
     const arch = os.arch();
     const loadAvg = os.loadavg();
 
-    // Get CPU info
+    // Get CPU info with improved detection
     const cpuModel = cpus[0]?.model || 'Unknown';
-    const cpuCount = cpus.length;
+    const { logical: logicalCores, physical: physicalCores } = getCpuCoreCount(platform);
+    // Use physical cores if available, otherwise logical cores
+    // For mining, logical cores (including hyperthreading) are usually fine
+    const cpuCount = physicalCores !== null ? physicalCores : logicalCores;
     const cpuSpeed = cpus[0]?.speed || 0;
 
     // Calculate memory in GB
@@ -44,6 +121,8 @@ export async function GET() {
         cpu: {
           model: cpuModel,
           cores: cpuCount,
+          logicalCores: logicalCores,
+          physicalCores: physicalCores,
           speed: cpuSpeed,
           loadAverage: loadAvg,
         },
@@ -88,19 +167,25 @@ function calculateRecommendations(specs: {
 
   // Worker threads recommendation
   // Rule: Use 80% of CPU cores to leave headroom for OS and other processes
-  // Absolute maximum: 20 threads (diminishing returns beyond this for most mining workloads)
-  const ABSOLUTE_MAX_WORKERS = 20;
+  // Absolute maximum: 1024 (matches API limit, but practical max is usually much lower)
+  const ABSOLUTE_MAX_WORKERS = 1024;
 
-  // Calculate max workers based on CPU count (can go higher than optimal for high-end systems)
+  // Calculate max workers based on CPU count
+  // For systems with hyperthreading, we can use up to logical core count
+  // But we'll recommend based on physical cores for stability
   let maxWorkers: number;
-  if (cpuCount >= 24) {
-    maxWorkers = Math.min(ABSOLUTE_MAX_WORKERS, Math.floor(cpuCount * 0.85)); // 85% for very high-end
+  if (cpuCount >= 64) {
+    maxWorkers = Math.min(ABSOLUTE_MAX_WORKERS, Math.floor(cpuCount * 0.9)); // 90% for very high-end (64+ cores)
+  } else if (cpuCount >= 32) {
+    maxWorkers = Math.min(ABSOLUTE_MAX_WORKERS, Math.floor(cpuCount * 0.85)); // 85% for high-end (32+ cores)
   } else if (cpuCount >= 16) {
-    maxWorkers = Math.min(ABSOLUTE_MAX_WORKERS, Math.floor(cpuCount * 0.8)); // 80% for high-end
+    maxWorkers = Math.min(ABSOLUTE_MAX_WORKERS, Math.floor(cpuCount * 0.8)); // 80% for high-end (16+ cores)
   } else if (cpuCount >= 8) {
-    maxWorkers = Math.floor(cpuCount * 0.75); // 75% for mid-range
+    maxWorkers = Math.floor(cpuCount * 0.75); // 75% for mid-range (8+ cores)
+  } else if (cpuCount >= 4) {
+    maxWorkers = Math.max(4, cpuCount - 1); // Leave 1 core free for low-end (4+ cores)
   } else {
-    maxWorkers = Math.max(4, cpuCount - 1); // Leave 1 core free for low-end
+    maxWorkers = Math.max(1, cpuCount); // Use all cores for very low-end (<4 cores)
   }
 
   // Optimal workers (recommended for best balance of performance and stability)
