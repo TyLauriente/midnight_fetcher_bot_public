@@ -41,8 +41,10 @@ export class HashClient {
       headers: {
         'Connection': 'keep-alive',
       },
-      maxContentLength: 50 * 1024 * 1024, // 50MB for batch requests
-      maxBodyLength: 50 * 1024 * 1024, // 50MB for batch requests
+      // Increased for high-end systems with very large batches (50k hashes)
+      // Each preimage is ~200 bytes, so 50k = ~10MB, but JSON overhead can be 2-3x
+      maxContentLength: 100 * 1024 * 1024, // 100MB for very large batch requests
+      maxBodyLength: 100 * 1024 * 1024, // 100MB for very large batch requests
     });
 
     console.log(`[HashClient] Connection pool initialized: ${maxConnectionsPerUrl} connections to ${baseUrl}`);
@@ -134,8 +136,13 @@ export class HashClient {
     let lastError: Error | null = null;
 
     // Longer timeout for batch operations (scales with batch size)
-    // ~10-20ms per hash in batch, so 5000 hashes = ~100 seconds max
-    const batchTimeout = Math.max(30000, preimages.length * 20);
+    // For high-end systems with large batches (50k hashes):
+    // - Rayon parallel processing: ~1-2ms per hash on high-end CPUs
+    // - Network overhead: ~100-200ms per batch
+    // - Safety margin: 2x the expected time
+    const estimatedTimePerHash = 2; // ms per hash (optimistic for high-end systems)
+    const networkOverhead = 500; // ms for network/JSON serialization
+    const batchTimeout = Math.max(60000, (preimages.length * estimatedTimePerHash) + networkOverhead);
 
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       try {

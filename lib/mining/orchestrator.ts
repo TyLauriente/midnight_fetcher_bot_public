@@ -28,7 +28,11 @@ class MiningOrchestrator extends EventEmitter {
   private isRunning = false;
   private currentChallengeId: string | null = null;
   private apiBase: string = 'https://scavenger.prod.gd.midnighttge.io';
-  private pollInterval = 2000; // 2 seconds - frequent polling to keep latest_submission fresh (it updates with every network solution)
+  // Optimize polling interval for high-end systems
+  // For systems with many workers, we can poll less frequently since we're processing more solutions
+  // Default: 2 seconds, but can be reduced for high-end systems
+  private pollInterval = parseInt(process.env.MINING_POLL_INTERVAL || '2000', 10);
+  private maxConcurrentAddresses = 1; // Maximum addresses to mine simultaneously (optimized for high-end systems)
   private pollTimer: NodeJS.Timeout | null = null;
   private walletManager: WalletManager | null = null;
   private isDevFeeMining = false; // Flag to prevent multiple simultaneous dev fee mining operations
@@ -92,9 +96,19 @@ class MiningOrchestrator extends EventEmitter {
 
   /**
    * Get current batch size (custom or default)
+   * Optimized for high-end systems: larger batches = better throughput
    */
   private getBatchSize(): number {
-    return this.customBatchSize || 300; // Default BATCH_SIZE
+    if (this.customBatchSize !== null) {
+      return this.customBatchSize;
+    }
+    
+    // Dynamic batch size based on worker count for high-end systems
+    // More workers = larger batches for better throughput
+    // Formula: min(300 + (workers * 10), 50000)
+    // Example: 100 workers = 1300 batch size, 200 workers = 2300 batch size
+    const dynamicBatchSize = Math.min(300 + (this.workerThreads * 10), 50000);
+    return dynamicBatchSize;
   }
 
 
@@ -130,6 +144,14 @@ class MiningOrchestrator extends EventEmitter {
     if (this.customBatchSize === null) { // Only if still at default
       this.customBatchSize = persistedConfig.batchSize;
     }
+    
+    // Optimize for high-end systems: mine multiple addresses in parallel
+    // For systems with 100+ vCPUs, we can mine multiple addresses simultaneously
+    // Formula: min(workerThreads / 10, 10) - allows up to 10 parallel addresses
+    // This ensures we have enough workers per address (at least 10 workers per address)
+    const optimalConcurrentAddresses = Math.min(Math.max(1, Math.floor(this.workerThreads / 10)), 10);
+    this.maxConcurrentAddresses = parseInt(process.env.MINING_MAX_CONCURRENT_ADDRESSES || optimalConcurrentAddresses.toString(), 10);
+    console.log(`[Orchestrator] Max concurrent addresses: ${this.maxConcurrentAddresses} (${this.workerThreads} total workers)`);
     
     this.addressesPerRange = parseInt(process.env.MINING_ADDRESSES_PER_RANGE || '200', 10);
     
@@ -567,6 +589,78 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
+   * Mine a single address with a specific range of workers
+   * Helper method for parallel address mining
+   */
+  private async mineAddressWithWorkers(
+    addr: DerivedAddress,
+    challengeId: string,
+    workerStartId: number,
+    workerEndId: number,
+    addressesInProgress: Set<string>,
+    lastMineAttempt: Map<string, number>
+  ): Promise<void> {
+    const MAX_SUBMISSION_FAILURES = 6;
+    const MIN_RETRY_DELAY = 30000;
+    const now = Date.now();
+    
+    // CRITICAL: Reset failure counter if we're retrying after delay
+    const submissionKey = `${addr.bech32}:${challengeId}`;
+    const lastAttempt = lastMineAttempt.get(addr.bech32);
+    const timeSinceLastAttempt = lastAttempt ? (now - lastAttempt) : 0;
+    
+    if (timeSinceLastAttempt >= MIN_RETRY_DELAY) {
+      const failureCount = this.addressSubmissionFailures.get(submissionKey);
+      if (failureCount && failureCount > 0) {
+        console.log(`[Orchestrator] Retrying address ${addr.index} after delay - clearing previous failure count (${failureCount})`);
+        this.addressSubmissionFailures.delete(submissionKey);
+      }
+    }
+
+    console.log(`[Orchestrator] ========================================`);
+    console.log(`[Orchestrator] Starting mining for address ${addr.index} (workers ${workerStartId}-${workerEndId - 1})`);
+    console.log(`[Orchestrator] Address: ${addr.bech32.slice(0, 20)}...`);
+    console.log(`[Orchestrator] Max allowed failures: ${MAX_SUBMISSION_FAILURES}`);
+    console.log(`[Orchestrator] ========================================`);
+
+    // Set current mining address for this address group (only if single address mode)
+    if (this.maxConcurrentAddresses === 1) {
+      this.currentMiningAddress = addr.bech32;
+    }
+
+    // Clear stopped workers set for this address
+    this.stoppedWorkers.clear();
+
+    // Launch workers for this address
+    const userWorkerCount = workerEndId - workerStartId;
+    const workers = Array(userWorkerCount).fill(null).map((_, idx) =>
+      this.mineForAddress(addr, false, workerStartId + idx, MAX_SUBMISSION_FAILURES)
+    );
+
+    // Wait for ALL workers to complete
+    try {
+      await Promise.all(workers);
+    } catch (error) {
+      console.error(`[Orchestrator] Error in workers for address ${addr.index}:`, error);
+    } finally {
+      // Always remove from in-progress set
+      addressesInProgress.delete(addr.bech32);
+    }
+
+    // Check if address was successfully solved
+    const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
+    const addressSolved = solvedChallenges?.has(challengeId) || false;
+
+    if (addressSolved) {
+      console.log(`[Orchestrator] ✓ Address ${addr.index} SOLVED!`);
+      lastMineAttempt.delete(addr.bech32);
+    } else {
+      console.log(`[Orchestrator] ✗ Address ${addr.index} FAILED after ${MAX_SUBMISSION_FAILURES} attempts.`);
+      console.log(`[Orchestrator] Will retry this address after ${MIN_RETRY_DELAY / 1000}s (challenge data may have updated)`);
+    }
+  }
+
+  /**
    * Start mining loop for current challenge
    */
   private async startMining(): Promise<void> {
@@ -681,82 +775,46 @@ class MiningOrchestrator extends EventEmitter {
         }
       }
 
-      // Process the next available address
-      const addr = newAddressesToMine[0];
-      addressesInProgress.add(addr.bech32);
-      lastMineAttempt.set(addr.bech32, now);
-
-      // CRITICAL: Reset failure counter if we're retrying after delay
-      // This allows addresses to be retried even if they previously failed
-      // Challenge data may have changed (latest_submission updated, etc.)
-      const submissionKey = `${addr.bech32}:${currentChallengeId}`;
-      const lastAttempt = lastMineAttempt.get(addr.bech32);
-      const timeSinceLastAttempt = lastAttempt ? (now - lastAttempt) : 0;
+      // Process multiple addresses in parallel for high-end systems
+      // Take up to maxConcurrentAddresses addresses at once
+      const addressesToProcess = newAddressesToMine.slice(0, this.maxConcurrentAddresses);
       
-      // If retrying after delay, clear failure counter to give it a fresh chance
-      if (timeSinceLastAttempt >= MIN_RETRY_DELAY) {
-        const failureCount = this.addressSubmissionFailures.get(submissionKey);
-        if (failureCount && failureCount > 0) {
-          console.log(`[Orchestrator] Retrying address ${addr.index} after delay - clearing previous failure count (${failureCount})`);
-          this.addressSubmissionFailures.delete(submissionKey);
-        }
-      }
-
-      // Track submission failures for this address
-      const MAX_SUBMISSION_FAILURES = 6;
-      let addressSolved = false;
-
-      console.log(`[Orchestrator] ========================================`);
-      console.log(`[Orchestrator] Starting mining for address ${addr.index}`);
-      console.log(`[Orchestrator] Address: ${addr.bech32.slice(0, 20)}...`);
-      console.log(`[Orchestrator] Max allowed failures: ${MAX_SUBMISSION_FAILURES}`);
-      console.log(`[Orchestrator] ========================================`);
-
-      // Set current mining address - all workers will mine this address
-      this.currentMiningAddress = addr.bech32;
-
-      // Clear stopped workers set for this address
-      this.stoppedWorkers.clear();
-
-      // Launch workers to mine for the SAME address in parallel
-      // ALWAYS reserve 20% of workers for potential dev fee mining
-      // This prevents worker ID conflicts when dev fee starts/stops
-      // Workers 0-7 (80%) = user mining, Workers 8-10 (20%) = dev fee mining
-      const userWorkerCount = Math.floor(this.workerThreads * 0.8);
-
-      if (this.isDevFeeMining) {
-        console.log(`[Orchestrator] Dev fee active - using ${userWorkerCount} workers for user mining (${this.workerThreads - userWorkerCount} reserved for dev fee)`);
-      }
-
-      // Each worker gets a unique ID (0 to userWorkerCount-1) to generate different nonces
-      const workers = Array(userWorkerCount).fill(null).map((_, workerId) =>
-        this.mineForAddress(addr, false, workerId, MAX_SUBMISSION_FAILURES)
-      );
-
-      // Wait for ALL workers to complete (they'll exit when address is solved or max failures reached)
-      try {
-        await Promise.all(workers);
-      } catch (error) {
-        console.error(`[Orchestrator] Error in workers for address ${addr.index}:`, error);
-      } finally {
-        // Always remove from in-progress set, even if there was an error
-        addressesInProgress.delete(addr.bech32);
-      }
-
-      // Check if address was successfully solved
-      const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
-      addressSolved = solvedChallenges?.has(currentChallengeId!) || false;
-
-      if (addressSolved) {
-        console.log(`[Orchestrator] ✓ Address ${addr.index} SOLVED! Moving to next address...`);
-        // Remove from retry tracking since it's solved
-        lastMineAttempt.delete(addr.bech32);
-      } else {
-        console.log(`[Orchestrator] ✗ Address ${addr.index} FAILED after ${MAX_SUBMISSION_FAILURES} attempts.`);
-        console.log(`[Orchestrator] Will retry this address after ${MIN_RETRY_DELAY / 1000}s (challenge data may have updated)`);
-        // Keep in lastMineAttempt so it can be retried after delay
-        // Don't add back to addressesInProgress - let it retry later
-      }
+      // Launch mining for all selected addresses in parallel
+      const miningPromises = addressesToProcess.map((addr, idx) => {
+        addressesInProgress.add(addr.bech32);
+        lastMineAttempt.set(addr.bech32, now);
+        
+        // Calculate worker ID range for this address
+        // Distribute workers across addresses: address 0 gets workers 0-N, address 1 gets workers N+1-2N, etc.
+        const totalUserWorkers = Math.floor(this.workerThreads * 0.8);
+        const workersPerAddress = Math.max(10, Math.floor(totalUserWorkers / addressesToProcess.length));
+        const workerStartId = idx * workersPerAddress;
+        const workerEndId = Math.min(workerStartId + workersPerAddress, totalUserWorkers);
+        
+        return this.mineAddressWithWorkers(addr, currentChallengeId, workerStartId, workerEndId, addressesInProgress, lastMineAttempt);
+      });
+      
+      // Wait for at least one address to finish (or all if they all fail)
+      await Promise.race([
+        Promise.allSettled(miningPromises),
+        // Also resolve if any address is solved (to immediately pick up next address)
+        new Promise(resolve => {
+          const checkInterval = setInterval(() => {
+            const anySolved = addressesToProcess.some(addr => {
+              const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
+              return solvedChallenges?.has(currentChallengeId);
+            });
+            if (anySolved) {
+              clearInterval(checkInterval);
+              resolve(null);
+            }
+          }, 1000);
+          // Cleanup after 5 minutes max
+          setTimeout(() => clearInterval(checkInterval), 300000);
+        })
+      ]);
+      
+      continue; // Continue to next iteration to pick up new addresses
 
       // After solution submitted or max failures, continue to next address
       // The 2-second poll will refresh challenge data, and failed addresses will be retried after delay
@@ -845,7 +903,9 @@ class MiningOrchestrator extends EventEmitter {
     // Mine continuously with sequential nonces using BATCH processing
     while (this.isRunning && this.isMining && this.currentChallengeId === challengeId && currentNonce < nonceEnd) {
       // Check if we're still mining the correct address
-      if (!isDevFee && this.currentMiningAddress !== addr.bech32) {
+      // For parallel address mining (maxConcurrentAddresses > 1), workers are assigned to specific addresses
+      // In that case, we don't check currentMiningAddress since multiple addresses can be active
+      if (!isDevFee && this.maxConcurrentAddresses === 1 && this.currentMiningAddress !== addr.bech32) {
         console.log(`[Orchestrator] Worker ${workerId}: Current address changed (was ${addr.index}), stopping`);
         return;
       }
@@ -1735,82 +1795,23 @@ class MiningOrchestrator extends EventEmitter {
     const RETRY_DELAY = 5000; // 5 seconds between retries
     const failedAddresses: DerivedAddress[] = [];
 
-    // First pass: attempt registration for all unregistered addresses
-    for (const addr of unregistered) {
-      let success = false;
-      let retries = 0;
+    // Optimize registration for high-end systems: parallelize when possible
+    // For large batches (>50 addresses), register in parallel batches of 10
+    const PARALLEL_REGISTRATION_BATCH_SIZE = totalToRegister > 50 ? 10 : 1; // Parallel batches of 10 for large sets
+    const REGISTRATION_DELAY = totalToRegister > 50 ? 200 : 1500; // Faster for large batches
+    
+    // Process addresses in parallel batches
+    for (let batchStart = 0; batchStart < unregistered.length; batchStart += PARALLEL_REGISTRATION_BATCH_SIZE) {
+      const batch = unregistered.slice(batchStart, batchStart + PARALLEL_REGISTRATION_BATCH_SIZE);
+      
+      // Register batch in parallel
+      const batchResults = await Promise.allSettled(batch.map(async (addr) => {
+        let success = false;
+        let retries = 0;
 
-      while (retries < MAX_RETRIES && !success) {
-        try {
-          // Emit registration start event
-          this.emit('registration_progress', {
-            type: 'registration_progress',
-            addressIndex: addr.index,
-            address: addr.bech32,
-            current: registeredCount,
-            total: totalToRegister,
-            success: false,
-            message: retries > 0 ? `Retrying registration for address ${addr.index} (attempt ${retries + 1}/${MAX_RETRIES})...` : `Registering address ${addr.index}...`,
-          } as MiningEvent);
-
-          await this.registerAddress(addr);
-          
-          // Verify registration was saved
-          if (addr.registered) {
-            success = true;
-            registeredCount++;
-            console.log(`[Orchestrator] ✓ Registered address ${addr.index}${retries > 0 ? ` (after ${retries} retries)` : ''}`);
-
-            // Emit registration success event
-            this.emit('registration_progress', {
-              type: 'registration_progress',
-              addressIndex: addr.index,
-              address: addr.bech32,
-              current: registeredCount,
-              total: totalToRegister,
-              success: true,
-              message: `Address ${addr.index} registered successfully`,
-            } as MiningEvent);
-          } else {
-            throw new Error('Address not marked as registered after registration attempt');
-          }
-
-          // Rate limiting (only on success, not retries)
-          if (success && retries === 0) {
-            await this.sleep(1500);
-          }
-        } catch (error: any) {
-          retries++;
-          
-          // Check if the address was actually registered (handled in registerAddress)
-          if (addr.registered) {
-            // Address was marked as registered (likely already registered from another computer)
-            success = true;
-            registeredCount++;
-            addressesInConflict++;
-            conflictDetected = true;
-            console.log(`[Orchestrator] Address ${addr.index} was already registered - continuing`);
-            
-            // Emit registration success event
-            this.emit('registration_progress', {
-              type: 'registration_progress',
-              addressIndex: addr.index,
-              address: addr.bech32,
-              current: registeredCount,
-              total: totalToRegister,
-              success: true,
-              message: `Address ${addr.index} already registered (from another instance)`,
-            } as MiningEvent);
-          } else if (retries < MAX_RETRIES) {
-            // Retry after delay
-            console.warn(`[Orchestrator] Registration attempt ${retries} failed for address ${addr.index}: ${error.message}, retrying in ${RETRY_DELAY/1000}s...`);
-            await this.sleep(RETRY_DELAY);
-          } else {
-            // Max retries reached
-            Logger.error('mining', `Failed to register address ${addr.index} after ${MAX_RETRIES} attempts`, error);
-            failedAddresses.push(addr);
-
-            // Emit registration failure event
+        while (retries < MAX_RETRIES && !success) {
+          try {
+            // Emit registration start event
             this.emit('registration_progress', {
               type: 'registration_progress',
               addressIndex: addr.index,
@@ -1818,10 +1819,88 @@ class MiningOrchestrator extends EventEmitter {
               current: registeredCount,
               total: totalToRegister,
               success: false,
-              message: `Failed to register address ${addr.index} after ${MAX_RETRIES} attempts: ${error.message}`,
+              message: retries > 0 ? `Retrying registration for address ${addr.index} (attempt ${retries + 1}/${MAX_RETRIES})...` : `Registering address ${addr.index}...`,
             } as MiningEvent);
+
+            await this.registerAddress(addr);
+            
+            // Verify registration was saved
+            if (addr.registered) {
+              success = true;
+              registeredCount++;
+              console.log(`[Orchestrator] ✓ Registered address ${addr.index}${retries > 0 ? ` (after ${retries} retries)` : ''}`);
+
+              // Emit registration success event
+              this.emit('registration_progress', {
+                type: 'registration_progress',
+                addressIndex: addr.index,
+                address: addr.bech32,
+                current: registeredCount,
+                total: totalToRegister,
+                success: true,
+                message: `Address ${addr.index} registered successfully`,
+              } as MiningEvent);
+            } else {
+              throw new Error('Address not marked as registered after registration attempt');
+            }
+          } catch (error: any) {
+            retries++;
+            
+            // Check if the address was actually registered (handled in registerAddress)
+            if (addr.registered) {
+              // Address was marked as registered (likely already registered from another computer)
+              success = true;
+              registeredCount++;
+              addressesInConflict++;
+              conflictDetected = true;
+              console.log(`[Orchestrator] Address ${addr.index} was already registered - continuing`);
+              
+              // Emit registration success event
+              this.emit('registration_progress', {
+                type: 'registration_progress',
+                addressIndex: addr.index,
+                address: addr.bech32,
+                current: registeredCount,
+                total: totalToRegister,
+                success: true,
+                message: `Address ${addr.index} already registered (from another instance)`,
+              } as MiningEvent);
+            } else if (retries < MAX_RETRIES) {
+              // Retry after delay
+              console.warn(`[Orchestrator] Registration attempt ${retries} failed for address ${addr.index}: ${error.message}, retrying in ${RETRY_DELAY/1000}s...`);
+              await this.sleep(RETRY_DELAY);
+            } else {
+              // Max retries reached
+              Logger.error('mining', `Failed to register address ${addr.index} after ${MAX_RETRIES} attempts`, error);
+              failedAddresses.push(addr);
+
+              // Emit registration failure event
+              this.emit('registration_progress', {
+                type: 'registration_progress',
+                addressIndex: addr.index,
+                address: addr.bech32,
+                current: registeredCount,
+                total: totalToRegister,
+                success: false,
+                message: `Failed to register address ${addr.index} after ${MAX_RETRIES} attempts: ${error.message}`,
+              } as MiningEvent);
+            }
           }
         }
+        
+        return { addr, success };
+      }));
+      
+      // Process results and track failures
+      for (const result of batchResults) {
+        if (result.status === 'rejected') {
+          console.error(`[Orchestrator] Registration promise rejected:`, result.reason);
+        }
+      }
+      
+      // Rate limiting between batches (only on success, not retries)
+      if (batchStart + PARALLEL_REGISTRATION_BATCH_SIZE < unregistered.length) {
+        await this.sleep(REGISTRATION_DELAY);
       }
     }
 

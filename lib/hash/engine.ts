@@ -15,14 +15,25 @@ class HashEngine {
   constructor() {
     // Initialize HashClient connection to external hash server
     const hashServiceUrl = process.env.HASH_SERVICE_URL || 'http://127.0.0.1:9001';
+    
+    // Dynamically calculate connection pool size based on worker threads
+    // For high-end systems (100-200 vCPUs), we need much larger connection pools
+    // Formula: max(200, workerThreads * 2) to handle concurrent batches
+    const workerThreads = parseInt(process.env.MINING_WORKER_THREADS || '11', 10);
+    const maxConnections = Math.max(200, workerThreads * 2);
+    
+    // Increase timeout for very large batches (50k hashes can take 30-60 seconds)
+    const requestTimeout = Math.max(10000, 60000); // At least 60 seconds for large batches
+    
     this.hashClient = new HashClient(hashServiceUrl, {
-      maxConnectionsPerUrl: 200, // Increased for 16 parallel workers with large batches
-      keepAliveTimeout: 60000,
-      requestTimeout: 10000,
+      maxConnectionsPerUrl: maxConnections,
+      keepAliveTimeout: 120000, // 2 minutes for high-end systems
+      requestTimeout: requestTimeout,
       maxRetries: 3,
       retryDelayMs: 100,
     });
-    console.log('[Hash Engine] Initialized HTTP client for hash service:', hashServiceUrl);
+    console.log(`[Hash Engine] Initialized HTTP client for hash service: ${hashServiceUrl}`);
+    console.log(`[Hash Engine] Connection pool: ${maxConnections} connections, timeout: ${requestTimeout}ms`);
   }
 
   /**
