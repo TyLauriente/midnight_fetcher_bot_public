@@ -813,6 +813,26 @@ class MiningOrchestrator extends EventEmitter {
       // OPTIMIZATION: Cache Date.now() at start of loop iteration to reduce system calls
       const now = Date.now();
       
+      // CRITICAL: Check for batch size recovery periodically (not just after successful hashes)
+      // This ensures recovery happens even if there are continuous timeouts
+      if (this.hashServiceTimeoutCount > 0 && this.adaptiveBatchSize !== null) {
+        const timeSinceLastTimeout = now - this.lastHashServiceTimeout;
+        // Reset after 10 seconds of no timeouts (faster recovery - was 20 seconds)
+        if (timeSinceLastTimeout > 10000) {
+          const previousAdaptive = this.adaptiveBatchSize;
+          this.hashServiceTimeoutCount = 0;
+          const restoredBatchSize = this.getBatchSize(); // Will return customBatchSize or default
+          console.log(`[Orchestrator] ✓ Hash service stabilized. Restoring batch size from ${previousAdaptive} to ${restoredBatchSize} (saved value)`);
+          this.adaptiveBatchSize = null;
+          
+          // Emit info event to notify UI
+          this.emit('error', {
+            type: 'error',
+            message: `Hash service recovered. Batch size restored to ${restoredBatchSize} (saved value).`,
+          } as MiningEvent);
+        }
+      }
+      
       // Dynamically get available addresses (includes newly registered ones)
       const addressesToMine = this.getAvailableAddressesForMining();
 
@@ -1695,29 +1715,39 @@ class MiningOrchestrator extends EventEmitter {
           const backoffDelay = Math.min(16000, 2000 * Math.pow(2, Math.min(this.hashServiceTimeoutCount - 1, 3)));
           
           // Adaptive batch size reduction: reduce batch size when timeouts occur
+          // CRITICAL: This is TEMPORARY and does NOT save to disk - will reset when service stabilizes
           if (this.hashServiceTimeoutCount >= 3 && this.adaptiveBatchSize === null) {
             const currentBatchSize = this.getBatchSize();
-            // Reduce batch size by 50% when 3+ consecutive timeouts occur
-            this.adaptiveBatchSize = Math.max(100, Math.floor(currentBatchSize * 0.5));
-            console.warn(`[Orchestrator] ⚠️  Hash service overloaded! Reducing batch size from ${currentBatchSize} to ${this.adaptiveBatchSize} to reduce server load`);
+            // Reduce batch size by 30% (less aggressive) when 3+ consecutive timeouts occur
+            // Minimum is 25% of original or 150, whichever is higher (prevents going too low)
+            const minBatchSize = Math.max(150, Math.floor(currentBatchSize * 0.25));
+            this.adaptiveBatchSize = Math.max(minBatchSize, Math.floor(currentBatchSize * 0.7));
+            console.warn(`[Orchestrator] ⚠️  Hash service overloaded! Temporarily reducing batch size from ${currentBatchSize} to ${this.adaptiveBatchSize} to reduce server load`);
+            console.warn(`[Orchestrator] ⚠️  NOTE: This is TEMPORARY - your saved batch size (${this.customBatchSize || 'default'}) is unchanged. Batch size will auto-recover when service stabilizes.`);
             
             this.emit('error', {
               type: 'error',
-              message: `Hash service overloaded. Automatically reducing batch size to ${this.adaptiveBatchSize} to reduce server load.`,
+              message: `Hash service overloaded. Temporarily reducing batch size to ${this.adaptiveBatchSize} (saved: ${this.customBatchSize || currentBatchSize}). Will auto-recover when service stabilizes.`,
             } as MiningEvent);
-          } else if (this.hashServiceTimeoutCount >= 5 && this.adaptiveBatchSize !== null) {
-            // Further reduce if still timing out
+          } else if (this.hashServiceTimeoutCount >= 6 && this.adaptiveBatchSize !== null) {
+            // Further reduce if still timing out (less aggressive - only after 6+ timeouts)
             const currentAdaptive = this.adaptiveBatchSize;
-            this.adaptiveBatchSize = Math.max(50, Math.floor(this.adaptiveBatchSize * 0.75));
+            // Use the original batch size (before any reductions) to calculate minimum
+            // This ensures we don't go below 25% of the original, even after multiple reductions
+            const originalBatchSize = this.customBatchSize || (300 + (this.workerThreads * 10));
+            const minBatchSize = Math.max(150, Math.floor(originalBatchSize * 0.25));
+            this.adaptiveBatchSize = Math.max(minBatchSize, Math.floor(this.adaptiveBatchSize * 0.8));
             if (this.adaptiveBatchSize < currentAdaptive) {
-              console.warn(`[Orchestrator] ⚠️  Further reducing batch size to ${this.adaptiveBatchSize} due to continued timeouts`);
+              console.warn(`[Orchestrator] ⚠️  Further reducing temporary batch size to ${this.adaptiveBatchSize} due to continued timeouts`);
+              console.warn(`[Orchestrator] ⚠️  NOTE: Your saved batch size (${this.customBatchSize || originalBatchSize}) is unchanged. Minimum is ${minBatchSize} (25% of original).`);
             }
           }
 
           // Log suggestion for user
+          const savedBatchSize = this.customBatchSize || this.getBatchSize();
           this.emit('error', {
             type: 'error',
-            message: `Hash service timeout on worker ${workerId}. Server may be overloaded. ${this.adaptiveBatchSize !== null ? `Batch size reduced to ${this.adaptiveBatchSize}.` : 'Consider reducing batch size or worker count.'}`,
+            message: `Hash service timeout on worker ${workerId}. Server may be overloaded. ${this.adaptiveBatchSize !== null ? `Temporarily using batch size ${this.adaptiveBatchSize} (saved: ${savedBatchSize}). Will auto-recover.` : 'Consider reducing batch size or worker count if this persists.'}`,
           } as MiningEvent);
 
           // Wait with adaptive backoff before retrying to give server time to recover
@@ -1726,16 +1756,23 @@ class MiningOrchestrator extends EventEmitter {
         }
         
         // Reset timeout counter on successful hash (not a timeout error)
-        // This allows batch size to recover when service stabilizes
-        if (this.hashServiceTimeoutCount > 0) {
+        // NOTE: Recovery check is now also done in the main mining loop above for faster recovery
+        // This is a secondary check for immediate recovery after a successful hash
+        if (this.hashServiceTimeoutCount > 0 && this.adaptiveBatchSize !== null) {
           const timeSinceLastTimeout = Date.now() - this.lastHashServiceTimeout;
-          // Reset after 30 seconds of no timeouts
-          if (timeSinceLastTimeout > 30000) {
+          // Reset immediately if we've had 5 seconds of no timeouts (very fast recovery after success)
+          if (timeSinceLastTimeout > 5000) {
+            const previousAdaptive = this.adaptiveBatchSize;
             this.hashServiceTimeoutCount = 0;
-            if (this.adaptiveBatchSize !== null) {
-              console.log(`[Orchestrator] ✓ Hash service stabilized. Resetting adaptive batch size (was ${this.adaptiveBatchSize})`);
-              this.adaptiveBatchSize = null;
-            }
+            const restoredBatchSize = this.getBatchSize(); // Will return customBatchSize or default
+            console.log(`[Orchestrator] ✓ Hash service stabilized (successful hash). Restoring batch size from ${previousAdaptive} to ${restoredBatchSize} (saved value)`);
+            this.adaptiveBatchSize = null;
+            
+            // Emit info event to notify UI
+            this.emit('error', {
+              type: 'error',
+              message: `Hash service recovered. Batch size restored to ${restoredBatchSize} (saved value).`,
+            } as MiningEvent);
           }
         }
 

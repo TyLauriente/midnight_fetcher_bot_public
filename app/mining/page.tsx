@@ -99,6 +99,7 @@ function MiningDashboardContent() {
   const router = useRouter();
   const [password, setPassword] = useState<string | null>(null);
   const [addressOffset, setAddressOffset] = useState<number>(0); // Address range offset (0 = 0-199, 1 = 200-399, etc.)
+  const [currentBatchSize, setCurrentBatchSize] = useState<number | null>(null); // Current batch size (includes adaptive reductions)
 
   const [stats, setStats] = useState<MiningStats | null>(null);
   const [loading, setLoading] = useState(false);
@@ -438,7 +439,11 @@ function MiningDashboardContent() {
           if (data.config.addressOffset !== undefined) {
             setAddressOffset(data.config.addressOffset);
           }
-          // Workers and batch size are loaded from scale tab
+          // Update current batch size (includes adaptive reductions if any)
+          if (data.config.batchSize !== undefined) {
+            setCurrentBatchSize(data.config.batchSize);
+          }
+          // Workers are loaded from scale tab
         }
       }
     } catch (err: any) {
@@ -635,7 +640,11 @@ function MiningDashboardContent() {
         if (statusData.success && statusData.config) {
           // Use persisted values if available, otherwise use current recommendations
           setEditedWorkerThreads(statusData.config.workerThreads || data.recommendations.workerThreads.current);
-          setEditedBatchSize(statusData.config.batchSize || data.recommendations.batchSize.current);
+          // Use current batch size (includes adaptive reductions) if available, otherwise use persisted or recommended
+          const batchSizeToUse = statusData.config.batchSize || data.recommendations.batchSize.current;
+          setEditedBatchSize(batchSizeToUse);
+          // Also update currentBatchSize state to keep it in sync
+          setCurrentBatchSize(batchSizeToUse);
         } else {
           // Fallback to current values from recommendations
           setEditedWorkerThreads(data.recommendations.workerThreads.current);
@@ -857,6 +866,16 @@ function MiningDashboardContent() {
     }, 1000);
     return () => clearInterval(interval);
   }, []);
+
+  // Sync Scale tab editedBatchSize when currentBatchSize changes (e.g., from adaptive reductions)
+  useEffect(() => {
+    if (currentBatchSize !== null && activeTab === 'scale') {
+      // Only update if the Scale tab is open and the value actually changed
+      if (editedBatchSize !== currentBatchSize) {
+        setEditedBatchSize(currentBatchSize);
+      }
+    }
+  }, [currentBatchSize, activeTab, editedBatchSize]);
 
   // ... inside MiningDashboardContent, after handleApplyAddressCount, add:
   const [fillMissingLoading, setFillMissingLoading] = useState(false);
@@ -1279,10 +1298,16 @@ function MiningDashboardContent() {
                       </div>
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div className="grid grid-cols-3 gap-3 text-sm">
                     <div>
                       <p className="text-gray-400">Workers</p>
                       <p className="text-lg font-semibold text-white">{stats.workerThreads}</p>
+                    </div>
+                    <div>
+                      <p className="text-gray-400">Batch Size</p>
+                      <p className="text-lg font-semibold text-white">
+                        {currentBatchSize !== null ? currentBatchSize.toLocaleString() : '---'}
+                      </p>
                     </div>
                     <div>
                       <p className="text-gray-400">CPU</p>
@@ -2686,6 +2711,8 @@ function MiningDashboardContent() {
                             onBlur={async () => {
                               // Save immediately when user finishes editing
                               if (editedBatchSize !== null && editedBatchSize >= 50) {
+                                // Update currentBatchSize to keep dashboard in sync
+                                setCurrentBatchSize(editedBatchSize);
                                 try {
                                   await fetch('/api/mining/update-config', {
                                     method: 'POST',
@@ -2706,6 +2733,7 @@ function MiningDashboardContent() {
                           onClick={async () => {
                             const optimal = scaleRecommendations.batchSize.optimal;
                             setEditedBatchSize(optimal);
+                            setCurrentBatchSize(optimal); // Update dashboard display
                             // Save immediately
                             try {
                               await fetch('/api/mining/update-config', {
@@ -2728,7 +2756,11 @@ function MiningDashboardContent() {
                         </div>
 
                         <div className="flex items-center justify-between p-3 bg-blue-900/20 border border-blue-700/50 rounded-lg cursor-pointer hover:bg-blue-900/30 transition-colors"
-                          onClick={() => setEditedBatchSize(scaleRecommendations.batchSize.conservative)}>
+                          onClick={() => {
+                            const conservative = scaleRecommendations.batchSize.conservative;
+                            setEditedBatchSize(conservative);
+                            setCurrentBatchSize(conservative); // Update dashboard display
+                          }}>
                           <span className="text-blue-400">Conservative:</span>
                           <span className="text-xl font-bold text-blue-400">
                             {scaleRecommendations.batchSize.conservative}
@@ -2736,7 +2768,11 @@ function MiningDashboardContent() {
                         </div>
 
                         <div className="flex items-center justify-between p-3 bg-orange-900/20 border border-orange-700/50 rounded-lg cursor-pointer hover:bg-orange-900/30 transition-colors"
-                          onClick={() => setEditedBatchSize(scaleRecommendations.batchSize.max)}>
+                          onClick={() => {
+                            const max = scaleRecommendations.batchSize.max;
+                            setEditedBatchSize(max);
+                            setCurrentBatchSize(max); // Update dashboard display
+                          }}>
                           <span className="text-orange-400">Maximum:</span>
                           <span className="text-xl font-bold text-orange-400">
                             {scaleRecommendations.batchSize.max}
