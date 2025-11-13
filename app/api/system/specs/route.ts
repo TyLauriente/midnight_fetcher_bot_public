@@ -129,30 +129,30 @@ function calculateRecommendations(specs: {
   // Batch size recommendation
   // Rule: Larger batches = fewer API calls but more memory usage
   // Base on CPU speed and memory
+  // Maximum allowed: 50,000 (matches API limit)
+  const ABSOLUTE_MAX_BATCH_SIZE = 50000;
+  
   let optimalBatchSize = 300; // Default
-  let maxBatchSize = 500;
+  let maxBatchSize = ABSOLUTE_MAX_BATCH_SIZE; // Allow up to API limit
   let conservativeBatchSize = 200;
 
-  // Adjust based on CPU cores and speed
+  // Adjust optimal and conservative based on CPU cores and speed
+  // But max is always 50,000 to allow users to go higher if needed
   if (cpuCount >= 12 && cpuSpeed >= 2500 && totalMemoryGB >= 16) {
     // High-end system
     optimalBatchSize = 400;
-    maxBatchSize = 600;
     conservativeBatchSize = 300;
   } else if (cpuCount >= 8 && cpuSpeed >= 2000 && totalMemoryGB >= 8) {
     // Mid-range system
     optimalBatchSize = 350;
-    maxBatchSize = 500;
     conservativeBatchSize = 250;
   } else if (cpuCount >= 4 && totalMemoryGB >= 4) {
     // Entry-level system
     optimalBatchSize = 250;
-    maxBatchSize = 350;
     conservativeBatchSize = 150;
   } else {
     // Low-end system
     optimalBatchSize = 150;
-    maxBatchSize = 250;
     conservativeBatchSize = 100;
   }
 

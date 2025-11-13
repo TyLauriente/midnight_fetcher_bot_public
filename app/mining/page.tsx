@@ -2489,7 +2489,7 @@ function MiningDashboardContent() {
                           <input
                             type="number"
                             min="50"
-                            max={scaleRecommendations.batchSize.max}
+                            max="50000"
                             step="50"
                             value={editedBatchSize || ''}
                             onChange={(e) => setEditedBatchSize(parseInt(e.target.value) || 50)}
