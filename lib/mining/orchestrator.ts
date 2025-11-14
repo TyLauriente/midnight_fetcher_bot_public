@@ -1816,6 +1816,8 @@ class MiningOrchestrator extends EventEmitter {
         this.delayedWorkerResetTimer = setTimeout(async () => {
           if (!this.isRunning || this.currentChallengeId !== challengeId) {
             // Challenge changed again or mining stopped, skip reset
+            console.log('[Orchestrator] Skipping delayed worker reset - challenge changed or mining stopped');
+            this.delayedWorkerResetTimer = null;
             return;
           }
           
@@ -1823,7 +1825,19 @@ class MiningOrchestrator extends EventEmitter {
           console.log('[Orchestrator] DELAYED WORKER RESET (30s after new challenge)');
           console.log('[Orchestrator] ========================================');
           
+          // Track recovery state
+          let resetSuccessful = false;
+          let romInitialized = false;
+          let miningRestarted = false;
+          
           try {
+            // CRITICAL: Check conditions before starting reset
+            if (!this.isRunning || this.currentChallengeId !== challengeId) {
+              console.log('[Orchestrator] Skipping delayed worker reset - conditions changed before reset started');
+              this.delayedWorkerResetTimer = null;
+              return;
+            }
+            
             // Stop mining temporarily
             const wasMining = this.isMining;
             this.isMining = false;
@@ -1831,23 +1845,223 @@ class MiningOrchestrator extends EventEmitter {
             // Give workers time to finish current batch
             await this.sleep(1000);
             
-            // Reset all workers to initial state
-            await this.resetAllWorkers();
-            
-            // Restart mining if it was running
-            if (wasMining && this.isRunning && this.currentChallengeId === challengeId) {
-              console.log('[Orchestrator] Resuming mining after delayed worker reset...');
-              this.startMining();
+            // CRITICAL: Check conditions again after sleep
+            if (!this.isRunning || this.currentChallengeId !== challengeId) {
+              console.log('[Orchestrator] Skipping delayed worker reset - conditions changed during reset');
+              this.delayedWorkerResetTimer = null;
+              // Try to resume mining if it was running
+              if (wasMining && this.isRunning && this.currentChallenge && this.currentChallengeId) {
+                this.isMining = false;
+                this.startMining().catch(err => {
+                  console.error('[Orchestrator] Failed to resume mining after condition change:', err.message);
+                });
+              }
+              return;
             }
             
+            // Reset all workers to initial state
+            try {
+              await this.resetAllWorkers();
+              resetSuccessful = true;
+              console.log('[Orchestrator] ✓ Workers reset successfully');
+            } catch (resetError: any) {
+              console.error('[Orchestrator] ❌ Failed to reset workers:', resetError.message);
+              // Continue anyway - try to recover
+            }
+            
+            // CRITICAL: Reinitialize ROM to ensure it's ready for mining
+            // This is necessary because resetAllWorkers() might have cleared ROM state
+            if (this.currentChallenge && this.isRunning && this.currentChallengeId === challengeId) {
+              console.log('[Orchestrator] Reinitializing ROM after delayed worker reset...');
+              const noPreMine = this.currentChallenge.no_pre_mine;
+              
+              try {
+                // Try ROM initialization with retry logic
+                let romInitAttempts = 0;
+                const maxRomAttempts = 3;
+                let romInitSuccess = false;
+                
+                while (romInitAttempts < maxRomAttempts && !romInitSuccess && this.isRunning && this.currentChallengeId === challengeId) {
+                  romInitAttempts++;
+                  try {
+                    await hashEngine.initRom(noPreMine);
+                    
+                    // Wait for ROM to be ready with timeout
+                    const maxWait = 60000;
+                    const startWait = Date.now();
+                    while (!hashEngine.isRomReady() && (Date.now() - startWait) < maxWait) {
+                      // Check if conditions changed during wait
+                      if (!this.isRunning || this.currentChallengeId !== challengeId) {
+                        console.log('[Orchestrator] Conditions changed during ROM initialization wait');
+                        break;
+                      }
+                      await this.sleep(500);
+                    }
+                    
+                    if (hashEngine.isRomReady()) {
+                      romInitSuccess = true;
+                      romInitialized = true;
+                      console.log('[Orchestrator] ✓ ROM reinitialized successfully');
+                    } else if (romInitAttempts < maxRomAttempts) {
+                      console.warn(`[Orchestrator] ⚠️ ROM not ready after attempt ${romInitAttempts}/${maxRomAttempts}, retrying...`);
+                      await this.sleep(2000); // Wait before retry
+                    }
+                  } catch (romError: any) {
+                    console.error(`[Orchestrator] ❌ ROM initialization attempt ${romInitAttempts} failed:`, romError.message);
+                    if (romInitAttempts < maxRomAttempts) {
+                      await this.sleep(2000); // Wait before retry
+                    }
+                  }
+                }
+                
+                if (!romInitialized) {
+                  console.error('[Orchestrator] ❌ ROM initialization failed after all retry attempts');
+                  // Check if ROM is already ready (maybe from previous initialization)
+                  if (hashEngine.isRomReady()) {
+                    console.log('[Orchestrator] ✓ ROM was already ready, continuing...');
+                    romInitialized = true;
+                  }
+                }
+              } catch (romInitError: any) {
+                console.error('[Orchestrator] ❌ ROM initialization error:', romInitError.message);
+                // Check if ROM is already ready as fallback
+                if (hashEngine.isRomReady()) {
+                  console.log('[Orchestrator] ✓ ROM was already ready (fallback), continuing...');
+                  romInitialized = true;
+                }
+              }
+            }
+            
+            // Wait a bit before restarting to ensure everything is ready
+            await this.sleep(1000);
+            
+            // CRITICAL: Restart mining if it was running
+            // Double-check all conditions before restarting
+            if (wasMining && this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
+              // Try to restart mining even if ROM initialization had issues
+              // The mining loop will handle ROM readiness checks
+              if (!romInitialized && !hashEngine.isRomReady()) {
+                console.warn('[Orchestrator] ⚠️ ROM not ready, but attempting to restart mining anyway (mining loop will handle ROM)');
+              }
+              
+              console.log('[Orchestrator] Resuming mining after delayed worker reset...');
+              // CRITICAL: Ensure isMining is false before calling startMining (it sets it to true)
+              this.isMining = false;
+              
+              try {
+                await this.startMining();
+                // Verify mining actually started
+                if (this.isMining) {
+                  miningRestarted = true;
+                  console.log('[Orchestrator] ✓ Mining resumed successfully');
+                } else {
+                  console.error('[Orchestrator] ❌ Mining failed to start after delayed reset - isMining is still false');
+                  // Try one more time after a short delay
+                  await this.sleep(2000);
+                  if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
+                    this.isMining = false;
+                    await this.startMining();
+                    if (this.isMining) {
+                      miningRestarted = true;
+                      console.log('[Orchestrator] ✓ Mining resumed successfully on retry');
+                    }
+                  }
+                }
+              } catch (startError: any) {
+                console.error('[Orchestrator] ❌ Failed to start mining after delayed reset:', startError.message);
+                console.error('[Orchestrator] Stack:', startError.stack);
+                // Try one more time after a delay
+                await this.sleep(3000);
+                if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
+                  try {
+                    this.isMining = false;
+                    await this.startMining();
+                    if (this.isMining) {
+                      miningRestarted = true;
+                      console.log('[Orchestrator] ✓ Mining resumed successfully on error recovery');
+                    }
+                  } catch (retryError: any) {
+                    console.error('[Orchestrator] ❌ Mining retry after error also failed:', retryError.message);
+                  }
+                }
+              }
+            } else {
+              console.warn('[Orchestrator] ⚠️ Cannot resume mining after delayed reset:', {
+                wasMining,
+                isRunning: this.isRunning,
+                hasChallenge: !!this.currentChallenge,
+                challengeIdMatch: this.currentChallengeId === challengeId,
+                romReady: hashEngine.isRomReady()
+              });
+            }
+            
+            // Final status report
             console.log('[Orchestrator] ========================================');
             console.log('[Orchestrator] DELAYED WORKER RESET COMPLETE');
+            console.log('[Orchestrator] Status:', {
+              resetSuccessful,
+              romInitialized,
+              miningRestarted,
+              isMining: this.isMining,
+              isRunning: this.isRunning,
+              hasChallenge: !!this.currentChallenge,
+              challengeId: this.currentChallengeId
+            });
             console.log('[Orchestrator] ========================================');
+            
+            // CRITICAL: If mining didn't restart, try one final recovery attempt
+            if (wasMining && !miningRestarted && this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
+              console.warn('[Orchestrator] ⚠️ Mining did not restart, attempting final recovery...');
+              await this.sleep(5000);
+              if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
+                try {
+                  this.isMining = false;
+                  await this.startMining();
+                  if (this.isMining) {
+                    console.log('[Orchestrator] ✓ Mining resumed successfully on final recovery attempt');
+                  } else {
+                    console.error('[Orchestrator] ❌ Final recovery attempt failed - mining may need manual restart');
+                    // Emit error event so UI can notify user
+                    this.emit('error', {
+                      type: 'error',
+                      message: 'Mining failed to restart after delayed worker reset. Please check logs and restart manually if needed.',
+                    } as MiningEvent);
+                  }
+                } catch (finalError: any) {
+                  console.error('[Orchestrator] ❌ Final recovery attempt failed:', finalError.message);
+                  this.emit('error', {
+                    type: 'error',
+                    message: `Mining failed to restart after delayed worker reset: ${finalError.message}`,
+                  } as MiningEvent);
+                }
+              }
+            }
           } catch (error: any) {
-            console.error('[Orchestrator] Delayed worker reset failed:', error.message);
-            // Try to resume mining anyway
-            if (this.isRunning && this.currentChallengeId === challengeId) {
-              this.startMining();
+            console.error('[Orchestrator] ❌ Delayed worker reset failed with unexpected error:', error.message);
+            console.error('[Orchestrator] Stack:', error.stack);
+            
+            // CRITICAL: Try to resume mining anyway if conditions are met
+            if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
+              console.log('[Orchestrator] Attempting emergency recovery - resuming mining after error...');
+              try {
+                this.isMining = false;
+                await this.startMining();
+                if (this.isMining) {
+                  console.log('[Orchestrator] ✓ Emergency recovery successful - mining resumed');
+                } else {
+                  console.error('[Orchestrator] ❌ Emergency recovery failed - mining did not start');
+                  this.emit('error', {
+                    type: 'error',
+                    message: 'Emergency recovery after delayed worker reset failed. Mining may need manual restart.',
+                  } as MiningEvent);
+                }
+              } catch (recoveryError: any) {
+                console.error('[Orchestrator] ❌ Emergency recovery failed:', recoveryError.message);
+                this.emit('error', {
+                  type: 'error',
+                  message: `Emergency recovery failed: ${recoveryError.message}. Mining may need manual restart.`,
+                } as MiningEvent);
+              }
             }
           }
           
