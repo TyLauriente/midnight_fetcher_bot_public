@@ -299,15 +299,15 @@ async fn main() -> std::io::Result<()> {
 
     // HTTP workers: configurable via WORKERS env var (default 16 for good concurrency)
     let workers = std::env::var("WORKERS")
-        .unwrap_or_else(|_| "16".to_string())
-        .parse::<usize>()
-        .unwrap_or(16);
+            .unwrap_or_else(|_| num_cpus::get().to_string())
+            .parse::<usize>()
+            .unwrap_or(num_cpus::get());
 
     // Rayon threads: use physical cores (avoids hyperthreading overhead for CPU-intensive work)
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(physical_cores)
-        .build_global()
-        .ok();
+    // rayon::ThreadPoolBuilder::new()
+    //     .num_threads(physical_cores)
+    //     .build_global()
+    //     .ok();
 
     info!("═══════════════════════════════════════════════════════════");
     info!("HashEngine Native Hash Service (Rust)");
