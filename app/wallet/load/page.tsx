@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
@@ -13,6 +13,75 @@ export default function LoadWallet() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
+  const [checkingAutoUnlock, setCheckingAutoUnlock] = useState(true);
+
+  // Check if wallet is already unlocked on the backend (from auto-startup script)
+  useEffect(() => {
+    const checkAutoUnlock = async () => {
+      // Retry up to 10 times with 2 second delays (20 seconds total)
+      // This handles the case where auto-startup script is still running
+      const maxRetries = 10;
+      const retryDelay = 2000;
+      const defaultPassword = 'Rascalismydog@1';
+      
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          // First, check if mining is already active (most reliable indicator)
+          const statusResponse = await fetch('/api/mining/status');
+          if (statusResponse.ok) {
+            const statusData = await statusResponse.json();
+            if (statusData.success && statusData.stats?.active) {
+              // Mining is active! Wallet is already unlocked and mining is running
+              // Set the default password in sessionStorage and redirect to mining
+              sessionStorage.setItem('walletPassword', defaultPassword);
+              console.log(`[Wallet Load] Mining is already active (attempt ${attempt + 1})! Wallet unlocked via auto-startup, redirecting to mining...`);
+              router.push('/mining');
+              return;
+            }
+          }
+          
+          // Mining is not active yet, try to verify default password works
+          const response = await fetch('/api/wallet/load', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: defaultPassword }),
+          });
+          
+          if (response.ok) {
+            // Default password works! Wallet can be unlocked
+            // Set the default password in sessionStorage and redirect to mining
+            // (Mining may start automatically or user can start it manually)
+            sessionStorage.setItem('walletPassword', defaultPassword);
+            console.log(`[Wallet Load] Default password works! (attempt ${attempt + 1}) Wallet can be unlocked, redirecting to mining...`);
+            router.push('/mining');
+            return;
+          } else {
+            // Default password doesn't work yet, maybe auto-startup is still running
+            if (attempt < maxRetries - 1) {
+              console.log(`[Wallet Load] Default password check failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${retryDelay / 1000}s...`);
+              await new Promise(resolve => setTimeout(resolve, retryDelay));
+              continue;
+            } else {
+              // All retries failed, show the password input form
+              console.log('[Wallet Load] Default password does not work after all retries, showing password input form');
+            }
+          }
+        } catch (error) {
+          console.error(`[Wallet Load] Error checking auto-unlock (attempt ${attempt + 1}):`, error);
+          // On error, wait and retry unless this is the last attempt
+          if (attempt < maxRetries - 1) {
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            continue;
+          }
+        }
+      }
+      
+      // All retries failed, show the password input form
+      setCheckingAutoUnlock(false);
+    };
+    
+    checkAutoUnlock();
+  }, [router]);
 
   const handleLoadWallet = async () => {
     if (!password) {
@@ -54,6 +123,19 @@ export default function LoadWallet() {
       handleLoadWallet();
     }
   };
+
+  // Show loading state while checking auto-unlock
+  if (checkingAutoUnlock) {
+    return (
+      <div className="relative flex flex-col items-center justify-center min-h-screen p-8 overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-br from-blue-900/10 via-purple-900/10 to-gray-900 pointer-events-none" />
+        <div className="relative text-center space-y-4">
+          <Loader2 className="w-16 h-16 animate-spin text-blue-500 mx-auto" />
+          <p className="text-lg text-gray-400">Checking if wallet is already unlocked...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative flex flex-col items-center justify-center min-h-screen p-8 overflow-hidden">

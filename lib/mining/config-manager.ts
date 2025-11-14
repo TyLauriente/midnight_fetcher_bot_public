@@ -42,7 +42,7 @@ export interface MiningConfig {
 const DEFAULT_CONFIG: MiningConfig = {
   addressOffset: 0,
   workerThreads: 11,
-  batchSize: 300,
+  batchSize: 850,
 };
 
 export class ConfigManager {
@@ -91,7 +91,8 @@ export class ConfigManager {
       // Validate values
       if (updated.addressOffset < 0) updated.addressOffset = 0;
       if (updated.workerThreads < 1) updated.workerThreads = DEFAULT_CONFIG.workerThreads;
-      if (updated.batchSize < 50) updated.batchSize = DEFAULT_CONFIG.batchSize;
+      // Minimum batch size is 400 (not 50) to match orchestrator requirements
+      if (updated.batchSize < 400) updated.batchSize = Math.max(400, DEFAULT_CONFIG.batchSize);
 
       fs.writeFileSync(CONFIG_FILE, JSON.stringify(updated, null, 2), { mode: 0o600 });
       console.log(`[ConfigManager] Saved config: offset=${updated.addressOffset}, workers=${updated.workerThreads}, batch=${updated.batchSize}`);

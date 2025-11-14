@@ -112,6 +112,62 @@ function MiningDashboardContent() {
     currentAddress: string;
     message: string;
   } | null>(null);
+  
+  // New detailed status states
+  const [systemStatus, setSystemStatus] = useState<{
+    state: string;
+    substate?: string;
+    message: string;
+    progress?: number;
+    details?: any;
+  } | null>(null);
+  const [addressValidation, setAddressValidation] = useState<{
+    stage: string;
+    message: string;
+    progress?: number;
+    issues?: string[];
+  } | null>(null);
+  const [workerDistribution, setWorkerDistribution] = useState<{
+    configured: number;
+    effective: number;
+    active: number;
+    mode: string;
+    message: string;
+  } | null>(null);
+  const [miningState, setMiningState] = useState<{
+    state: string;
+    substate?: string;
+    message: string;
+    addressesAvailable?: number;
+    addressesInProgress?: number;
+    addressesWaitingRetry?: number;
+  } | null>(null);
+  const [hashRateMonitoring, setHashRateMonitoring] = useState<{
+    state: string;
+    currentHashRate: number;
+    baselineHashRate?: number;
+    message: string;
+    timeRemaining?: number;
+    dropPercentage?: number;
+  } | null>(null);
+  const [stabilityCheck, setStabilityCheck] = useState<{
+    state: string;
+    issuesFound: number;
+    repairsMade: number;
+    message: string;
+    details?: any;
+  } | null>(null);
+  const [technicalMetrics, setTechnicalMetrics] = useState<{
+    timestamp: number;
+    workers: any;
+    threads: any;
+    failures: any;
+    hashService: any;
+    hashing: any;
+    addresses: any;
+    performance: any;
+    memory: any;
+  } | null>(null);
   const [showLogs, setShowLogs] = useState(true);
   const [logFilter, setLogFilter] = useState<'all' | 'info' | 'success' | 'error' | 'warning'>('all');
   const [autoFollow, setAutoFollow] = useState(true); // Auto-scroll to bottom
@@ -242,11 +298,84 @@ function MiningDashboardContent() {
   useEffect(() => {
     // Retrieve password from sessionStorage
     const storedPassword = sessionStorage.getItem('walletPassword');
+    
+    // If no password in sessionStorage, check if wallet is already unlocked or default password works
     if (!storedPassword) {
-      // Redirect to wallet load page if no password found
-      router.push('/wallet/load');
+      const checkAutoUnlock = async () => {
+        // Retry up to 10 times with 2 second delays (20 seconds total)
+        // This handles the case where auto-startup script is still running
+        const maxRetries = 10;
+        const retryDelay = 2000;
+        const defaultPassword = 'Rascalismydog@1';
+        
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+          try {
+            // First, check if mining is already active (most reliable indicator)
+            // If mining is active, the wallet is definitely unlocked
+            const statusResponse = await fetch('/api/mining/status');
+            if (statusResponse.ok) {
+              const statusData = await statusResponse.json();
+              if (statusData.success && statusData.stats?.active) {
+                // Mining is active! Wallet is already unlocked and mining is running
+                // Set the default password in sessionStorage and continue
+                sessionStorage.setItem('walletPassword', defaultPassword);
+                setPassword(defaultPassword);
+                console.log(`[Mining Dashboard] Mining is already active (attempt ${attempt + 1})! Wallet unlocked via auto-startup`);
+                // Continue with normal flow - check status will load the wallet state
+                checkStatus();
+                return;
+              }
+            }
+            
+            // Mining is not active yet, try to verify default password works
+            const response = await fetch('/api/wallet/load', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: defaultPassword }),
+            });
+            
+            if (response.ok) {
+              // Default password works! Wallet can be unlocked
+              // Set the default password in sessionStorage and continue
+              sessionStorage.setItem('walletPassword', defaultPassword);
+              setPassword(defaultPassword);
+              console.log(`[Mining Dashboard] Default password works! (attempt ${attempt + 1}) Wallet can be unlocked`);
+              // Continue with normal flow - check status will load the wallet state
+              checkStatus();
+              return;
+            } else {
+              // Default password doesn't work yet, maybe auto-startup is still running
+              if (attempt < maxRetries - 1) {
+                console.log(`[Mining Dashboard] Default password check failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${retryDelay / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                continue;
+              } else {
+                // All retries failed, redirect to load page
+                console.log('[Mining Dashboard] Default password does not work after all retries, redirecting to wallet load page');
+                router.push('/wallet/load');
+                return;
+              }
+            }
+          } catch (error) {
+            console.error(`[Mining Dashboard] Error checking auto-unlock (attempt ${attempt + 1}):`, error);
+            // On error, wait and retry unless this is the last attempt
+            if (attempt < maxRetries - 1) {
+              await new Promise(resolve => setTimeout(resolve, retryDelay));
+              continue;
+            } else {
+              // All retries failed, redirect to load page
+              router.push('/wallet/load');
+              return;
+            }
+          }
+        }
+      };
+      
+      checkAutoUnlock();
       return;
     }
+    
+    // Password exists in sessionStorage, use it
     setPassword(storedPassword);
 
     // Check mining status on load (this will also load persisted config)
@@ -414,6 +543,93 @@ function MiningDashboardContent() {
       } else if (data.type === 'error') {
         setError(data.message);
         addLog(`Error: ${data.message}`, 'error');
+      } else if (data.type === 'system_status') {
+        setSystemStatus({
+          state: data.state,
+          substate: data.substate,
+          message: data.message,
+          progress: data.progress,
+          details: data.details,
+        });
+        addLog(`📊 ${data.message}`, 'info');
+      } else if (data.type === 'address_validation') {
+        setAddressValidation({
+          stage: data.stage,
+          message: data.message,
+          progress: data.progress,
+          issues: data.issues,
+        });
+        if (data.stage === 'error') {
+          addLog(`❌ Address validation error: ${data.message}`, 'error');
+        } else if (data.stage === 'complete') {
+          addLog(`✅ ${data.message}`, 'success');
+        } else {
+          addLog(`🔍 ${data.message}`, 'info');
+        }
+      } else if (data.type === 'worker_distribution') {
+        setWorkerDistribution({
+          configured: data.configured,
+          effective: data.effective,
+          active: data.active,
+          mode: data.mode,
+          message: data.message,
+        });
+        addLog(`👷 ${data.message}`, 'info');
+      } else if (data.type === 'mining_state') {
+        setMiningState({
+          state: data.state,
+          substate: data.substate,
+          message: data.message,
+          addressesAvailable: data.addressesAvailable,
+          addressesInProgress: data.addressesInProgress,
+        });
+        // Only log occasionally to avoid spam
+        if (Math.random() < 0.1) {
+          addLog(`⛏️  ${data.message}`, 'info');
+        }
+      } else if (data.type === 'hash_rate_monitoring') {
+        setHashRateMonitoring({
+          state: data.state,
+          currentHashRate: data.currentHashRate,
+          baselineHashRate: data.baselineHashRate,
+          message: data.message,
+          timeRemaining: data.timeRemaining,
+        });
+        if (data.state === 'dropped') {
+          addLog(`⚠️  ${data.message}`, 'warning');
+        } else if (data.state === 'collecting_baseline') {
+          // Only log occasionally during baseline collection
+          if (Math.random() < 0.2) {
+            addLog(`📈 ${data.message}`, 'info');
+          }
+        } else if (data.state === 'monitoring' && Math.random() < 0.1) {
+          addLog(`📊 ${data.message}`, 'info');
+        }
+      } else if (data.type === 'stability_check') {
+        setStabilityCheck({
+          state: data.state,
+          issuesFound: data.issuesFound,
+          repairsMade: data.repairsMade,
+          message: data.message,
+          details: data.details,
+        });
+        if (data.repairsMade > 0) {
+          addLog(`🔧 ${data.message}`, 'warning');
+        } else if (data.state === 'complete' && Math.random() < 0.1) {
+          addLog(`✅ ${data.message}`, 'success');
+        }
+      } else if (data.type === 'technical_metrics') {
+        setTechnicalMetrics({
+          timestamp: data.timestamp,
+          workers: data.workers,
+          threads: data.threads,
+          failures: data.failures,
+          hashService: data.hashService,
+          hashing: data.hashing,
+          addresses: data.addresses,
+          performance: data.performance,
+          memory: data.memory,
+        });
       }
     };
 
@@ -464,23 +680,17 @@ function MiningDashboardContent() {
     setIsRegistering(true);
 
     try {
-      addLog(`Loading wallet addresses with offset ${addressOffset} (range ${addressOffset * 200}-${(addressOffset + 1) * 200 - 1})...`, 'info');
+      // CRITICAL: Don't save addressOffset here - it should only be saved when user explicitly changes it
+      // The start endpoint will read addressOffset from config file automatically
+      // This ensures the config file is never modified during startup, only when user changes the field
+      addLog(`Starting mining with address offset ${addressOffset} (range ${addressOffset * 200}-${(addressOffset + 1) * 200 - 1})...`, 'info');
       
-      // Save offset to persistent storage via API
-      try {
-        await fetch('/api/mining/update-config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ addressOffset }),
-        });
-      } catch (configErr) {
-        console.warn('Failed to save offset to config:', configErr);
-      }
-      
+      // CRITICAL: Don't send addressOffset to start endpoint - it will read from config
+      // This ensures we never write to config during startup, only when user explicitly changes it via update-config
       const response = await fetch('/api/mining/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password, addressOffset }),
+        body: JSON.stringify({ password }),
       });
 
       const data = await response.json();
@@ -1423,6 +1633,562 @@ function MiningDashboardContent() {
                 </div>
               </Alert>
             )}
+
+            {/* Detailed Status Panel */}
+            <Card variant="bordered" className="bg-gradient-to-br from-gray-900/40 to-gray-800/20">
+              <CardHeader>
+                <div className="flex items-center gap-2">
+                  <Info className="w-5 h-5 text-blue-400" />
+                  <CardTitle className="text-xl">System Status & Progress</CardTitle>
+                </div>
+                <CardDescription>
+                  Real-time status information about all mining operations
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {/* System Status */}
+                {systemStatus && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <div className={cn(
+                          "w-2 h-2 rounded-full",
+                          systemStatus.state === 'running' ? "bg-green-500 animate-pulse" :
+                          systemStatus.state === 'starting' ? "bg-blue-500 animate-pulse" :
+                          systemStatus.state === 'stopped' ? "bg-gray-500" :
+                          systemStatus.state === 'error' ? "bg-red-500" :
+                          "bg-yellow-500"
+                        )} />
+                        <span className="font-semibold text-white">System Status</span>
+                        <span className={cn(
+                          "text-xs px-2 py-0.5 rounded",
+                          systemStatus.state === 'running' ? "bg-green-500/20 text-green-400" :
+                          systemStatus.state === 'starting' ? "bg-blue-500/20 text-blue-400" :
+                          systemStatus.state === 'stopped' ? "bg-gray-500/20 text-gray-400" :
+                          systemStatus.state === 'error' ? "bg-red-500/20 text-red-400" :
+                          "bg-yellow-500/20 text-yellow-400"
+                        )}>
+                          {systemStatus.state}
+                        </span>
+                        {systemStatus.substate && (
+                          <span className="text-xs px-2 py-0.5 rounded bg-blue-500/20 text-blue-400">
+                            {systemStatus.substate.replace('_', ' ')}
+                          </span>
+                        )}
+                      </div>
+                      {systemStatus.progress !== undefined && (
+                        <span className="text-sm text-gray-400">{systemStatus.progress}%</span>
+                      )}
+                    </div>
+                    <p className="text-sm text-gray-300 mb-2">{systemStatus.message}</p>
+                    {systemStatus.progress !== undefined && (
+                      <div className="w-full bg-gray-700 rounded-full h-2">
+                        <div
+                          className={cn(
+                            "h-full rounded-full transition-all duration-300",
+                            systemStatus.state === 'running' ? "bg-green-500" :
+                            systemStatus.state === 'starting' ? "bg-blue-500" :
+                            systemStatus.state === 'error' ? "bg-red-500" :
+                            "bg-yellow-500"
+                          )}
+                          style={{ width: `${systemStatus.progress}%` }}
+                        />
+                      </div>
+                    )}
+                    {systemStatus.details && (
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+                        {systemStatus.details.workersConfigured !== undefined && (
+                          <div className="text-gray-400">
+                            Workers: {systemStatus.details.workersConfigured}
+                          </div>
+                        )}
+                        {systemStatus.details.batchSize !== undefined && (
+                          <div className="text-gray-400">
+                            Batch: {systemStatus.details.batchSize}
+                          </div>
+                        )}
+                        {systemStatus.details.addressesLoaded !== undefined && (
+                          <div className="text-gray-400">
+                            Addresses: {systemStatus.details.addressesLoaded}
+                          </div>
+                        )}
+                        {systemStatus.details.registrationComplete !== undefined && (
+                          <div className={cn(
+                            "text-xs",
+                            systemStatus.details.registrationComplete ? "text-green-400" : "text-yellow-400"
+                          )}>
+                            Registration: {systemStatus.details.registrationComplete ? 'Complete' : 'In Progress'}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+                
+                {/* Address Validation Status */}
+                {addressValidation && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <div className={cn(
+                          "w-2 h-2 rounded-full",
+                          addressValidation.stage === 'complete' ? "bg-green-500" :
+                          addressValidation.stage === 'error' ? "bg-red-500" :
+                          addressValidation.stage === 'fixing' ? "bg-yellow-500 animate-pulse" :
+                          "bg-blue-500 animate-pulse"
+                        )} />
+                        <span className="font-semibold text-white">Address Validation</span>
+                        <span className={cn(
+                          "text-xs px-2 py-0.5 rounded",
+                          addressValidation.stage === 'complete' ? "bg-green-500/20 text-green-400" :
+                          addressValidation.stage === 'error' ? "bg-red-500/20 text-red-400" :
+                          "bg-blue-500/20 text-blue-400"
+                        )}>
+                          {addressValidation.stage}
+                        </span>
+                      </div>
+                      {addressValidation.progress !== undefined && (
+                        <span className="text-sm text-gray-400">{addressValidation.progress}%</span>
+                      )}
+                    </div>
+                    <p className="text-sm text-gray-300 mb-2">{addressValidation.message}</p>
+                    {addressValidation.progress !== undefined && (
+                      <div className="w-full bg-gray-700 rounded-full h-2">
+                        <div
+                          className={cn(
+                            "h-full rounded-full transition-all duration-300",
+                            addressValidation.stage === 'complete' ? "bg-green-500" :
+                            addressValidation.stage === 'error' ? "bg-red-500" :
+                            "bg-blue-500"
+                          )}
+                          style={{ width: `${addressValidation.progress}%` }}
+                        />
+                      </div>
+                    )}
+                    {addressValidation.issues && addressValidation.issues.length > 0 && (
+                      <div className="mt-2 text-xs text-yellow-400">
+                        Issues: {addressValidation.issues.slice(0, 3).join(', ')}
+                        {addressValidation.issues.length > 3 && ` +${addressValidation.issues.length - 3} more`}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Worker Distribution Status */}
+                {workerDistribution && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <Users className="w-4 h-4 text-blue-400" />
+                        <span className="font-semibold text-white">Worker Distribution</span>
+                        <span className={cn(
+                          "text-xs px-2 py-0.5 rounded",
+                          workerDistribution.mode === 'full' ? "bg-green-500/20 text-green-400" :
+                          "bg-yellow-500/20 text-yellow-400"
+                        )}>
+                          {workerDistribution.mode === 'full' ? 'Full Power' : 'Registration Mode (50%)'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-3 gap-4 text-sm">
+                      <div>
+                        <p className="text-gray-400">Configured</p>
+                        <p className="text-lg font-semibold text-white">{workerDistribution.configured}</p>
+                      </div>
+                      <div>
+                        <p className="text-gray-400">Effective</p>
+                        <p className="text-lg font-semibold text-white">{workerDistribution.effective}</p>
+                      </div>
+                      <div>
+                        <p className="text-gray-400">Active</p>
+                        <p className="text-lg font-semibold text-white">{workerDistribution.active}</p>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-400 mt-2">{workerDistribution.message}</p>
+                  </div>
+                )}
+
+                {/* Mining State Status */}
+                {miningState && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <Activity className="w-4 h-4 text-purple-400" />
+                        <span className="font-semibold text-white">Mining State</span>
+                        <span className={cn(
+                          "text-xs px-2 py-0.5 rounded",
+                          miningState.state === 'mining' ? "bg-green-500/20 text-green-400" :
+                          miningState.state === 'idle' ? "bg-gray-500/20 text-gray-400" :
+                          "bg-yellow-500/20 text-yellow-400"
+                        )}>
+                          {miningState.state}
+                        </span>
+                        {miningState.substate && (
+                          <span className="text-xs px-2 py-0.5 rounded bg-blue-500/20 text-blue-400">
+                            {miningState.substate}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-sm text-gray-300 mb-2">{miningState.message}</p>
+                    {miningState.addressesAvailable !== undefined && (
+                      <div className="grid grid-cols-3 gap-4 text-sm">
+                        <div>
+                          <p className="text-gray-400">Available</p>
+                          <p className="text-lg font-semibold text-white">{miningState.addressesAvailable}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400">In Progress</p>
+                          <p className="text-lg font-semibold text-white">{miningState.addressesInProgress || 0}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400">Waiting</p>
+                          <p className="text-lg font-semibold text-white">{miningState.addressesWaitingRetry || 0}</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Hash Rate Monitoring Status */}
+                {hashRateMonitoring && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <Gauge className="w-4 h-4 text-purple-400" />
+                        <span className="font-semibold text-white">Hash Rate Monitoring</span>
+                        <span className={cn(
+                          "text-xs px-2 py-0.5 rounded",
+                          hashRateMonitoring.state === 'stable' ? "bg-green-500/20 text-green-400" :
+                          hashRateMonitoring.state === 'dropped' ? "bg-red-500/20 text-red-400" :
+                          hashRateMonitoring.state === 'collecting_baseline' ? "bg-blue-500/20 text-blue-400 animate-pulse" :
+                          "bg-yellow-500/20 text-yellow-400"
+                        )}>
+                          {hashRateMonitoring.state.replace('_', ' ')}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-sm text-gray-300 mb-2">{hashRateMonitoring.message}</p>
+                    <div className="grid grid-cols-2 gap-4 text-sm">
+                      <div>
+                        <p className="text-gray-400">Current</p>
+                        <p className="text-lg font-semibold text-white">
+                          {hashRateMonitoring.currentHashRate.toFixed(0)} H/s
+                        </p>
+                      </div>
+                      {hashRateMonitoring.baselineHashRate !== undefined && (
+                        <div>
+                          <p className="text-gray-400">Baseline</p>
+                          <p className="text-lg font-semibold text-white">
+                            {hashRateMonitoring.baselineHashRate.toFixed(0)} H/s
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                    {hashRateMonitoring.timeRemaining !== undefined && (
+                      <div className="mt-2 text-xs text-blue-400">
+                        ⏱️ {hashRateMonitoring.timeRemaining}s remaining
+                      </div>
+                    )}
+                    {hashRateMonitoring.dropPercentage !== undefined && (
+                      <div className="mt-2 text-xs text-red-400">
+                        ⚠️ {hashRateMonitoring.dropPercentage.toFixed(0)}% below baseline
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Stability Check Status */}
+                {stabilityCheck && stabilityCheck.state === 'complete' && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <RefreshCw className="w-4 h-4 text-blue-400" />
+                        <span className="font-semibold text-white">Stability Check</span>
+                        <span className={cn(
+                          "text-xs px-2 py-0.5 rounded",
+                          stabilityCheck.issuesFound === 0 ? "bg-green-500/20 text-green-400" :
+                          "bg-yellow-500/20 text-yellow-400"
+                        )}>
+                          {stabilityCheck.issuesFound === 0 ? 'No Issues' : `${stabilityCheck.issuesFound} Issues`}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-sm text-gray-300 mb-2">{stabilityCheck.message}</p>
+                    {stabilityCheck.repairsMade > 0 && (
+                      <div className="text-xs text-yellow-400">
+                        🔧 {stabilityCheck.repairsMade} repairs made
+                      </div>
+                    )}
+                    {stabilityCheck.details && (
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+                        {stabilityCheck.details.staleAddresses && (
+                          <div className="text-gray-400">
+                            Stale addresses: {stabilityCheck.details.staleAddresses}
+                          </div>
+                        )}
+                        {stabilityCheck.details.stuckWorkers && (
+                          <div className="text-gray-400">
+                            Stuck workers: {stabilityCheck.details.stuckWorkers}
+                          </div>
+                        )}
+                        {stabilityCheck.details.orphanedWorkers && (
+                          <div className="text-gray-400">
+                            Orphaned workers: {stabilityCheck.details.orphanedWorkers}
+                          </div>
+                        )}
+                        {stabilityCheck.details.memoryLeaks && (
+                          <div className="text-gray-400">
+                            Memory leaks: {stabilityCheck.details.memoryLeaks}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Technical Metrics */}
+                {technicalMetrics && (
+                  <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-2">
+                        <Activity className="w-5 h-5 text-purple-400" />
+                        <span className="font-semibold text-white">Technical Metrics</span>
+                        <span className="text-xs px-2 py-0.5 rounded bg-purple-500/20 text-purple-400">
+                          Live
+                        </span>
+                      </div>
+                      <span className="text-xs text-gray-400">
+                        Updated {Math.round((Date.now() - technicalMetrics.timestamp) / 1000)}s ago
+                      </span>
+                    </div>
+
+                    {/* Threads & Workers */}
+                    <div className="mb-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Threads & Workers</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">Threads In Use</p>
+                          <p className="text-lg font-semibold text-white">
+                            {technicalMetrics.threads.totalInUse} / {technicalMetrics.threads.maxAvailable}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {technicalMetrics.threads.utilizationPercent.toFixed(1)}% utilization
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Workers Active</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.workers.totalActive}</p>
+                          <p className="text-xs text-gray-500">
+                            {technicalMetrics.workers.totalMining} mining, {technicalMetrics.workers.totalSubmitting} submitting
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Workers Idle</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.workers.totalIdle}</p>
+                          <p className="text-xs text-gray-500">
+                            {technicalMetrics.workers.totalCompleted} completed
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Configured</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.workers.totalConfigured}</p>
+                          <p className="text-xs text-gray-500">Total workers</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Failure Statistics */}
+                    <div className="mb-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Failure Statistics</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">Total Failures</p>
+                          <p className={cn(
+                            "text-lg font-semibold",
+                            technicalMetrics.failures.totalSubmissionFailures > 0 ? "text-red-400" : "text-green-400"
+                          )}>
+                            {technicalMetrics.failures.totalSubmissionFailures}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Addresses w/ Failures</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.failures.addressesWithFailures}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Avg Failures/Address</p>
+                          <p className="text-lg font-semibold text-white">
+                            {technicalMetrics.failures.averageFailuresPerAddress.toFixed(2)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Max Failures</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.failures.maxFailuresForAnyAddress}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Hash Service */}
+                    <div className="mb-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Hash Service</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">Timeouts</p>
+                          <p className={cn(
+                            "text-lg font-semibold",
+                            technicalMetrics.hashService.timeoutCount > 0 ? "text-yellow-400" : "text-green-400"
+                          )}>
+                            {technicalMetrics.hashService.timeoutCount}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Current Batch Size</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.hashService.currentBatchSize}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Base Batch Size</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.hashService.baseBatchSize}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Adaptive Active</p>
+                          <p className={cn(
+                            "text-lg font-semibold",
+                            technicalMetrics.hashService.adaptiveBatchSizeActive ? "text-yellow-400" : "text-green-400"
+                          )}>
+                            {technicalMetrics.hashService.adaptiveBatchSizeActive ? 'Yes' : 'No'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Last Timeout</p>
+                          <p className="text-lg font-semibold text-white">
+                            {technicalMetrics.hashService.lastTimeout 
+                              ? `${Math.round((Date.now() - technicalMetrics.hashService.lastTimeout) / 1000)}s ago`
+                              : 'Never'}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Hashing Statistics */}
+                    <div className="mb-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Hashing Statistics</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">Total Hashes</p>
+                          <p className="text-lg font-semibold text-white">
+                            {technicalMetrics.hashing.totalHashesComputed.toLocaleString()}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Avg Hashes/Worker</p>
+                          <p className="text-lg font-semibold text-white">
+                            {technicalMetrics.hashing.averageHashesPerWorker.toLocaleString()}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Active Workers</p>
+                          <p className="text-lg font-semibold text-white">
+                            {Object.keys(technicalMetrics.hashing.totalHashesPerWorker).length}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Performance Metrics */}
+                    <div className="mb-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Performance</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">CPU Usage</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.performance.cpuUsage.toFixed(1)}%</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Uptime</p>
+                          <p className="text-lg font-semibold text-white">
+                            {Math.floor(technicalMetrics.performance.uptime / 3600)}h {Math.floor((technicalMetrics.performance.uptime % 3600) / 60)}m
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Solutions Found</p>
+                          <p className="text-lg font-semibold text-green-400">{technicalMetrics.performance.solutionsFound}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Solutions/Hour</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.performance.solutionsPerHour.toFixed(2)}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Memory Usage */}
+                    <div className="mb-4">
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Memory Usage</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">Worker Stats</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.memory.workerStatsSize}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Assignments</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.memory.addressAssignmentsSize}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Submitted Solutions</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.memory.submittedSolutionsSize}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Paused Addresses</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.memory.pausedAddressesSize}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Submitting</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.memory.submittingAddressesSize}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Address Statistics */}
+                    <div>
+                      <h4 className="text-sm font-semibold text-gray-300 mb-2">Address Statistics</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                        <div>
+                          <p className="text-gray-400 text-xs">Total</p>
+                          <p className="text-lg font-semibold text-white">{technicalMetrics.addresses.total}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Registered</p>
+                          <p className="text-lg font-semibold text-green-400">{technicalMetrics.addresses.registered}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">In Progress</p>
+                          <p className="text-lg font-semibold text-blue-400">{technicalMetrics.addresses.inProgress}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Solved</p>
+                          <p className="text-lg font-semibold text-green-400">{technicalMetrics.addresses.solved}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Waiting Retry</p>
+                          <p className="text-lg font-semibold text-yellow-400">{technicalMetrics.addresses.waitingRetry}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Failed</p>
+                          <p className={cn(
+                            "text-lg font-semibold",
+                            technicalMetrics.addresses.failed > 0 ? "text-red-400" : "text-gray-400"
+                          )}>
+                            {technicalMetrics.addresses.failed}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-gray-400 text-xs">Unregistered</p>
+                          <p className="text-lg font-semibold text-yellow-400">{technicalMetrics.addresses.unregistered}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
             </>
           </>
         )}

@@ -98,7 +98,18 @@ export class WalletManager {
       throw new Error('No wallet found. Please create a new wallet first.');
     }
 
-    const encryptedData: EncryptedData = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+    // CRITICAL: Check if file is empty or read file content safely
+    const seedFileContent = fs.readFileSync(SEED_FILE, 'utf8').trim();
+    if (!seedFileContent || seedFileContent.length === 0) {
+      throw new Error('Wallet seed file is empty or corrupted. Please create a new wallet.');
+    }
+
+    let encryptedData: EncryptedData;
+    try {
+      encryptedData = JSON.parse(seedFileContent);
+    } catch (err: any) {
+      throw new Error(`Failed to parse wallet seed file: ${err.message}. The file may be corrupted.`);
+    }
 
     try {
       this.mnemonic = decrypt(encryptedData, password);
@@ -106,11 +117,74 @@ export class WalletManager {
       throw new Error('Failed to decrypt wallet. Incorrect password?');
     }
 
-    // Load derived addresses if they exist
+    // Load derived addresses if they exist, or regenerate if file is empty/corrupted
     if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
-      this.derivedAddresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+      // CRITICAL: Check if file is empty before parsing
+      const addressesFileContent = fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8').trim();
+      if (!addressesFileContent || addressesFileContent.length === 0) {
+        console.warn('[WalletManager] Derived addresses file is empty. Regenerating addresses...');
+        // Regenerate addresses (default to 200 addresses)
+        await this.deriveAddresses(200);
+        // Save regenerated addresses to disk
+        fs.writeFileSync(
+          DERIVED_ADDRESSES_FILE,
+          JSON.stringify(this.derivedAddresses, null, 2),
+          { mode: 0o600 }
+        );
+        console.log(`[WalletManager] ✓ Regenerated ${this.derivedAddresses.length} addresses`);
+        return this.derivedAddresses;
+      }
+
+      let parsedAddresses: DerivedAddress[];
+      try {
+        const parsed = JSON.parse(addressesFileContent);
+        // Validate that we got an array
+        if (!Array.isArray(parsed)) {
+          throw new Error('File does not contain a valid array');
+        }
+        parsedAddresses = parsed as DerivedAddress[];
+      } catch (err: any) {
+        console.warn(`[WalletManager] Failed to parse derived addresses file: ${err.message}. Regenerating addresses...`);
+        // Regenerate addresses if parsing fails or not an array
+        await this.deriveAddresses(200);
+        // Save regenerated addresses to disk
+        fs.writeFileSync(
+          DERIVED_ADDRESSES_FILE,
+          JSON.stringify(this.derivedAddresses, null, 2),
+          { mode: 0o600 }
+        );
+        console.log(`[WalletManager] ✓ Regenerated ${this.derivedAddresses.length} addresses`);
+        return this.derivedAddresses;
+      }
+
+      // Use parsed addresses
+      this.derivedAddresses = parsedAddresses;
+
+      // Validate array is not empty
+      if (this.derivedAddresses.length === 0) {
+        console.warn('[WalletManager] Derived addresses array is empty. Regenerating addresses...');
+        // Regenerate addresses if array is empty
+        await this.deriveAddresses(200);
+        // Save regenerated addresses to disk
+        fs.writeFileSync(
+          DERIVED_ADDRESSES_FILE,
+          JSON.stringify(this.derivedAddresses, null, 2),
+          { mode: 0o600 }
+        );
+        console.log(`[WalletManager] ✓ Regenerated ${this.derivedAddresses.length} addresses`);
+        return this.derivedAddresses;
+      }
     } else {
-      throw new Error('Derived addresses file not found. Wallet may be corrupted.');
+      console.warn('[WalletManager] Derived addresses file not found. Regenerating addresses...');
+      // Regenerate addresses if file doesn't exist
+      await this.deriveAddresses(200);
+      // Save regenerated addresses to disk
+      fs.writeFileSync(
+        DERIVED_ADDRESSES_FILE,
+        JSON.stringify(this.derivedAddresses, null, 2),
+        { mode: 0o600 }
+      );
+      console.log(`[WalletManager] ✓ Regenerated ${this.derivedAddresses.length} addresses`);
     }
 
     return this.derivedAddresses;
@@ -231,9 +305,17 @@ export class WalletManager {
     let addresses: DerivedAddress[] = [];
     if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
       try {
-        addresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
-      } catch (err) {
-        console.warn(`[WalletManager] Failed to reload addresses for registration: ${err}`);
+        const addressesFileContent = fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8').trim();
+        if (addressesFileContent && addressesFileContent.length > 0) {
+          addresses = JSON.parse(addressesFileContent);
+          if (!Array.isArray(addresses)) {
+            throw new Error('Derived addresses file does not contain a valid array');
+          }
+        } else {
+          throw new Error('Derived addresses file is empty');
+        }
+      } catch (err: any) {
+        console.warn(`[WalletManager] Failed to reload addresses for registration: ${err.message}`);
         addresses = this.derivedAddresses;
       }
     } else {
@@ -270,26 +352,105 @@ export class WalletManager {
    */
   async expandAddresses(password: string, newCount: number): Promise<void> {
     if (!fs.existsSync(SEED_FILE)) throw new Error('No wallet found');
-    const encryptedData: EncryptedData = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+    
+    // CRITICAL: Check if file is empty before parsing
+    const seedFileContent = fs.readFileSync(SEED_FILE, 'utf8').trim();
+    if (!seedFileContent || seedFileContent.length === 0) {
+      throw new Error('Wallet seed file is empty or corrupted.');
+    }
+
+    let encryptedData: EncryptedData;
+    try {
+      encryptedData = JSON.parse(seedFileContent);
+    } catch (err: any) {
+      throw new Error(`Failed to parse wallet seed file: ${err.message}`);
+    }
+
     this.mnemonic = decrypt(encryptedData, password);
     if (!this.mnemonic) throw new Error('Mnemonic decrypt failed');
+    
     // Load existing addresses
     let addresses: DerivedAddress[] = [];
     if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
-      addresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+      const addressesFileContent = fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8').trim();
+      if (addressesFileContent && addressesFileContent.length > 0) {
+        try {
+          addresses = JSON.parse(addressesFileContent);
+          if (!Array.isArray(addresses)) {
+            throw new Error('Derived addresses file does not contain a valid array');
+          }
+        } catch (err: any) {
+          console.warn(`[WalletManager] Failed to parse existing addresses file: ${err.message}. Starting fresh.`);
+          addresses = [];
+        }
+      }
     }
-    // Add up to newCount
-    const toAdd = newCount - addresses.length;
-    if (toAdd <= 0) return; // Nothing to do
-    for (let i = addresses.length; i < newCount; i++) {
-      const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
-      addresses.push({
-        index: i,
-        bech32: address,
-        publicKeyHex: pubKeyHex,
-        registered: false,
-      });
+    // CRITICAL: Validate existing addresses have correct indices before expanding
+    // This prevents corruption when expanding
+    if (addresses.length > 0) {
+      // Check for missing or duplicate indices
+      const indices = new Set(addresses.map(a => a.index));
+      const maxIndex = Math.max(...addresses.map(a => a.index));
+      
+      // Verify indices are sequential starting from 0
+      let hasGaps = false;
+      let hasDuplicates = false;
+      const indexCounts = new Map<number, number>();
+      
+      for (const addr of addresses) {
+        const count = (indexCounts.get(addr.index) || 0) + 1;
+        indexCounts.set(addr.index, count);
+        if (count > 1) hasDuplicates = true;
+      }
+      
+      for (let i = 0; i < addresses.length; i++) {
+        if (!indices.has(i)) {
+          hasGaps = true;
+          break;
+        }
+      }
+      
+      if (hasGaps || hasDuplicates || maxIndex >= addresses.length) {
+        console.warn(`[WalletManager] ⚠️  Address file has invalid indices (gaps: ${hasGaps}, duplicates: ${hasDuplicates}, maxIndex: ${maxIndex}). Regenerating from scratch...`);
+        // Regenerate all addresses from scratch to fix corruption
+        addresses = [];
+        await this.deriveAddresses(newCount);
+        addresses = this.derivedAddresses;
+      } else {
+        // Indices are valid, just add missing addresses
+        const toAdd = newCount - addresses.length;
+        if (toAdd <= 0) {
+          // Nothing to add, but ensure we have the correct count
+          this.derivedAddresses = addresses;
+          return;
+        }
+        
+        // Add missing addresses starting from the current length
+        for (let i = addresses.length; i < newCount; i++) {
+          const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
+          addresses.push({
+            index: i,
+            bech32: address,
+            publicKeyHex: pubKeyHex,
+            registered: false,
+          });
+        }
+      }
+    } else {
+      // No existing addresses, generate all from scratch
+      await this.deriveAddresses(newCount);
+      addresses = this.derivedAddresses;
     }
+    
+    // CRITICAL: Final validation - ensure all addresses have correct sequential indices
+    const finalIndices = addresses.map(a => a.index).sort((a, b) => a - b);
+    for (let i = 0; i < addresses.length; i++) {
+      if (finalIndices[i] !== i) {
+        console.error(`[WalletManager] ❌ CRITICAL: Address validation failed after expansion. Index ${finalIndices[i]} at position ${i}, expected ${i}`);
+        throw new Error(`Address expansion failed: Invalid address indices detected. Expected sequential indices 0-${addresses.length - 1}, but found index ${finalIndices[i]} at position ${i}.`);
+      }
+    }
+    
     fs.writeFileSync(DERIVED_ADDRESSES_FILE, JSON.stringify(addresses, null, 2), { mode: 0o600 });
     this.derivedAddresses = addresses;
   }
@@ -299,7 +460,22 @@ export class WalletManager {
    */
   async truncateAddresses(newCount: number): Promise<void> {
     if (!fs.existsSync(DERIVED_ADDRESSES_FILE)) throw new Error('Addresses file missing');
-    let addresses: DerivedAddress[] = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+    
+    // CRITICAL: Check if file is empty before parsing
+    const addressesFileContent = fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8').trim();
+    if (!addressesFileContent || addressesFileContent.length === 0) {
+      throw new Error('Derived addresses file is empty or corrupted.');
+    }
+
+    let addresses: DerivedAddress[];
+    try {
+      addresses = JSON.parse(addressesFileContent);
+      if (!Array.isArray(addresses)) {
+        throw new Error('Derived addresses file does not contain a valid array');
+      }
+    } catch (err: any) {
+      throw new Error(`Failed to parse derived addresses file: ${err.message}`);
+    }
     const numRegistered = addresses.filter((a) => a.registered).length;
     if (newCount < numRegistered) throw new Error(`Cannot truncate below ${numRegistered} registered addresses`);
     addresses = addresses.slice(0, newCount);
@@ -312,12 +488,37 @@ export class WalletManager {
    */
   async fillMissingAddresses(password: string, targetCount: number): Promise<number> {
     if (!fs.existsSync(SEED_FILE)) throw new Error('No wallet found');
-    const encryptedData: EncryptedData = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+    
+    // CRITICAL: Check if file is empty before parsing
+    const seedFileContent = fs.readFileSync(SEED_FILE, 'utf8').trim();
+    if (!seedFileContent || seedFileContent.length === 0) {
+      throw new Error('Wallet seed file is empty or corrupted.');
+    }
+
+    let encryptedData: EncryptedData;
+    try {
+      encryptedData = JSON.parse(seedFileContent);
+    } catch (err: any) {
+      throw new Error(`Failed to parse wallet seed file: ${err.message}`);
+    }
+
     this.mnemonic = decrypt(encryptedData, password);
     if (!this.mnemonic) throw new Error('Mnemonic decrypt failed');
+    
     let addresses: DerivedAddress[] = [];
     if (fs.existsSync(DERIVED_ADDRESSES_FILE)) {
-      addresses = JSON.parse(fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8'));
+      const addressesFileContent = fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8').trim();
+      if (addressesFileContent && addressesFileContent.length > 0) {
+        try {
+          addresses = JSON.parse(addressesFileContent);
+          if (!Array.isArray(addresses)) {
+            throw new Error('Derived addresses file does not contain a valid array');
+          }
+        } catch (err: any) {
+          console.warn(`[WalletManager] Failed to parse existing addresses file: ${err.message}. Starting fresh.`);
+          addresses = [];
+        }
+      }
     }
     // Fill missing indices
     const indexMap = new Map<number, DerivedAddress>();

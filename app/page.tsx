@@ -23,6 +23,67 @@ export default function Home() {
       const response = await fetch('/api/wallet/status');
       const data = await response.json();
       setWalletExists(data.exists);
+      
+      // If wallet exists, check if it's already unlocked (auto-startup script may have unlocked it)
+      if (data.exists) {
+        // Check immediately, then retry if needed (auto-startup script may still be running)
+        const checkAutoUnlock = async (attempt: number = 0) => {
+          const maxRetries = 10;
+          const retryDelay = 2000;
+          const defaultPassword = 'Rascalismydog@1';
+          
+          try {
+            // First, check if mining is already active (most reliable indicator)
+            const statusResponse = await fetch('/api/mining/status');
+            if (statusResponse.ok) {
+              const statusData = await statusResponse.json();
+              if (statusData.success && statusData.stats?.active) {
+                // Mining is active! Wallet is already unlocked and mining is running
+                // Set the default password in sessionStorage and redirect to mining
+                sessionStorage.setItem('walletPassword', defaultPassword);
+                console.log(`[Home] Mining is already active (attempt ${attempt + 1})! Wallet unlocked via auto-startup, redirecting to mining...`);
+                router.push('/mining');
+                return;
+              }
+            }
+            
+            // Mining is not active, try to verify default password works
+            const unlockResponse = await fetch('/api/wallet/load', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: defaultPassword }),
+            });
+            
+            if (unlockResponse.ok) {
+              // Default password works! Wallet can be unlocked
+              // Set the default password in sessionStorage and redirect to mining
+              sessionStorage.setItem('walletPassword', defaultPassword);
+              console.log(`[Home] Default password works! (attempt ${attempt + 1}) Wallet can be unlocked, redirecting to mining...`);
+              router.push('/mining');
+              return;
+            } else {
+              // Default password doesn't work yet, maybe auto-startup is still running
+              if (attempt < maxRetries - 1) {
+                console.log(`[Home] Default password check failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${retryDelay / 1000}s...`);
+                setTimeout(() => checkAutoUnlock(attempt + 1), retryDelay);
+                return;
+              } else {
+                console.log('[Home] Default password does not work after all retries, showing home page');
+              }
+            }
+          } catch (error) {
+            console.error(`[Home] Error checking auto-unlock (attempt ${attempt + 1}):`, error);
+            // On error, retry unless this is the last attempt
+            if (attempt < maxRetries - 1) {
+              setTimeout(() => checkAutoUnlock(attempt + 1), retryDelay);
+              return;
+            }
+          }
+        };
+        
+        // Start checking immediately (auto-startup script may have already completed)
+        checkAutoUnlock(0);
+      }
     } catch (error) {
       console.error('Failed to check wallet status:', error);
     } finally {

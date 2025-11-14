@@ -5,6 +5,31 @@ import { MiningEvent } from '@/lib/mining/types';
 export async function GET() {
   const encoder = new TextEncoder();
   let isClosed = false;
+  let statsInterval: NodeJS.Timeout | null = null;
+  let cleanupFunction: (() => void) | null = null;
+
+  // CRITICAL FIX: Define cleanup function outside so cancel() can access it
+  const setupCleanup = (interval: NodeJS.Timeout | null, onEvent: (event: MiningEvent) => void) => {
+    return () => {
+      if (isClosed) return; // Prevent double cleanup
+      isClosed = true;
+      if (interval) {
+        clearInterval(interval);
+      }
+      // Clear the outer variable
+      statsInterval = null;
+      miningOrchestrator.off('status', onEvent);
+      miningOrchestrator.off('solution', onEvent);
+      miningOrchestrator.off('stats', onEvent);
+      miningOrchestrator.off('error', onEvent);
+      miningOrchestrator.off('mining_start', onEvent);
+      miningOrchestrator.off('hash_progress', onEvent);
+      miningOrchestrator.off('solution_submit', onEvent);
+      miningOrchestrator.off('solution_result', onEvent);
+      miningOrchestrator.off('registration_progress', onEvent);
+      miningOrchestrator.off('worker_update', onEvent);
+    };
+  };
 
   const stream = new ReadableStream({
     start(controller) {
@@ -41,7 +66,7 @@ export async function GET() {
       miningOrchestrator.on('worker_update', onEvent);
 
       // Send periodic stats updates
-      const statsInterval = setInterval(() => {
+      statsInterval = setInterval(() => {
         if (isClosed) return;
         try {
           const stats = miningOrchestrator.getStats();
@@ -50,31 +75,27 @@ export async function GET() {
         } catch (error) {
           console.error('Error sending periodic stats:', error);
           isClosed = true;
-          clearInterval(statsInterval);
+          if (statsInterval) {
+            clearInterval(statsInterval);
+            statsInterval = null;
+          }
         }
       }, 5000); // Every 5 seconds
 
-      // Cleanup on close
-      const cleanup = () => {
-        isClosed = true;
-        clearInterval(statsInterval);
-        miningOrchestrator.off('status', onEvent);
-        miningOrchestrator.off('solution', onEvent);
-        miningOrchestrator.off('stats', onEvent);
-        miningOrchestrator.off('error', onEvent);
-        miningOrchestrator.off('mining_start', onEvent);
-        miningOrchestrator.off('hash_progress', onEvent);
-        miningOrchestrator.off('solution_submit', onEvent);
-        miningOrchestrator.off('solution_result', onEvent);
-        miningOrchestrator.off('registration_progress', onEvent);
-        miningOrchestrator.off('worker_update', onEvent);
-      };
+      // CRITICAL FIX: Store cleanup function so cancel() can call it
+      cleanupFunction = setupCleanup(statsInterval, onEvent);
 
-      // Handle client disconnect
-      return cleanup;
+      // Handle client disconnect - return cleanup
+      return cleanupFunction;
     },
     cancel() {
+      // CRITICAL FIX: Call cleanup to remove event listeners
+      // This prevents memory leaks when clients disconnect
       isClosed = true;
+      if (cleanupFunction) {
+        cleanupFunction();
+        cleanupFunction = null;
+      }
     },
   });
 

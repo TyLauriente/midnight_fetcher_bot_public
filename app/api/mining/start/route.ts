@@ -3,7 +3,7 @@ import { miningOrchestrator } from '@/lib/mining/orchestrator';
 
 export async function POST(request: NextRequest) {
   try {
-    const { password, addressOffset } = await request.json();
+    const { password } = await request.json();
 
     if (!password) {
       return NextResponse.json(
@@ -12,23 +12,19 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate addressOffset (must be a non-negative integer)
-    const offset = addressOffset !== undefined ? parseInt(addressOffset, 10) : 0;
-    if (isNaN(offset) || offset < 0) {
-      return NextResponse.json(
-        { error: 'Address offset must be a non-negative integer' },
-        { status: 400 }
-      );
-    }
+    // CRITICAL: Never accept addressOffset in start endpoint - always read from config
+    // This ensures addressOffset is only saved when user explicitly changes it via update-config endpoint
+    // The start() method will read addressOffset from config automatically when undefined is passed
+    console.log(`[API] Start button clicked - reinitializing orchestrator (addressOffset will be read from config)...`);
+    await miningOrchestrator.reinitialize(password, undefined);
 
-    // Use reinitialize to ensure fresh state when start button is clicked
-    console.log(`[API] Start button clicked - reinitializing orchestrator with address offset ${offset}...`);
-    await miningOrchestrator.reinitialize(password, offset);
+    // Get current config to return the addressOffset that was actually used
+    const config = miningOrchestrator.getCurrentConfiguration();
 
     return NextResponse.json({
       success: true,
       message: 'Mining started',
-      addressOffset: offset,
+      addressOffset: config.addressOffset,
       stats: miningOrchestrator.getStats(),
     });
   } catch (error: any) {

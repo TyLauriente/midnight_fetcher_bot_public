@@ -73,3 +73,6 @@ $RECYCLE.BIN/
 # Dev fee cache
 .devfee_cache.json
 nul
+
+package-lock.json
+package.json

@@ -99,9 +99,11 @@ export async function GET() {
     // Get CPU info with improved detection
     const cpuModel = cpus[0]?.model || 'Unknown';
     const { logical: logicalCores, physical: physicalCores } = getCpuCoreCount(platform);
-    // Use physical cores if available, otherwise logical cores
-    // For mining, logical cores (including hyperthreading) are usually fine
-    const cpuCount = physicalCores !== null ? physicalCores : logicalCores;
+    // CRITICAL FIX: For mining, use LOGICAL cores (not physical) to maximize performance
+    // Hyperthreading provides real performance benefits for mining workloads
+    // Physical cores are useful for recommendations, but logical cores are what we can actually use
+    // Only use physical if logical detection failed
+    const cpuCount = logicalCores > 0 ? logicalCores : (physicalCores !== null ? physicalCores : cpus.length);
     const cpuSpeed = cpus[0]?.speed || 0;
 
     // Calculate memory in GB

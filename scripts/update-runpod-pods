@@ -1,0 +1,135 @@
+import subprocess
+import time
+
+HOSTS = [
+    "1eblzyiodqi9y3-64410b5b@ssh.runpod.io",
+    "4u0hqt04vdbsgz-64410b2f@ssh.runpod.io",
+    "hmkwc7uijg30yh-64410b38@ssh.runpod.io",
+    "hwo8ofj0qw7ees-64410b38@ssh.runpod.io",
+    "e4y12rltm8u9fl-64410bd1@ssh.runpod.io",
+    "n4c2wt1nzdwu6u-64410b05@ssh.runpod.io",
+    "38c15qumr609fy-64410ffb@ssh.runpod.io",
+    "2anl3jzxzzdady-64410b77@ssh.runpod.io",
+    "3w2yvbzn5t9e22-64410b38@ssh.runpod.io",
+    "wiod5bhb33tjuy-64410ff1@ssh.runpod.io",
+    "qnf7z3rw6f2srl-64411a5d@ssh.runpod.io",
+    "el3wtriqlctdbf-64410bdd@ssh.runpod.io",
+    "cti1e645lgvenh-64410ffb@ssh.runpod.io",
+    "9m8psrhia6vfl4-64410b42@ssh.runpod.io",
+    "zpvtnxvj63g00m-64410bf0@ssh.runpod.io",
+    "hftlhxxre0aa1l-64410b5b@ssh.runpod.io",
+    "0dx22qrxw98kfo-64410b18@ssh.runpod.io",
+    "fajlsj4hbhshlt-64410b5b@ssh.runpod.io",
+    "7001dkz2sfh2ao-64410b42@ssh.runpod.io",
+    "ubcp8yl1xwrthx-64410b43@ssh.runpod.io",
+    "cm8sc2isw5ooti-64410b2f@ssh.runpod.io",
+    "55kegmdv7yan4a-64410b42@ssh.runpod.io",
+    "sksvxa5agenajc-64411dd3@ssh.runpod.io",
+    "n5kh02ks9lixqn-64410b05@ssh.runpod.io",
+    "koi7kov1iwei1a-64410b32@ssh.runpod.io",
+    "dbthr1k3ygvz8f-64410b38@ssh.runpod.io",
+    "tge7002n8y1g88-64410b5b@ssh.runpod.io",
+    "athq1ymdk0l5e5-64411dd3@ssh.runpod.io",
+    "tmtq8j36lkjon6-64410b5b@ssh.runpod.io",
+    "1lummya06f31w4-64410b42@ssh.runpod.io",
+    "q52f2ost29yitx-64410bca@ssh.runpod.io",
+    "0ihhjh1zn56nrb-64410b32@ssh.runpod.io",
+    "n3zemki8vqt3q9-64410bdd@ssh.runpod.io"
+]
+
+# Commands to execute on each host
+COMMANDS = [
+    "tmux a || true",
+    "tmux send-keys C-c",  # end previous app if running
+    "cd midnight_fetcher_bot_public/ && git fetch origin main && git reset --hard origin/main && sh setup.sh",
+    "tmux a",  # reattach to running app
+    "tmux send-keys Enter"  # press enter inside tmux for any prompts
+]
+
+SSH_KEY = "~/.ssh/id_ed25519"
+
+def run_ssh_commands(host, commands):
+    # We override the normal command list because we need timed behavior
+    print(f"--- Connecting to {host} ---")
+
+    # Build SSH base
+    ssh_base = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-i", SSH_KEY,
+        host
+    ]
+
+    # Step 1: attach to tmux (non-fatal)
+    subprocess.run(ssh_base + ["tmux a || true"], text=True)
+
+    # Step 2: send ctrl+c
+    subprocess.run(ssh_base + ["tmux send-keys C-c"], text=True)
+
+    # Step 3: run setup sequence
+    setup_cmd = "cd midnight_fetcher_bot_public/ && git fetch origin main && git reset --hard origin/main && sh setup.sh"
+    subprocess.run(ssh_base + [setup_cmd], text=True)
+
+    # Step 3.5: wait before pressing enter
+    print("Waiting 3 seconds to allow setup.sh to settle...")
+    time.sleep(3)
+
+    # Step 4: reattach to tmux
+    subprocess.run(ssh_base + ["tmux a"], text=True)
+
+    # Step 5: check if prompt is asking for input (simple detection)
+    # We run a small tmux capture and inspect it
+    capture = subprocess.Popen(
+        ssh_base + ["tmux capture-pane -p"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+    output, _ = capture.communicate()
+
+    if "press any key" in output.lower() or "continue" in output.lower():
+        print("Prompt detected, sending Enter...")
+        subprocess.run(ssh_base + ["tmux send-keys Enter"], text=True)
+    else:
+        print("No prompt detected.")
+
+    print(f"--- Finished with {host} ---")
+    print("Waiting 3 seconds...")
+    time.sleep(3)(host, commands)
+    remote_cmd = " && ".join(commands)
+
+    ssh_cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-i", SSH_KEY,
+        host,
+        remote_cmd
+    ]
+
+    print(f"\n--- Connecting to {host} ---\n")
+
+    process = subprocess.Popen(
+        ssh_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    for line in process.stdout:
+        print(line, end="")
+
+    process.wait()
+
+    print(f"\n--- Finished with {host} ---")
+    print("Waiting 3 seconds...\n")
+    time.sleep(3)
+
+def main():
+    for host in HOSTS:
+        run_ssh_commands(host, COMMANDS)
+
+    print("All sessions complete.")
+
+if __name__ == "__main__":
+    main()
