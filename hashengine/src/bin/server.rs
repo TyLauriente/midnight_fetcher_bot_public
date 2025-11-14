@@ -293,17 +293,28 @@ async fn main() -> std::io::Result<()> {
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| "9001".to_string());
+
+    // Get system CPU information
+    let physical_cores = num_cpus::get_physical();
+
+    // HTTP workers: configurable via WORKERS env var (default 16 for good concurrency)
     let workers = std::env::var("WORKERS")
-        .unwrap_or_else(|_| num_cpus::get().to_string())
+        .unwrap_or_else(|_| "16".to_string())
         .parse::<usize>()
-        .unwrap_or(num_cpus::get());
+        .unwrap_or(16);
+
+    // Rayon threads: use physical cores (avoids hyperthreading overhead for CPU-intensive work)
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(physical_cores)
+        .build_global()
+        .ok();
 
     info!("═══════════════════════════════════════════════════════════");
     info!("HashEngine Native Hash Service (Rust)");
     info!("═══════════════════════════════════════════════════════════");
     info!("Listening: {}:{}", host, port);
-    info!("Workers: {} (multi-threaded)", workers);
-    info!("Parallel processing: rayon thread pool");
+    info!("HTTP Workers: {} (actix-web server threads)", workers);
+    info!("Rayon Threads: {} (physical cores for hashing)", physical_cores);
     info!("═══════════════════════════════════════════════════════════");
 
     HttpServer::new(|| {

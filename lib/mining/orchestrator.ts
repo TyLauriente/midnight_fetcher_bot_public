@@ -747,7 +747,7 @@ class MiningOrchestrator extends EventEmitter {
 
     // Calculate available workers (use all workers - no permanent reservation)
     const availableWorkers = this.workerThreads;
-    const MAX_SUBMISSION_FAILURES = 6;
+    const MAX_SUBMISSION_FAILURES = 1;
 
     // Mine in batches: continuously mine groups of addresses until challenge changes
     // After each batch, check if dev fee is needed
@@ -1052,13 +1052,13 @@ class MiningOrchestrator extends EventEmitter {
    * @param addr - The address to mine for
    * @param isDevFee - Whether this is a dev fee mining operation (default: false)
    * @param workerId - Unique worker ID (0-9) to ensure different nonce generation per worker (default: 0)
-   * @param maxFailures - Maximum number of submission failures allowed for this address (default: 10)
+   * @param maxFailures - Maximum number of submission failures allowed for this address (default: 1)
    */
   private async mineForAddress(
     addr: DerivedAddress,
     isDevFee: boolean = false,
     workerId: number = 0,
-    maxFailures: number = 10,
+    maxFailures: number = 1,
     specificChallengeId?: string, // Allow mining a specific challenge (for graceful handover)
     specificChallenge?: Challenge
   ): Promise<void> {
@@ -1547,8 +1547,8 @@ class MiningOrchestrator extends EventEmitter {
           } as MiningEvent);
         }
 
-        // Only log every 100th progress update to console (reduced logging frequency)
-        if (batchCounter % (PROGRESS_INTERVAL * 100) === 0) {
+        // Only log every 500th progress update to console (reduced logging frequency)
+        if (batchCounter % (PROGRESS_INTERVAL * 500) === 0) {
           const progressMsg = `Worker ${workerId} for Address ${addr.index}: ${hashCount.toLocaleString()} hashes @ ${hashRate.toLocaleString()} H/s (Challenge: ${challengeId.slice(0, 8)}...)`;
           console.log(`[Orchestrator] ${progressMsg}`);
         }
