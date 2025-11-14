@@ -102,6 +102,7 @@ def run_host(host, iteration):
     channel = client.invoke_shell(width=200, height=50)
 
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
+    channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
     stream_output(channel, timeout=1)
 
     channel.send(f'sed -i "s/\\"addressOffset\\":[ ]*[0-9]\\+/\\"addressOffset\\": {iteration}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
@@ -110,7 +111,7 @@ def run_host(host, iteration):
     stream_output(channel, timeout=1)
 
     channel.send(SETUP_COMMAND + "\n")
-    stream_output(channel, timeout=4)
+    stream_output(channel, timeout=3)
 
     print(f"--- Finished with {host} ---\n")
     client.close()

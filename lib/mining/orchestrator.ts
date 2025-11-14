@@ -1778,50 +1778,92 @@ class MiningOrchestrator extends EventEmitter {
           }
         }
 
+        // CRITICAL FIX: Check if challenge data changed BEFORE updating currentChallenge
+        // This allows us to detect the change and handle it properly
+        const challengeDataChanged = this.currentChallenge && (
+          challenge.challenge.latest_submission !== this.currentChallenge.latest_submission ||
+          challenge.challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour ||
+          challenge.challenge.difficulty !== this.currentChallenge.difficulty
+        );
+        
+        // CRITICAL FIX: If no_pre_mine_hour changed (hour boundary), we MUST stop workers
+        // Workers are using stale challenge data and generating invalid preimages
+        const noPreMineHourChanged = this.currentChallenge && 
+          challenge.challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour;
+        
+        if (noPreMineHourChanged && this.currentChallenge) {
+          console.log(`[Orchestrator] ⚠️  HOUR BOUNDARY DETECTED: no_pre_mine_hour changed from ${this.currentChallenge.no_pre_mine_hour} to ${challenge.challenge.no_pre_mine_hour}`);
+          console.log(`[Orchestrator] Stopping all workers to refresh with new challenge data...`);
+          
+          // Stop all active workers - they're using stale challenge data
+          // Workers will automatically restart with fresh challenge data
+          const activeWorkers = Array.from(this.workerAddressAssignment.keys());
+          for (const workerId of activeWorkers) {
+            this.deleteWorkerAssignment(workerId);
+            this.stoppedWorkers.add(workerId); // Signal workers to stop
+            const workerData = this.workerStats.get(workerId);
+            if (workerData && (workerData.status === 'mining' || workerData.status === 'submitting')) {
+              workerData.status = 'idle';
+              workerData.currentChallenge = null;
+              this.workerHashesSinceLastUpdate.delete(workerId);
+            }
+          }
+          
+          // Clear address assignments so workers can restart fresh
+          this.workerAddressAssignment.clear();
+          this.addressToWorkers.clear();
+          
+          // Clear static preimage cache - it's based on challenge data
+          this.staticPreimageCache.clear();
+          
+          console.log(`[Orchestrator] ✓ Cleared ${activeWorkers.length} worker assignments for hour boundary refresh`);
+          
+          // Emit status event to notify UI of challenge data update
+          this.emit('status', {
+            type: 'status',
+            active: this.isRunning,
+            challengeId: this.currentChallengeId,
+          } as MiningEvent);
+        }
+        
+        // Update currentChallenge AFTER handling the change
         this.currentChallenge = challenge.challenge;
         
         // CRITICAL FIX: Clear blocked addresses when challenge data changes significantly
         // This mimics what stop/start does - clears failure state so addresses can retry immediately
         // This prevents workers from sitting idle when challenge data updates
-        if (this.currentChallenge) {
-          const challengeDataChanged = 
-            challenge.challenge.latest_submission !== this.currentChallenge.latest_submission ||
-            challenge.challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour ||
-            challenge.challenge.difficulty !== this.currentChallenge.difficulty;
+        if (challengeDataChanged) {
+          // CRITICAL FIX: Clear ALL blocked state when challenge data changes
+          // This mimics what stop/start does - completely resets failure state
+          const failuresBefore = this.addressSubmissionFailures.size;
+          const blockedBefore = this.lastMineAttempt.size;
+          const pausedBefore = this.pausedAddresses.size;
+          const submittingBefore = this.submittingAddresses.size;
           
-          if (challengeDataChanged) {
-            // CRITICAL FIX: Clear ALL blocked state when challenge data changes
-            // This mimics what stop/start does - completely resets failure state
-            const failuresBefore = this.addressSubmissionFailures.size;
-            const blockedBefore = this.lastMineAttempt.size;
-            const pausedBefore = this.pausedAddresses.size;
-            const submittingBefore = this.submittingAddresses.size;
+          // Clear failure counters for addresses that failed due to stale challenge data
+          // This is what stop() does (line 1339) - we're doing it at runtime
+          this.addressSubmissionFailures.clear();
+          
+          // Clear lastMineAttempt to unblock all addresses for immediate retry
+          // This is what startMining() does (line 2083) - we're doing it at runtime
+          this.lastMineAttempt.clear();
+          
+          // Clear paused and submitting states - these can also block addresses
+          // This ensures addresses aren't stuck in paused/submitting state with stale data
+          this.pausedAddresses.clear();
+          this.submittingAddresses.clear();
+          
+          // Reset consecutive recovery attempts since we're proactively fixing the issue
+          this.consecutiveRecoveryAttempts = 0;
+          
+          if (failuresBefore > 0 || blockedBefore > 0 || pausedBefore > 0 || submittingBefore > 0) {
+            console.log(`[Orchestrator] 🔄 Challenge data changed - cleared ${failuresBefore} failures, ${blockedBefore} blocked, ${pausedBefore} paused, ${submittingBefore} submitting (all addresses can retry immediately)`);
             
-            // Clear failure counters for addresses that failed due to stale challenge data
-            // This is what stop() does (line 1339) - we're doing it at runtime
-            this.addressSubmissionFailures.clear();
-            
-            // Clear lastMineAttempt to unblock all addresses for immediate retry
-            // This is what startMining() does (line 2083) - we're doing it at runtime
-            this.lastMineAttempt.clear();
-            
-            // Clear paused and submitting states - these can also block addresses
-            // This ensures addresses aren't stuck in paused/submitting state with stale data
-            this.pausedAddresses.clear();
-            this.submittingAddresses.clear();
-            
-            // Reset consecutive recovery attempts since we're proactively fixing the issue
-            this.consecutiveRecoveryAttempts = 0;
-            
-            if (failuresBefore > 0 || blockedBefore > 0 || pausedBefore > 0 || submittingBefore > 0) {
-              console.log(`[Orchestrator] 🔄 Challenge data changed - cleared ${failuresBefore} failures, ${blockedBefore} blocked, ${pausedBefore} paused, ${submittingBefore} submitting (all addresses can retry immediately)`);
-              
-              // Emit event to notify UI
-              this.emit('error', {
-                type: 'error',
-                message: `Challenge data updated - ${blockedBefore + pausedBefore + submittingBefore} blocked addresses unblocked for immediate retry`,
-              } as MiningEvent);
-            }
+            // Emit event to notify UI
+            this.emit('error', {
+              type: 'error',
+              message: `Challenge data updated - ${blockedBefore + pausedBefore + submittingBefore} blocked addresses unblocked for immediate retry`,
+            } as MiningEvent);
           }
         }
       }
@@ -3142,6 +3184,28 @@ class MiningOrchestrator extends EventEmitter {
             workerData.status = 'idle';
           }
           return; // Stop mining for this address, new challenge will restart
+        }
+        
+        // CRITICAL FIX: Check if challenge DATA changed (not just challenge ID)
+        // When no_pre_mine_hour changes at hour boundary, workers must refresh challenge data
+        // Otherwise they'll generate invalid preimages with stale no_pre_mine_hour
+        if (this.currentChallenge && (
+          this.currentChallenge.no_pre_mine_hour !== challenge.no_pre_mine_hour ||
+          this.currentChallenge.latest_submission !== challenge.latest_submission ||
+          this.currentChallenge.difficulty !== challenge.difficulty
+        )) {
+          // Challenge data changed - worker needs to refresh with new data
+          // Stop this worker so it can restart with fresh challenge data
+          console.log(`[Orchestrator] Worker ${workerId}: Challenge data changed (no_pre_mine_hour: ${challenge.no_pre_mine_hour} -> ${this.currentChallenge.no_pre_mine_hour}), stopping to refresh`);
+          this.deleteWorkerAssignment(workerId);
+          this.stoppedWorkers.delete(workerId);
+          const workerData = this.workerStats.get(workerId);
+          if (workerData) {
+            workerData.status = 'idle';
+            workerData.currentChallenge = null;
+          }
+          this.workerHashesSinceLastUpdate.delete(workerId);
+          return; // Stop mining - will restart with fresh challenge data
         }
 
         // CRITICAL: Atomic hash counting to prevent race conditions
@@ -5943,6 +6007,8 @@ class MiningOrchestrator extends EventEmitter {
     // Track when we first detected no active workers
     let noActiveWorkersStartTime: number | null = null;
     const NO_ACTIVE_WORKERS_THRESHOLD = 120000; // 2 minutes of no active workers before recovery
+    const STARTUP_GRACE_PERIOD = 300000; // 5 minutes grace period after mining starts (workers may be slow to start)
+    const miningStartTime = Date.now(); // Track when mining started
 
     // Check every 30 seconds for no active workers
     this.automaticRecoveryCheckInterval = setInterval(() => {
@@ -5954,29 +6020,60 @@ class MiningOrchestrator extends EventEmitter {
       }
 
       const now = Date.now();
+      
+      // CRITICAL FIX: Grace period after startup - don't trigger recovery during initial startup
+      // Workers may take time to start mining, especially during registration
+      const timeSinceStart = now - miningStartTime;
+      if (timeSinceStart < STARTUP_GRACE_PERIOD) {
+        // Still in grace period - skip recovery check
+        noActiveWorkersStartTime = null; // Reset tracking during grace period
+        return;
+      }
 
-      // CRITICAL: Use the SAME logic as the UI to detect "No active workers"
-      // The UI checks: workers.size === 0
-      // We check: workerStats with status 'mining' or 'submitting' and updated recently
+      // CRITICAL FIX: Improved detection logic - check multiple indicators
+      // 1. Workers with active status and recent updates (primary check)
+      // 2. Workers assigned to addresses (secondary check - they're working even if slow to update)
+      // 3. Addresses currently in progress (tertiary check - work is happening)
       let activeWorkerCount = 0;
+      let assignedWorkerCount = 0;
+      
       for (const [workerId, workerData] of this.workerStats.entries()) {
-        // Worker is active if:
-        // 1. Status is 'mining' or 'submitting' (not 'idle' or 'completed')
-        // 2. Updated in the last 2 minutes (actually working, not stuck)
+        // Primary check: Worker is active if status is 'mining' or 'submitting'
         if (workerData && (workerData.status === 'mining' || workerData.status === 'submitting')) {
           const timeSinceUpdate = now - workerData.lastUpdateTime;
-          if (timeSinceUpdate < 120000) { // Updated in last 2 minutes
+          // CRITICAL FIX: Increase timeout to 5 minutes for workers with large batches
+          // Workers update every 100 batches, so with large batches they may not update for 3-4 minutes
+          if (timeSinceUpdate < 300000) { // Updated in last 5 minutes (increased from 2 minutes)
             activeWorkerCount++;
           }
         }
+        
+        // Secondary check: Worker is assigned to an address (even if slow to update)
+        if (this.workerAddressAssignment.has(workerId)) {
+          assignedWorkerCount++;
+        }
       }
+      
+      // CRITICAL FIX: Also check if addresses are in progress (work is happening)
+      // This prevents false positives when workers are processing but haven't updated stats yet
+      const addressesInProgress = Array.from(this.workerAddressAssignment.values()).filter(addr => addr).length;
+      
+      // Worker is considered active if:
+      // - Has active status and recent update, OR
+      // - Is assigned to an address (working even if slow to update), OR
+      // - Addresses are in progress (work happening)
+      const effectiveActiveWorkers = Math.max(activeWorkerCount, assignedWorkerCount > 0 ? assignedWorkerCount : 0);
+      const hasWorkInProgress = addressesInProgress > 0;
 
-      // Check if we have no active workers
-      if (activeWorkerCount === 0) {
+      // CRITICAL FIX: Only trigger recovery if BOTH conditions are true:
+      // 1. No active workers (by status/update time)
+      // 2. No work in progress (no addresses being mined)
+      // This prevents false positives when workers are just slow to update
+      if (effectiveActiveWorkers === 0 && !hasWorkInProgress) {
         // First time detecting no active workers - start tracking
         if (noActiveWorkersStartTime === null) {
           noActiveWorkersStartTime = now;
-          console.warn(`[Orchestrator] ⚠️  FAILSAFE: No active workers detected (0/${this.workerThreads}). Monitoring for ${NO_ACTIVE_WORKERS_THRESHOLD / 1000}s before auto-recovery...`);
+          console.warn(`[Orchestrator] ⚠️  FAILSAFE: No active workers detected (${effectiveActiveWorkers} active, ${assignedWorkerCount} assigned, ${addressesInProgress} addresses in progress). Monitoring for ${NO_ACTIVE_WORKERS_THRESHOLD / 1000}s before auto-recovery...`);
         } else {
           // We've been in no-active-workers state for a while
           const timeInNoWorkersState = now - noActiveWorkersStartTime;
@@ -6016,7 +6113,19 @@ class MiningOrchestrator extends EventEmitter {
             this.lastAutomaticRecovery = now;
             noActiveWorkersStartTime = null; // Reset tracking
 
-            // Emit error event to notify UI
+            // Emit error event to notify UI (safe because we have a default handler)
+            // Use system_status for recovery events to avoid error event issues
+            this.emit('system_status', {
+              type: 'system_status',
+              state: 'running',
+              message: `Automatic recovery triggered: No active workers detected. Restarting mining...`,
+              details: {
+                recoveryTriggered: true,
+                consecutiveAttempts: this.consecutiveRecoveryAttempts + 1,
+              },
+            } as MiningEvent);
+            
+            // Also emit error for UI compatibility (but safe now with default handler)
             this.emit('error', {
               type: 'error',
               message: `Automatic recovery triggered: No active workers detected. Restarting mining...`,
@@ -6035,7 +6144,7 @@ class MiningOrchestrator extends EventEmitter {
       } else {
         // We have active workers - reset tracking
         if (noActiveWorkersStartTime !== null) {
-          console.log(`[Orchestrator] ✓ FAILSAFE: Active workers restored (${activeWorkerCount}/${this.workerThreads}). Recovery not needed.`);
+          console.log(`[Orchestrator] ✓ FAILSAFE: Active workers restored (${effectiveActiveWorkers} active, ${assignedWorkerCount} assigned, ${addressesInProgress} addresses in progress). Recovery not needed.`);
           noActiveWorkersStartTime = null;
           
           // Reset consecutive recovery count after successful mining period
@@ -6051,7 +6160,7 @@ class MiningOrchestrator extends EventEmitter {
       }
     }, 30000); // Check every 30 seconds
 
-    console.log('[Orchestrator] ✅ Automatic recovery failsafe started (checks every 30s, triggers after 2min of no active workers)');
+    console.log('[Orchestrator] ✅ Automatic recovery failsafe started (checks every 30s, 5min grace period after startup, triggers after 2min of no active workers AND no work in progress)');
   }
 
   /**
@@ -6227,6 +6336,16 @@ class MiningOrchestrator extends EventEmitter {
 // Singleton instance
 // CRITICAL: Create singleton instance
 export const miningOrchestrator = new MiningOrchestrator();
+
+// CRITICAL FIX: Add default error handler to prevent unhandled error events
+// EventEmitter throws if 'error' event is emitted without listeners
+// This handler ensures errors are logged even if no UI listeners exist
+miningOrchestrator.on('error', (event: MiningEvent) => {
+  // Log error but don't throw - this prevents unhandled error crashes
+  if (event.type === 'error') {
+    console.error(`[Orchestrator] Error event: ${(event as any).message || 'Unknown error'}`);
+  }
+});
 
 // CRITICAL FIX: Add global error handlers for unhandled promise rejections
 if (typeof process !== 'undefined') {
