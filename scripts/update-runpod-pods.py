@@ -58,6 +58,7 @@ SETUP_COMMAND = (
 
 ATTACH_DURATION = 1
 DEFAULT_WORKER_THREADS = 77
+DEFAULT_BATCH_SIZE = 500
 
 def stream_output(channel, timeout=None):
     start = time.time()
@@ -105,6 +106,7 @@ def run_host(host, iteration):
 
     channel.send(f'sed -i "s/\\"addressOffset\\":[ ]*[0-9]\\+/\\"addressOffset\\": {iteration}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
     channel.send(f'sed -i "s/\\"workerThreads\\":[ ]*[0-9]\\+/\\"workerThreads\\": {DEFAULT_WORKER_THREADS}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
+    channel.send(f'sed -i "s/\\"batchSize\\":[ ]*[0-9]\\+/\\"batchSize\\": {DEFAULT_BATCH_SIZE}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
     stream_output(channel, timeout=0.15)
 
     channel.send(SETUP_COMMAND + "\n")

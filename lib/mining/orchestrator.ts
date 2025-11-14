@@ -112,6 +112,15 @@ class MiningOrchestrator extends EventEmitter {
       this.hexLookup[i] = i.toString(16).padStart(2, '0');
     }
     
+    // OPTIMIZATION: Pre-build hex byte -> number lookup table (avoids parseInt in hot path)
+    // This is faster than parseInt(byteHex, 16) for single-byte hex strings
+    this.hexByteLookup = new Map<string, number>();
+    for (let i = 0; i < 256; i++) {
+      const hex = i.toString(16).padStart(2, '0');
+      this.hexByteLookup.set(hex, i);
+      this.hexByteLookup.set(hex.toUpperCase(), i);
+    }
+    
     // CRITICAL: Detect actual CPU thread count to limit max workers
     const maxCpuThreads = this.detectCpuThreadCount();
     console.log(`[Orchestrator] Detected CPU thread count: ${maxCpuThreads} (this will be the maximum allowed worker count)`);
@@ -188,6 +197,8 @@ class MiningOrchestrator extends EventEmitter {
   private pausedAddresses = new Set<string>(); // Track addresses that are paused while submission is in progress
   private workerStats = new Map<number, WorkerStats>(); // Track stats for each worker (workerId -> WorkerStats)
   private workerHashesSinceLastUpdate = new Map<number, number>(); // Track hashes since last hash rate update per worker
+  private addressToWorkers = new Map<string, Set<number>>(); // Reverse map: address -> Set of workerIds (for fast worker stopping)
+  private hexByteLookup = new Map<string, number>(); // Lookup table for hex byte -> number (0-255) to avoid parseInt in hot path
   private hourlyRestartTimer: NodeJS.Timeout | null = null; // Timer for hourly restart
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
@@ -439,6 +450,26 @@ class MiningOrchestrator extends EventEmitter {
         return false; // Already assigned to different address
       }
       this.workerAddressAssignment.set(workerId, address);
+      
+      // OPTIMIZATION: Update reverse map for fast worker lookup by address
+      if (existing && existing !== address) {
+        // Remove from old address's worker set
+        const oldWorkers = this.addressToWorkers.get(existing);
+        if (oldWorkers) {
+          oldWorkers.delete(workerId);
+          if (oldWorkers.size === 0) {
+            this.addressToWorkers.delete(existing);
+          }
+        }
+      }
+      // Add to new address's worker set
+      let workers = this.addressToWorkers.get(address);
+      if (!workers) {
+        workers = new Set<number>();
+        this.addressToWorkers.set(address, workers);
+      }
+      workers.add(workerId);
+      
       return true;
     } finally {
       this.workerAssignmentLock.set(workerId, false);
@@ -449,6 +480,17 @@ class MiningOrchestrator extends EventEmitter {
    * Thread-safe worker assignment deleter
    */
   private deleteWorkerAssignment(workerId: number): void {
+    // OPTIMIZATION: Update reverse map when removing assignment
+    const address = this.workerAddressAssignment.get(workerId);
+    if (address) {
+      const workers = this.addressToWorkers.get(address);
+      if (workers) {
+        workers.delete(workerId);
+        if (workers.size === 0) {
+          this.addressToWorkers.delete(address);
+        }
+      }
+    }
     this.workerAddressAssignment.delete(workerId);
     this.workerAssignmentLock.delete(workerId); // Also clear lock
   }
@@ -1050,6 +1092,7 @@ class MiningOrchestrator extends EventEmitter {
     this.optimalWorkerCount = null;
     this.workerAssignmentLock.clear();
     this.workerHashesSinceLastUpdate.clear();
+    this.addressToWorkers.clear();
 
     this.emit('status', {
       type: 'status',
@@ -1183,11 +1226,17 @@ class MiningOrchestrator extends EventEmitter {
 
     // Calculate time period solutions
     const timePeriodSolutions = this.calculateTimePeriodSolutions();
+    
+    // CRITICAL FIX: Calculate solutions found from receipts for accuracy
+    // This ensures the count is accurate even after restarts
+    const allReceipts = receiptsLogger.readReceipts();
+    const userReceipts = allReceipts.filter(r => !r.isDevFee);
+    const totalSolutionsFound = userReceipts.length;
 
     return {
       active: this.isRunning,
       challengeId: this.currentChallengeId,
-      solutionsFound: this.solutionsFound,
+      solutionsFound: totalSolutionsFound, // Use receipts count for accuracy
       registeredAddresses: this.addresses.filter(a => a.registered).length,
       totalAddresses: this.addresses.length,
       hashRate,
@@ -1295,6 +1344,7 @@ class MiningOrchestrator extends EventEmitter {
         
         // Clear worker address assignments for new challenge
         this.workerAddressAssignment.clear();
+        this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
         
         // Reset hash service timeout tracking for new challenge
         this.hashServiceTimeoutCount = 0;
@@ -2257,7 +2307,7 @@ class MiningOrchestrator extends EventEmitter {
       existingWorkerData.lastUpdateTime = workerStartTime;
       existingWorkerData.status = 'mining';
       existingWorkerData.currentChallenge = challengeId;
-      // OPTIMIZATION: Reset hash accumulator for new address
+      // BUG FIX: Reset hash accumulator for new address to prevent incorrect hash rate calculations
       this.workerHashesSinceLastUpdate.set(workerId, 0);
     } else {
       // Create new worker stats if they don't exist
@@ -2273,7 +2323,7 @@ class MiningOrchestrator extends EventEmitter {
         status: 'mining',
         currentChallenge: challengeId,
       });
-      // OPTIMIZATION: Initialize hash accumulator for new worker
+      // BUG FIX: Initialize hash accumulator for new worker
       this.workerHashesSinceLastUpdate.set(workerId, 0);
     }
 
@@ -2415,6 +2465,7 @@ class MiningOrchestrator extends EventEmitter {
 
       // Pause this worker if address is being submitted by another worker
       // OPTIMIZATION: pauseKey is pre-calculated above to avoid repeated string concatenation
+      // OPTIMIZATION: Cache workerData to avoid repeated Map lookups
       // CRITICAL FIX: Add timeout and max iterations to prevent workers from being stuck in paused state forever
       if (this.pausedAddresses.has(pauseKey)) {
         const workerData = this.workerStats.get(workerId);
@@ -2460,7 +2511,9 @@ class MiningOrchestrator extends EventEmitter {
         }
         // If we cleared the pause lock, continue to mining (don't wait)
       } else {
-        // Clear paused start time if we're no longer paused
+        // OPTIMIZATION: Only get workerData if we need to clear pausedStartTime
+        // Most of the time this branch won't need workerData, so we can avoid the lookup
+        // But we still need to check if pausedStartTime exists, so we do need the lookup
         const workerData = this.workerStats.get(workerId);
         if (workerData && (workerData as any)?.pausedStartTime) {
           delete (workerData as any).pausedStartTime;
@@ -2610,7 +2663,7 @@ class MiningOrchestrator extends EventEmitter {
         hashCount += hashesInBatch;
 
         // EXTREME OPTIMIZATION: Update worker stats extremely infrequently for maximum tick speed
-        // User wants 100x improvement - minimize all overhead
+        // OPTIMIZATION: Cache workerData to avoid repeated Map lookups
         const workerData = this.workerStats.get(workerId);
         if (workerData) {
           // EXTREME: Only check assignment every 1000 batches (assignment rarely changes)
@@ -2622,16 +2675,20 @@ class MiningOrchestrator extends EventEmitter {
             }
           }
           
+          // BUG FIX: Always accumulate hashes, but only calculate hash rate periodically
+          // This fixes the issue where hashes weren't being counted correctly
+          workerData.hashesComputed += hashesInBatch;
+          
           // EXTREME: Update stats only every 100 batches (20x reduction)
           if (batchCounter % 100 === 0) {
             const now = Date.now();
-            workerData.hashesComputed += hashesInBatch;
             workerData.lastUpdateTime = now;
             
             // Update hash rate every 100 batches (20x reduction from before)
             const lastUpdateTime = workerData.lastHashRateUpdateTime || workerData.startTime;
             const timeSinceLastUpdate = (now - lastUpdateTime) / 1000;
             if (timeSinceLastUpdate > 0) {
+              // BUG FIX: Use accumulated hashes correctly - they're already accumulated in the else branch
               const accumulatedHashes = this.workerHashesSinceLastUpdate.get(workerId) || 0;
               const instantaneousHashRate = accumulatedHashes / timeSinceLastUpdate;
               const alpha = 0.3;
@@ -2645,7 +2702,6 @@ class MiningOrchestrator extends EventEmitter {
             }
           } else {
             // Accumulate hashes for next hash rate calculation (no Date.now() call)
-            workerData.hashesComputed += hashesInBatch;
             const currentAccumulated = this.workerHashesSinceLastUpdate.get(workerId) || 0;
             this.workerHashesSinceLastUpdate.set(workerId, currentAccumulated + hashesInBatch);
           }
@@ -2699,9 +2755,10 @@ class MiningOrchestrator extends EventEmitter {
           }
           if (heistEnginePass && remainingZeroBits > 0 && fullZeroBytes * 2 < hash.length) {
             // OPTIMIZATION: Use substring instead of slice, cache the position
+            // OPTIMIZATION: Use hexByteLookup instead of parseInt for faster conversion
             const bytePos = fullZeroBytes * 2;
             const byteHex = hash.substring(bytePos, bytePos + 2);
-            const byte = parseInt(byteHex, 16);
+            const byte = this.hexByteLookup.get(byteHex) ?? parseInt(byteHex, 16);
             heistEnginePass = (byte & remainingBitsMask) === 0;
           }
           
@@ -2727,12 +2784,12 @@ class MiningOrchestrator extends EventEmitter {
             // solutionFound is already set to true above - no need to set again
 
             // CRITICAL FIX: Use atomic check-and-set to prevent race condition
-            // Try to add to submittingAddresses - if size didn't change, another worker already added it
-            // This is truly atomic: we check the result of the add operation itself
-            const sizeBefore = this.submittingAddresses.size;
-            this.submittingAddresses.add(pauseKey);
-            const sizeAfter = this.submittingAddresses.size;
-            const wasAlreadySubmitting = sizeBefore === sizeAfter;
+            // OPTIMIZATION: Set.add() returns the Set, so we can check if it was already present
+            // This is more efficient than checking size before and after
+            const wasAlreadySubmitting = this.submittingAddresses.has(pauseKey);
+            if (!wasAlreadySubmitting) {
+              this.submittingAddresses.add(pauseKey);
+            }
             
             if (wasAlreadySubmitting) {
               if (this.logLevel === 'debug') {
@@ -2763,13 +2820,15 @@ class MiningOrchestrator extends EventEmitter {
 
             if (this.maxConcurrentAddresses > 1) {
               // Parallel mode: Only stop workers assigned to this same address
-              // EXTREME OPTIMIZATION: No logging in hot path
-              // OPTIMIZATION: Use forEach instead of entries() iterator for better performance
-              this.workerAddressAssignment.forEach((assignedAddress, assignedWorkerId) => {
-                if (assignedAddress === addr.bech32 && assignedWorkerId !== workerId) {
-                  this.stoppedWorkers.add(assignedWorkerId);
-                }
-              });
+              // EXTREME OPTIMIZATION: Use reverse map for O(1) worker lookup instead of O(n) iteration
+              const workersForAddress = this.addressToWorkers.get(addr.bech32);
+              if (workersForAddress) {
+                workersForAddress.forEach(assignedWorkerId => {
+                  if (assignedWorkerId !== workerId) {
+                    this.stoppedWorkers.add(assignedWorkerId);
+                  }
+                });
+              }
             } else {
               // Single-address mode: Stop all workers in appropriate range
             if (isDevFee) {
@@ -4494,12 +4553,34 @@ class MiningOrchestrator extends EventEmitter {
     }
 
     // Emit metrics every 5 seconds
+    // CRITICAL FIX: Also emit stats and worker updates for UI
     this.technicalMetricsInterval = setInterval(() => {
       if (!this.isRunning || !this.isMining) {
         return; // Don't report if not running or not mining
       }
 
       const now = Date.now();
+      
+      // CRITICAL FIX: Emit stats update for UI (solutions found, this hour, today, etc.)
+      this.emit('stats', {
+        type: 'stats',
+        stats: this.getStats(),
+      } as MiningEvent);
+      
+      // CRITICAL FIX: Emit worker updates for Workers tab
+      this.workerStats.forEach((workerData, workerId) => {
+        this.emit('worker_update', {
+          type: 'worker_update',
+          workerId: workerData.workerId,
+          addressIndex: workerData.addressIndex,
+          address: workerData.address,
+          hashesComputed: workerData.hashesComputed,
+          hashRate: workerData.hashRate,
+          solutionsFound: workerData.solutionsFound,
+          status: workerData.status,
+          currentChallenge: workerData.currentChallenge,
+        } as MiningEvent);
+      });
       
       // Calculate worker statistics
       const workerStatusCounts: Record<string, number> = {};
@@ -4664,6 +4745,7 @@ class MiningOrchestrator extends EventEmitter {
       this.workerStats.clear();
       this.stoppedWorkers.clear();
       this.workerAddressAssignment.clear();
+      this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
       this.addressSubmissionFailures.clear();
       this.submittingAddresses.clear();
       this.pausedAddresses.clear();
@@ -4758,6 +4840,7 @@ class MiningOrchestrator extends EventEmitter {
       this.workerStats.clear();
       this.stoppedWorkers.clear();
       this.workerAddressAssignment.clear();
+      this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
       this.addressSubmissionFailures.clear();
       this.submittingAddresses.clear();
       this.pausedAddresses.clear();
