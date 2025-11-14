@@ -472,11 +472,32 @@ function MiningDashboardContent() {
     }
   }, [logs, autoFollow]);
 
+  // CRITICAL FIX: Use ref to track EventSource for proper cleanup on page refresh
+  const eventSourceRef = useRef<EventSource | null>(null);
+
   useEffect(() => {
-    if (!stats?.active) return;
+    if (!stats?.active) {
+      // Close any existing connection when mining stops
+      if (eventSourceRef.current) {
+        console.log('[Mining Dashboard] Closing EventSource - mining not active');
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      return;
+    }
+
+    // CRITICAL FIX: Close any existing connection before creating a new one
+    // This prevents multiple connections when the component re-renders or page refreshes
+    if (eventSourceRef.current) {
+      console.log('[Mining Dashboard] Closing existing EventSource before creating new one');
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
 
     // Connect to SSE stream for real-time updates
+    console.log('[Mining Dashboard] Creating new EventSource connection');
     const eventSource = new EventSource('/api/mining/stream');
+    eventSourceRef.current = eventSource;
 
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -633,15 +654,70 @@ function MiningDashboardContent() {
       }
     };
 
-    eventSource.onerror = () => {
-      eventSource.close();
-      addLog('Stream connection closed', 'warning');
+    eventSource.onerror = (error) => {
+      console.error('[Mining Dashboard] EventSource error:', error);
+      if (eventSource.readyState === EventSource.CLOSED) {
+        addLog('Stream connection closed', 'warning');
+        eventSourceRef.current = null;
+      } else {
+        // Connection error - will auto-reconnect, but log it
+        console.warn('[Mining Dashboard] EventSource connection error, will attempt to reconnect');
+      }
     };
 
+    eventSource.onopen = () => {
+      console.log('[Mining Dashboard] EventSource connection opened');
+    };
+
+    // CRITICAL FIX: Cleanup function to close connection
     return () => {
-      eventSource.close();
+      console.log('[Mining Dashboard] Cleaning up EventSource connection');
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
     };
   }, [stats?.active]);
+
+  // CRITICAL FIX: Cleanup on page unload/refresh to prevent memory leaks
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      console.log('[Mining Dashboard] Page unloading, closing EventSource');
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      // Close connection when tab becomes hidden (user switches tabs)
+      // This helps prevent connection buildup
+      if (document.hidden && eventSourceRef.current) {
+        console.log('[Mining Dashboard] Tab hidden, closing EventSource');
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+
+    // Add event listeners for cleanup
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('unload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // Cleanup listeners
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('unload', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      
+      // Final cleanup of EventSource
+      if (eventSourceRef.current) {
+        console.log('[Mining Dashboard] Final cleanup - closing EventSource');
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
 
   const checkStatus = async () => {
     try {

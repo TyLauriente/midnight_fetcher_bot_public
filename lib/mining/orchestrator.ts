@@ -6871,6 +6871,11 @@ class MiningOrchestrator extends EventEmitter {
 // CRITICAL: Create singleton instance
 export const miningOrchestrator = new MiningOrchestrator();
 
+// CRITICAL FIX: Increase max listeners to prevent memory leak warnings
+// Multiple browser tabs/connections can add listeners, so we need a higher limit
+// 50 should be enough for multiple tabs/devices monitoring the same instance
+miningOrchestrator.setMaxListeners(50);
+
 // CRITICAL FIX: Add default error handler to prevent unhandled error events
 // EventEmitter throws if 'error' event is emitted without listeners
 // This handler ensures errors are logged even if no UI listeners exist
