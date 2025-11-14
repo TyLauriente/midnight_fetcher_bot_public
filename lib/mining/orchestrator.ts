@@ -682,16 +682,26 @@ class MiningOrchestrator extends EventEmitter {
   
   /**
    * Thread-safe worker assignment setter
+   * BUG FIX: Improved lock mechanism to prevent race conditions
    */
   private async setWorkerAssignment(workerId: number, address: string): Promise<boolean> {
-    // Acquire lock
-    if (this.workerAssignmentLock.get(workerId)) {
+    // CRITICAL FIX: Wait for lock with timeout to prevent race conditions
+    // If lock is held, wait in small increments up to 100ms total
+    let lockWaitTime = 0;
+    const maxLockWait = 100; // 100ms max wait
+    while (this.workerAssignmentLock.get(workerId) && lockWaitTime < maxLockWait) {
       await this.sleep(10);
-      // Check if already assigned
+      lockWaitTime += 10;
+    }
+    
+    // If lock is still held after waiting, check existing assignment without modifying
+    if (this.workerAssignmentLock.get(workerId)) {
       const existing = this.workerAddressAssignment.get(workerId);
       if (existing) {
         return existing === address; // Return true if already assigned to same address
       }
+      // Lock held but no assignment - wait a bit more or proceed with caution
+      await this.sleep(5);
     }
     
     this.workerAssignmentLock.set(workerId, true);
@@ -700,10 +710,15 @@ class MiningOrchestrator extends EventEmitter {
       if (existing && existing !== address) {
         return false; // Already assigned to different address
       }
+      if (existing === address) {
+        return true; // Already assigned to same address - success
+      }
+      
+      // Update forward map
       this.workerAddressAssignment.set(workerId, address);
       
       // OPTIMIZATION: Update reverse map for fast worker lookup by address
-      if (existing && existing !== address) {
+      if (existing) {
         // Remove from old address's worker set
         const oldWorkers = this.addressToWorkers.get(existing);
         if (oldWorkers) {
@@ -729,21 +744,34 @@ class MiningOrchestrator extends EventEmitter {
   
   /**
    * Thread-safe worker assignment deleter
+   * BUG FIX: Acquire lock to prevent race conditions during deletion
    */
   private deleteWorkerAssignment(workerId: number): void {
-    // OPTIMIZATION: Update reverse map when removing assignment
-    const address = this.workerAddressAssignment.get(workerId);
-    if (address) {
-      const workers = this.addressToWorkers.get(address);
-      if (workers) {
-        workers.delete(workerId);
-        if (workers.size === 0) {
-          this.addressToWorkers.delete(address);
+    // CRITICAL FIX: Acquire lock before deleting to prevent race conditions
+    // Simple lock check - if locked, skip (cleanup will happen later)
+    if (this.workerAssignmentLock.get(workerId)) {
+      // Lock is held - skip deletion for now (will be cleaned up later)
+      // This prevents race conditions where assignment is being set while we're deleting
+      return;
+    }
+    
+    this.workerAssignmentLock.set(workerId, true);
+    try {
+      // OPTIMIZATION: Update reverse map when removing assignment
+      const address = this.workerAddressAssignment.get(workerId);
+      if (address) {
+        const workers = this.addressToWorkers.get(address);
+        if (workers) {
+          workers.delete(workerId);
+          if (workers.size === 0) {
+            this.addressToWorkers.delete(address);
+          }
         }
       }
+      this.workerAddressAssignment.delete(workerId);
+    } finally {
+      this.workerAssignmentLock.set(workerId, false);
     }
-    this.workerAddressAssignment.delete(workerId);
-    this.workerAssignmentLock.delete(workerId); // Also clear lock
   }
   
   /**
@@ -1248,7 +1276,14 @@ class MiningOrchestrator extends EventEmitter {
     });
 
     // Emit system status: running
-    const registeredCount = this.addresses.filter(a => a.registered).length;
+    // OPTIMIZATION: Use cached registered addresses count
+    const nowForStatus = Date.now();
+    const cacheAgeForStatus = nowForStatus - this.lastRegisteredAddressesUpdate;
+    if (!this.cachedRegisteredAddresses || cacheAgeForStatus > 5000) {
+      this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+      this.lastRegisteredAddressesUpdate = nowForStatus;
+    }
+    const registeredCount = this.cachedRegisteredAddresses.length;
     this.emit('system_status', {
       type: 'system_status',
       state: 'running',
@@ -1327,6 +1362,12 @@ class MiningOrchestrator extends EventEmitter {
     if (this.workerOptimizationInterval) {
       clearInterval(this.workerOptimizationInterval);
       this.workerOptimizationInterval = null;
+    }
+    
+    // CRITICAL FIX: Clear adaptive batch size adjustment interval
+    if (this.adaptiveBatchSizeAdjustmentInterval) {
+      clearInterval(this.adaptiveBatchSizeAdjustmentInterval);
+      this.adaptiveBatchSizeAdjustmentInterval = null;
     }
 
     // CRITICAL FIX: Clean up hash client connection pool to prevent resource leaks
@@ -1505,11 +1546,20 @@ class MiningOrchestrator extends EventEmitter {
     const userReceipts = allReceipts.filter(r => !r.isDevFee);
     const totalSolutionsFound = userReceipts.length;
 
+    // OPTIMIZATION: Use cached registered addresses count
+    const nowForStats = Date.now();
+    const cacheAgeForStats = nowForStats - this.lastRegisteredAddressesUpdate;
+    if (!this.cachedRegisteredAddresses || cacheAgeForStats > 5000) {
+      this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+      this.lastRegisteredAddressesUpdate = nowForStats;
+    }
+    const registeredAddressCount = this.cachedRegisteredAddresses.length;
+    
     return {
       active: this.isRunning,
       challengeId: this.currentChallengeId,
       solutionsFound: totalSolutionsFound, // Use receipts count for accuracy
-      registeredAddresses: this.addresses.filter(a => a.registered).length,
+      registeredAddresses: registeredAddressCount,
       totalAddresses: this.addresses.length,
       hashRate,
       uptime: this.startTime ? Date.now() - this.startTime : 0,
@@ -2012,6 +2062,10 @@ class MiningOrchestrator extends EventEmitter {
           // Clear address-specific data but keep worker stats for reuse
           workerData.addressIndex = -1; // Mark as unassigned
           workerData.address = ''; // Clear address
+          // CRITICAL FIX: Clear currentChallenge when worker becomes idle to prevent stale challenge references
+          workerData.currentChallenge = null;
+          // CRITICAL FIX: Reset hash accumulator when worker becomes idle
+          this.workerHashesSinceLastUpdate.delete(workerId);
         } else {
           // CRITICAL: If worker stats don't exist, create them so worker can be reused
           // This handles the case where worker was deleted but needs to be reused
@@ -2169,7 +2223,14 @@ class MiningOrchestrator extends EventEmitter {
       });
 
       // OPTIMIZATION: Calculate counts once (used for logging and logic)
-      const registeredCount = this.cachedRegisteredAddresses?.length ?? this.addresses.filter(a => a.registered).length;
+      // CRITICAL FIX: Update cache if stale instead of expensive filter fallback
+      const nowForCache = Date.now();
+      const cacheAge = nowForCache - this.lastRegisteredAddressesUpdate;
+      if (!this.cachedRegisteredAddresses || cacheAge > 5000) {
+        this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+        this.lastRegisteredAddressesUpdate = nowForCache;
+      }
+      const registeredCount = this.cachedRegisteredAddresses.length;
       const addressesInProgressCount = addressesInProgress.size;
       // OPTIMIZATION: Count waiting addresses more efficiently (single pass)
       let addressesWaitingRetry = 0;
@@ -2204,21 +2265,31 @@ class MiningOrchestrator extends EventEmitter {
         } as MiningEvent);
       }
       
-      // OPTIMIZATION: Reduce logging frequency - only log every 10 iterations (every ~5-10 seconds)
-      const shouldLogStatus = Math.random() < 0.1; // 10% chance to log (reduces overhead)
+      // OPTIMIZATION: Reduce logging frequency - only log every 20 iterations (every ~10-20 seconds)
+      // Further reduced from 10% to 5% to minimize overhead in hot path
+      const shouldLogStatus = Math.random() < 0.05; // 5% chance to log (reduces overhead)
       
       if (shouldLogStatus || this.logLevel === 'debug') {
-    console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
+        // OPTIMIZATION: Cache string operations to avoid repeated work
+        const totalAddr = this.addresses.length.toString().padStart(3, ' ');
+        const regAddr = registeredCount.toString().padStart(3, ' ');
+        const availAddr = addressesToMine.length.toString().padStart(3, ' ');
+        const readyAddr = newAddressesToMine.length.toString().padStart(3, ' ');
+        const inProgressAddr = addressesInProgressCount.toString().padStart(3, ' ');
+        const waitingAddr = addressesWaitingRetry.toString().padStart(3, ' ');
+        const challengePrefix = currentChallengeId?.substring(0, 10) || 'none';
+        
+        console.log(`[Orchestrator] ╔═══════════════════════════════════════════════════════════╗`);
         console.log(`[Orchestrator] ║ DYNAMIC ADDRESS QUEUE (refreshed each iteration)          ║`);
-    console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
-        console.log(`[Orchestrator] ║ Total addresses loaded:        ${this.addresses.length.toString().padStart(3, ' ')}                       ║`);
-        console.log(`[Orchestrator] ║ Registered addresses:          ${registeredCount.toString().padStart(3, ' ')}                       ║`);
-        console.log(`[Orchestrator] ║ Available to mine:             ${addressesToMine.length.toString().padStart(3, ' ')}                       ║`);
-        console.log(`[Orchestrator] ║ Ready to mine now:             ${newAddressesToMine.length.toString().padStart(3, ' ')}                       ║`);
-        console.log(`[Orchestrator] ║ Currently mining:              ${addressesInProgressCount.toString().padStart(3, ' ')}                       ║`);
-        console.log(`[Orchestrator] ║ Waiting for retry:             ${addressesWaitingRetry.toString().padStart(3, ' ')}                       ║`);
-        console.log(`[Orchestrator] ║ Challenge ID:                  ${currentChallengeId?.substring(0, 10)}...            ║`);
-    console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
+        console.log(`[Orchestrator] ╠═══════════════════════════════════════════════════════════╣`);
+        console.log(`[Orchestrator] ║ Total addresses loaded:        ${totalAddr}                       ║`);
+        console.log(`[Orchestrator] ║ Registered addresses:          ${regAddr}                       ║`);
+        console.log(`[Orchestrator] ║ Available to mine:             ${availAddr}                       ║`);
+        console.log(`[Orchestrator] ║ Ready to mine now:             ${readyAddr}                       ║`);
+        console.log(`[Orchestrator] ║ Currently mining:              ${inProgressAddr}                       ║`);
+        console.log(`[Orchestrator] ║ Waiting for retry:             ${waitingAddr}                       ║`);
+        console.log(`[Orchestrator] ║ Challenge ID:                  ${challengePrefix}...            ║`);
+        console.log(`[Orchestrator] ╚═══════════════════════════════════════════════════════════╝`);
       }
 
       // CRITICAL STABILITY CHECK: Detect and repair stuck addresses and workers
@@ -2309,9 +2380,10 @@ class MiningOrchestrator extends EventEmitter {
         }
       }
 
-      // If no new addresses available, check if we should wait or continue
+        // If no new addresses available, check if we should wait or continue
       if (newAddressesToMine.length === 0) {
-        const allRegisteredCount = this.addresses.filter(a => a.registered).length;
+        // OPTIMIZATION: Use cached registered count instead of expensive filter
+        const allRegisteredCount = registeredCount;
         const allAvailableCount = addressesToMine.length;
         const unregisteredCount = this.addresses.length - registeredCount;
 
@@ -2806,6 +2878,10 @@ class MiningOrchestrator extends EventEmitter {
           workerData.lastUpdateTime = now;
           workerData.addressIndex = -1; // Mark as unassigned
           workerData.address = ''; // Clear address
+          // CRITICAL FIX: Clear currentChallenge when worker becomes idle to prevent stale challenge references
+          workerData.currentChallenge = null;
+          // CRITICAL FIX: Reset hash accumulator when worker becomes idle
+          this.workerHashesSinceLastUpdate.delete(workerId);
         }
         return;
       }
@@ -2831,6 +2907,10 @@ class MiningOrchestrator extends EventEmitter {
           workerData.lastUpdateTime = Date.now();
           workerData.addressIndex = -1; // Mark as unassigned
           workerData.address = ''; // Clear address
+          // CRITICAL FIX: Clear currentChallenge when worker becomes idle to prevent stale challenge references
+          workerData.currentChallenge = null;
+          // CRITICAL FIX: Reset hash accumulator when worker becomes idle
+          this.workerHashesSinceLastUpdate.delete(workerId);
           // Emit final worker update
           this.emit('worker_update', {
             type: 'worker_update',
@@ -2841,7 +2921,7 @@ class MiningOrchestrator extends EventEmitter {
             hashRate: 0,
             solutionsFound: workerData.solutionsFound,
             status: 'idle',
-            currentChallenge: challengeId,
+            currentChallenge: null,
           } as MiningEvent);
         }
         return;
@@ -3022,7 +3102,8 @@ class MiningOrchestrator extends EventEmitter {
             throughput: throughput,
           });
           
-          // Keep only last 200 samples (last ~20 seconds at 100 batches per sample)
+          // OPTIMIZATION: Keep only last 200 samples (last ~20 seconds at 100 batches per sample)
+          // Clean up proactively to prevent unbounded growth
           if (this.recentBatchMetrics.length > 200) {
             this.recentBatchMetrics = this.recentBatchMetrics.slice(-200);
           }
@@ -3039,7 +3120,8 @@ class MiningOrchestrator extends EventEmitter {
               hashRate: currentHashRate,
             });
             
-            // Keep only last 1000 samples to prevent memory growth
+            // OPTIMIZATION: Keep only last 1000 samples to prevent memory growth
+            // Clean up proactively to prevent unbounded growth
             if (this.batchPerformanceHistory.length > 1000) {
               this.batchPerformanceHistory = this.batchPerformanceHistory.slice(-1000);
             }
@@ -3065,6 +3147,17 @@ class MiningOrchestrator extends EventEmitter {
         // CRITICAL: Atomic hash counting to prevent race conditions
         // Update both total system hashes and worker-specific hashes atomically
         const hashesInBatch = hashes.length;
+        
+        // CRITICAL FIX: Prevent integer overflow in totalHashesComputed
+        // Reset when approaching Number.MAX_SAFE_INTEGER (2^53 - 1)
+        const MAX_SAFE_HASHES = 9_000_000_000_000_000; // 9 quadrillion (safe before overflow)
+        if (this.totalHashesComputed > MAX_SAFE_HASHES) {
+          // Reset to prevent overflow, but preserve relative hash rate by scaling down
+          const resetAmount = Math.floor(this.totalHashesComputed / 2);
+          this.totalHashesComputed = this.totalHashesComputed - resetAmount;
+          this.lastHashRateUpdate = Date.now(); // Reset hash rate calculation baseline
+        }
+        
         this.totalHashesComputed += hashesInBatch;
         hashCount += hashesInBatch;
 
@@ -3230,6 +3323,17 @@ class MiningOrchestrator extends EventEmitter {
             // OPTIMIZATION: Add to submittedSolutions BEFORE submission to prevent race conditions
             // This prevents other workers from trying to submit the same hash
             this.submittedSolutions.add(hash);
+            
+            // CRITICAL FIX: Proactive cleanup of submittedSolutions to prevent memory leak
+            // Clean when approaching max size (90% capacity) instead of waiting for 150%
+            if (this.submittedSolutions.size > this.submittedSolutionsMaxSize * 0.9) {
+              // Remove oldest 50% of entries
+              const entriesToRemove = Math.floor(this.submittedSolutions.size / 2);
+              const entriesArray = Array.from(this.submittedSolutions);
+              for (let i = 0; i < entriesToRemove && i < entriesArray.length; i++) {
+                this.submittedSolutions.delete(entriesArray[i]);
+              }
+            }
 
             // IMMEDIATELY stop all other workers MINING THE SAME ADDRESS to save CPU
             // In parallel mode, only stop workers assigned to this same address
@@ -3837,11 +3941,12 @@ class MiningOrchestrator extends EventEmitter {
       // Record solution timestamp for stats (keep only last 24 hours to prevent memory leak)
       // OPTIMIZATION: Use efficient cleanup - only filter when array gets large
       const now = Date.now();
-      this.solutionTimestamps.push({ timestamp: now });
-      // Only filter when array gets large (every 100 solutions) to avoid filtering on every solution
-      if (this.solutionTimestamps.length > 100) {
-        const oneDayAgo = now - (24 * 60 * 60 * 1000);
-        // OPTIMIZATION: Use efficient cleanup - find first valid index and slice
+      const MAX_SOLUTION_TIMESTAMPS = 10000; // Hard limit to prevent unbounded growth
+      const oneDayAgo = now - (24 * 60 * 60 * 1000);
+      
+      // Clean up old entries before adding new one (more efficient)
+      if (this.solutionTimestamps.length > 0) {
+        // Find first valid index (entries within last 24 hours)
         let firstValidIndex = 0;
         for (let i = 0; i < this.solutionTimestamps.length; i++) {
           if (this.solutionTimestamps[i].timestamp > oneDayAgo) {
@@ -3849,10 +3954,18 @@ class MiningOrchestrator extends EventEmitter {
             break;
           }
         }
-        if (firstValidIndex > 0) {
+        // If we have stale entries or array is too large, clean it up
+        if (firstValidIndex > 0 || this.solutionTimestamps.length > MAX_SOLUTION_TIMESTAMPS) {
           this.solutionTimestamps = this.solutionTimestamps.slice(firstValidIndex);
+          // If still too large, keep only most recent entries
+          if (this.solutionTimestamps.length > MAX_SOLUTION_TIMESTAMPS) {
+            this.solutionTimestamps = this.solutionTimestamps.slice(-MAX_SOLUTION_TIMESTAMPS);
+          }
         }
       }
+      
+      // Add new timestamp after cleanup
+      this.solutionTimestamps.push({ timestamp: now });
 
       // Note: address+challenge is already marked as solved before submission
       // to prevent race conditions with multiple solutions in same batch
@@ -4484,7 +4597,10 @@ class MiningOrchestrator extends EventEmitter {
         }
       }
       
-      const finalRegistered = this.addresses.filter(a => a.registered).length;
+      // OPTIMIZATION: Update cache after registration update
+      this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+      this.lastRegisteredAddressesUpdate = Date.now();
+      const finalRegistered = this.cachedRegisteredAddresses.length;
       console.log(`[Orchestrator] Registration complete: ${finalRegistered}/${this.addresses.length} addresses registered`);
       
       // Emit system status update: registration complete
@@ -4822,7 +4938,29 @@ class MiningOrchestrator extends EventEmitter {
         this.emergencyHashRateStartTime = null;
       }
 
-      // Add current hash rate to history
+      // CRITICAL FIX: Efficiently keep only last 10 minutes of history (600 seconds / 30 seconds = 20 samples)
+      // Clean up BEFORE adding new entry to prevent unbounded growth
+      const tenMinutesAgo = now - (10 * 60 * 1000);
+      const MAX_HISTORY_SIZE = 30; // Maximum 30 samples (15 minutes at 30s intervals)
+      
+      // Find first valid index (more efficient than filter)
+      let firstValidIndex = 0;
+      for (let i = 0; i < this.hashRateHistory.length; i++) {
+        if (this.hashRateHistory[i].timestamp >= tenMinutesAgo) {
+          firstValidIndex = i;
+          break;
+        }
+      }
+      // If array is too large or has stale entries, clean it up
+      if (firstValidIndex > 0 || this.hashRateHistory.length > MAX_HISTORY_SIZE) {
+        this.hashRateHistory = this.hashRateHistory.slice(firstValidIndex);
+        // If still too large, keep only most recent entries
+        if (this.hashRateHistory.length > MAX_HISTORY_SIZE) {
+          this.hashRateHistory = this.hashRateHistory.slice(-MAX_HISTORY_SIZE);
+        }
+      }
+
+      // Add current hash rate to history (after cleanup to prevent growth)
       this.hashRateHistory.push({
         timestamp: now,
         hashRate: currentHashRate,
@@ -4830,7 +4968,14 @@ class MiningOrchestrator extends EventEmitter {
 
       // CRITICAL: Check if all addresses are registered before starting baseline collection
       // Only start baseline collection AFTER all addresses are registered
-      const registeredCount = this.addresses.filter(a => a.registered).length;
+      // OPTIMIZATION: Use cached registered addresses count
+      const nowForBaseline = Date.now();
+      const cacheAgeForBaseline = nowForBaseline - this.lastRegisteredAddressesUpdate;
+      if (!this.cachedRegisteredAddresses || cacheAgeForBaseline > 5000) {
+        this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+        this.lastRegisteredAddressesUpdate = nowForBaseline;
+      }
+      const registeredCount = this.cachedRegisteredAddresses.length;
       const allAddressesRegistered = registeredCount >= this.addresses.length;
       
       // If registration just completed and baseline hasn't started, start it now
@@ -4864,21 +5009,6 @@ class MiningOrchestrator extends EventEmitter {
             console.log(`[Orchestrator]   Will use this baseline for threshold calculation (50% drop triggers restart)`);
           }
         }
-      }
-
-      // CRITICAL FIX: Efficiently keep only last 10 minutes of history (600 seconds / 30 seconds = 20 samples)
-      // Use slice instead of filter to avoid creating new array unnecessarily
-      const tenMinutesAgo = now - (10 * 60 * 1000);
-      // Find first valid index (more efficient than filter)
-      let firstValidIndex = 0;
-      for (let i = 0; i < this.hashRateHistory.length; i++) {
-        if (this.hashRateHistory[i].timestamp >= tenMinutesAgo) {
-          firstValidIndex = i;
-          break;
-        }
-      }
-      if (firstValidIndex > 0) {
-        this.hashRateHistory = this.hashRateHistory.slice(firstValidIndex);
       }
 
       // Need at least 5 minutes of history (10 samples) before checking (unless using baseline)
@@ -5061,13 +5191,25 @@ class MiningOrchestrator extends EventEmitter {
         : 0;
 
       // Calculate address statistics
-      const registeredCount = this.addresses.filter(a => a.registered).length;
+      // OPTIMIZATION: Use cached registered addresses instead of expensive filter
+      const nowForStats = Date.now();
+      const cacheAgeForStats = nowForStats - this.lastRegisteredAddressesUpdate;
+      if (!this.cachedRegisteredAddresses || cacheAgeForStats > 5000) {
+        this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+        this.lastRegisteredAddressesUpdate = nowForStats;
+      }
+      const registeredCount = this.cachedRegisteredAddresses.length;
       const unregisteredCount = this.addresses.length - registeredCount;
-      const solvedCount = this.addresses.filter(a => {
-        if (!this.currentChallengeId) return false;
-        const solvedChallenges = this.solvedAddressChallenges.get(a.bech32);
-        return solvedChallenges?.has(this.currentChallengeId) || false;
-      }).length;
+      // OPTIMIZATION: Count solved addresses more efficiently with single pass
+      let solvedCount = 0;
+      if (this.currentChallengeId) {
+        for (const addr of this.cachedRegisteredAddresses) {
+          const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
+          if (solvedChallenges?.has(this.currentChallengeId)) {
+            solvedCount++;
+          }
+        }
+      }
       
       // Count addresses in progress and waiting retry (approximate from worker assignments)
       const addressesInProgress = new Set(this.workerAddressAssignment.values()).size;
@@ -5577,13 +5719,40 @@ class MiningOrchestrator extends EventEmitter {
       if (workerData.currentChallenge !== this.currentChallengeId && this.currentChallengeId) {
         staleWorkerStats.push(workerId);
       }
+      // CRITICAL FIX: Reset accumulated hashesComputed if it gets too large (prevent integer overflow)
+      // Reset every 1 billion hashes to prevent overflow issues over very long runs
+      const MAX_HASHES_BEFORE_RESET = 1_000_000_000; // 1 billion
+      if (workerData.hashesComputed > MAX_HASHES_BEFORE_RESET) {
+        const resetAmount = Math.floor(workerData.hashesComputed / MAX_HASHES_BEFORE_RESET) * MAX_HASHES_BEFORE_RESET;
+        workerData.hashesComputed = workerData.hashesComputed - resetAmount;
+        console.log(`[Orchestrator] 🔧 Stability: Reset worker ${workerId} hashesComputed by ${resetAmount} to prevent overflow (now: ${workerData.hashesComputed})`);
+        repairsMade++;
+      }
     }
     for (const workerId of staleWorkerStats) {
       this.workerStats.delete(workerId);
+      // CRITICAL: Also clean up workerHashesSinceLastUpdate when deleting worker stats
+      this.workerHashesSinceLastUpdate.delete(workerId);
       repairsMade++;
     }
     if (staleWorkerStats.length > 0) {
       console.log(`[Orchestrator] 🔧 Stability: Cleaned ${staleWorkerStats.length} stale worker stats (prevented memory leak)`);
+    }
+    
+    // Check 8b-2: Clean up orphaned workerHashesSinceLastUpdate entries (workers that no longer exist)
+    // CRITICAL FIX: Prevent workerHashesSinceLastUpdate map from growing unbounded
+    const orphanedHashEntries: number[] = [];
+    for (const workerId of this.workerHashesSinceLastUpdate.keys()) {
+      if (!this.workerStats.has(workerId)) {
+        orphanedHashEntries.push(workerId);
+      }
+    }
+    for (const workerId of orphanedHashEntries) {
+      this.workerHashesSinceLastUpdate.delete(workerId);
+      repairsMade++;
+    }
+    if (orphanedHashEntries.length > 0) {
+      console.log(`[Orchestrator] 🔧 Stability: Cleaned ${orphanedHashEntries.length} orphaned worker hash entries (prevented memory leak)`);
     }
 
     // Check 8c: Clean up cachedSubmissionKeys if it's getting too large
