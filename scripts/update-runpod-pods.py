@@ -57,7 +57,7 @@ SETUP_COMMAND = (
 )
 
 ATTACH_DURATION = 1
-DEFAULT_WORKER_THREADS = 200
+DEFAULT_WORKER_THREADS = 256
 DEFAULT_BATCH_SIZE = 850
 
 def stream_output(channel, timeout=None):
@@ -102,15 +102,15 @@ def run_host(host, iteration):
     channel = client.invoke_shell(width=200, height=50)
 
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
-    stream_output(channel, timeout=0.25)
+    stream_output(channel, timeout=1)
 
     channel.send(f'sed -i "s/\\"addressOffset\\":[ ]*[0-9]\\+/\\"addressOffset\\": {iteration}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
     channel.send(f'sed -i "s/\\"workerThreads\\":[ ]*[0-9]\\+/\\"workerThreads\\": {DEFAULT_WORKER_THREADS}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
     channel.send(f'sed -i "s/\\"batchSize\\":[ ]*[0-9]\\+/\\"batchSize\\": {DEFAULT_BATCH_SIZE}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
-    stream_output(channel, timeout=0.15)
+    stream_output(channel, timeout=1)
 
     channel.send(SETUP_COMMAND + "\n")
-    stream_output(channel, timeout=3)
+    stream_output(channel, timeout=4)
 
     print(f"--- Finished with {host} ---\n")
     client.close()

@@ -222,6 +222,14 @@ class MiningOrchestrator extends EventEmitter {
   private batchSizeLock = false; // Lock to prevent concurrent batch size changes
   private workerCountLock = false; // Lock to prevent concurrent worker count changes
   private workerAssignmentLock = new Map<number, boolean>(); // Per-worker locks for assignment
+  
+  // NEW: Real-time adaptive batch sizing with feedback tracking
+  private recentBatchMetrics: Array<{ batchSize: number; processingTime: number; timestamp: number; throughput: number }> = []; // Recent batch metrics for real-time analysis
+  private batchSizeChangeHistory: Array<{ timestamp: number; oldSize: number; newSize: number; beforeMetrics: { avgThroughput: number; avgLatency: number }; afterMetrics?: { avgThroughput: number; avgLatency: number }; improvement?: number }> = []; // Track batch size changes and their impact
+  private currentBatchSizeTarget: number | null = null; // Current dynamically calculated target batch size
+  private adaptiveBatchSizeAdjustmentInterval: NodeJS.Timeout | null = null; // Interval for real-time batch size adjustments
+  private lastAdaptiveBatchAdjustment = 0; // Timestamp of last adaptive adjustment
+  private batchSizeAdjustmentCooldown = 30000; // Minimum time between adjustments (30 seconds)
 
   /**
    * Update orchestrator configuration dynamically
@@ -263,11 +271,17 @@ class MiningOrchestrator extends EventEmitter {
 
   /**
    * Get current batch size (custom or default)
+   * NEW: Real-time adaptive batch sizing takes priority over static values
    * Optimized for high-end systems: larger batches = better throughput
    * Includes adaptive reduction when hash service timeouts occur
-   * CRITICAL: Now includes intelligent optimization based on performance data
+   * CRITICAL: Now includes intelligent real-time optimization based on performance data
    */
   private getBatchSize(): number {
+    // NEW: Real-time adaptive batch size takes highest priority
+    if (this.currentBatchSizeTarget !== null && !this.batchSizeLock) {
+      return this.currentBatchSizeTarget;
+    }
+    
     // If adaptive batch size is set (due to timeouts), use it
     if (this.adaptiveBatchSize !== null) {
       return this.adaptiveBatchSize;
@@ -360,6 +374,225 @@ class MiningOrchestrator extends EventEmitter {
   }
   
   /**
+   * NEW: Analyze recent batch metrics to determine if batch size needs adjustment
+   * Returns: { needsAdjustment: boolean, direction: 'increase' | 'decrease' | null, reason: string, targetSize?: number }
+   */
+  private analyzeBatchSizeNeeds(): { needsAdjustment: boolean; direction: 'increase' | 'decrease' | null; reason: string; targetSize?: number } {
+    if (this.recentBatchMetrics.length < 20) {
+      return { needsAdjustment: false, direction: null, reason: 'Insufficient data (need at least 20 samples)' };
+    }
+    
+    const recent = this.recentBatchMetrics.slice(-50); // Last 50 samples (~5 seconds of data)
+    const currentBatchSize = this.getBatchSize();
+    
+    // Calculate average metrics
+    const avgThroughput = recent.reduce((sum, m) => sum + m.throughput, 0) / recent.length;
+    const avgLatency = recent.reduce((sum, m) => sum + m.processingTime, 0) / recent.length;
+    const avgBatchSize = recent.reduce((sum, m) => sum + m.batchSize, 0) / recent.length;
+    
+    // Determine optimal latency range (target: 50-200ms for good balance)
+    const targetMinLatency = 50; // ms
+    const targetMaxLatency = 200; // ms
+    const idealLatency = 100; // ms (sweet spot)
+    
+    // Determine optimal throughput (should be high and stable)
+    const throughputVariance = this.calculateVariance(recent.map(m => m.throughput));
+    const isThroughputStable = throughputVariance < (avgThroughput * 0.3); // Less than 30% variance
+    
+    // Decision logic:
+    // 1. If latency is too high (>200ms), batches are too large - decrease
+    // 2. If latency is too low (<50ms), batches are too small - increase
+    // 3. If throughput is low and latency is acceptable, try increasing batch size
+    // 4. If throughput variance is high, adjust towards more stable size
+    
+    let direction: 'increase' | 'decrease' | null = null;
+    let reason = '';
+    let targetSize: number | undefined = undefined;
+    
+    if (avgLatency > targetMaxLatency) {
+      // Batches are taking too long - reduce batch size
+      direction = 'decrease';
+      reason = `Latency too high (${avgLatency.toFixed(0)}ms > ${targetMaxLatency}ms)`;
+      // Reduce by 15-25% depending on how far over we are
+      const reductionFactor = Math.min(0.25, (avgLatency - targetMaxLatency) / targetMaxLatency);
+      targetSize = Math.max(400, Math.floor(currentBatchSize * (1 - reductionFactor)));
+    } else if (avgLatency < targetMinLatency && avgThroughput < avgBatchSize * 5) {
+      // Latency is low but throughput could be better - increase batch size
+      direction = 'increase';
+      reason = `Latency low (${avgLatency.toFixed(0)}ms < ${targetMinLatency}ms) and throughput can improve`;
+      // Increase by 10-20% depending on how far under we are
+      const increaseFactor = Math.min(0.20, (targetMinLatency - avgLatency) / targetMinLatency);
+      targetSize = Math.min(50000, Math.floor(currentBatchSize * (1 + increaseFactor)));
+    } else if (!isThroughputStable && avgLatency < idealLatency) {
+      // Throughput is unstable but we have headroom - try increasing for stability
+      direction = 'increase';
+      reason = `Throughput unstable (variance: ${(throughputVariance / avgThroughput * 100).toFixed(1)}%)`;
+      targetSize = Math.min(50000, Math.floor(currentBatchSize * 1.1)); // 10% increase
+    } else if (avgThroughput < avgBatchSize * 3 && avgLatency < idealLatency * 1.5) {
+      // Throughput is low relative to batch size - try increasing
+      direction = 'increase';
+      reason = `Throughput low (${avgThroughput.toFixed(0)} H/s) relative to batch size`;
+      targetSize = Math.min(50000, Math.floor(currentBatchSize * 1.15)); // 15% increase
+    }
+    
+    // Only adjust if change is significant (>5%)
+    if (direction && targetSize) {
+      const changePercent = Math.abs(targetSize - currentBatchSize) / currentBatchSize;
+      if (changePercent < 0.05) {
+        return { needsAdjustment: false, direction: null, reason: 'Change too small (<5%)' };
+      }
+      
+      // Clamp to reasonable bounds
+      const minBatchSize = Math.max(400, this.workerThreads * 20);
+      const maxBatchSize = Math.min(50000, this.workerThreads * 1000);
+      targetSize = Math.max(minBatchSize, Math.min(maxBatchSize, targetSize));
+      
+      return { needsAdjustment: true, direction, reason, targetSize };
+    }
+    
+    return { needsAdjustment: false, direction: null, reason: 'Performance metrics within acceptable range' };
+  }
+  
+  /**
+   * Calculate variance of an array of numbers
+   */
+  private calculateVariance(values: number[]): number {
+    if (values.length === 0) return 0;
+    const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+    const squaredDiffs = values.map(v => Math.pow(v - mean, 2));
+    return squaredDiffs.reduce((sum, v) => sum + v, 0) / values.length;
+  }
+  
+  /**
+   * NEW: Evaluate the impact of a batch size change
+   * Compares metrics before and after the change
+   */
+  private evaluateBatchSizeChangeImpact(): void {
+    const now = Date.now();
+    const evaluationWindow = 60000; // 60 seconds to evaluate impact
+    
+    // Find recent changes that need evaluation
+    for (const change of this.batchSizeChangeHistory) {
+      if (change.afterMetrics || now - change.timestamp < evaluationWindow) {
+        continue; // Already evaluated or too recent
+      }
+      
+      // Get metrics from the period after the change
+      const afterStartTime = change.timestamp;
+      const afterEndTime = Math.min(now, change.timestamp + evaluationWindow);
+      const afterMetrics = this.recentBatchMetrics.filter(
+        m => m.timestamp >= afterStartTime && m.timestamp <= afterEndTime
+      );
+      
+      if (afterMetrics.length < 10) {
+        continue; // Not enough data yet
+      }
+      
+      // Calculate after metrics
+      const avgAfterThroughput = afterMetrics.reduce((sum, m) => sum + m.throughput, 0) / afterMetrics.length;
+      const avgAfterLatency = afterMetrics.reduce((sum, m) => sum + m.processingTime, 0) / afterMetrics.length;
+      
+      change.afterMetrics = {
+        avgThroughput: avgAfterThroughput,
+        avgLatency: avgAfterLatency,
+      };
+      
+      // Calculate improvement (positive = better, negative = worse)
+      const throughputImprovement = ((avgAfterThroughput - change.beforeMetrics.avgThroughput) / change.beforeMetrics.avgThroughput) * 100;
+      const latencyImprovement = ((change.beforeMetrics.avgLatency - avgAfterLatency) / change.beforeMetrics.avgLatency) * 100;
+      
+      // Combined improvement score (weighted: 70% throughput, 30% latency)
+      const improvement = (throughputImprovement * 0.7) + (latencyImprovement * 0.3);
+      change.improvement = improvement;
+      
+      console.log(
+        `[Orchestrator] 📊 Batch size change evaluation: ${change.oldSize} → ${change.newSize} ` +
+        `(Throughput: ${change.beforeMetrics.avgThroughput.toFixed(0)} → ${avgAfterThroughput.toFixed(0)} H/s, ` +
+        `Latency: ${change.beforeMetrics.avgLatency.toFixed(0)} → ${avgAfterLatency.toFixed(0)}ms, ` +
+        `Improvement: ${improvement > 0 ? '+' : ''}${improvement.toFixed(1)}%)`
+      );
+    }
+  }
+  
+  /**
+   * NEW: Start real-time adaptive batch size adjustment
+   * Continuously monitors performance and adjusts batch size dynamically
+   */
+  private startAdaptiveBatchSizeAdjustment(): void {
+    // Clear any existing interval
+    if (this.adaptiveBatchSizeAdjustmentInterval) {
+      clearInterval(this.adaptiveBatchSizeAdjustmentInterval);
+    }
+    
+    // Adjust every 30 seconds (with cooldown)
+    this.adaptiveBatchSizeAdjustmentInterval = setInterval(() => {
+      if (!this.isRunning || !this.isMining) {
+        return;
+      }
+      
+      // Check cooldown
+      const now = Date.now();
+      if (now - this.lastAdaptiveBatchAdjustment < this.batchSizeAdjustmentCooldown) {
+        return;
+      }
+      
+      if (this.batchSizeLock) {
+        return; // Another adjustment in progress
+      }
+      
+      // Evaluate impact of previous changes
+      this.evaluateBatchSizeChangeImpact();
+      
+      // Analyze current batch size needs
+      const analysis = this.analyzeBatchSizeNeeds();
+      
+      if (!analysis.needsAdjustment || !analysis.targetSize) {
+        return; // No adjustment needed
+      }
+      
+      this.batchSizeLock = true;
+      try {
+        const currentSize = this.getBatchSize();
+        const newSize = analysis.targetSize;
+        
+        // Capture before metrics
+        const recent = this.recentBatchMetrics.slice(-20);
+        const beforeMetrics = {
+          avgThroughput: recent.reduce((sum, m) => sum + m.throughput, 0) / recent.length,
+          avgLatency: recent.reduce((sum, m) => sum + m.processingTime, 0) / recent.length,
+        };
+        
+        // Update target batch size
+        this.currentBatchSizeTarget = newSize;
+        this.lastAdaptiveBatchAdjustment = now;
+        
+        // Record change for impact evaluation
+        this.batchSizeChangeHistory.push({
+          timestamp: now,
+          oldSize: currentSize,
+          newSize: newSize,
+          beforeMetrics: beforeMetrics,
+        });
+        
+        // Keep only last 50 changes
+        if (this.batchSizeChangeHistory.length > 50) {
+          this.batchSizeChangeHistory = this.batchSizeChangeHistory.slice(-50);
+        }
+        
+        console.log(
+          `[Orchestrator] 🎯 Real-time batch size adjustment: ${analysis.direction} from ${currentSize} to ${newSize} ` +
+          `(${analysis.reason})`
+        );
+        
+        // Emit event for monitoring (simplified to avoid type issues)
+        console.log(`[Orchestrator] 📈 Adaptive batch size: ${newSize} (reason: ${analysis.reason})`);
+      } finally {
+        this.batchSizeLock = false;
+      }
+    }, 10000); // Check every 10 seconds
+  }
+  
+  /**
    * Start adaptive batch size optimization
    * Analyzes performance data and adjusts batch size for optimal throughput
    */
@@ -367,6 +600,9 @@ class MiningOrchestrator extends EventEmitter {
     // Clear any existing optimization
     if (this.batchOptimizationInterval) {
       clearInterval(this.batchOptimizationInterval);
+    }
+    if (this.adaptiveBatchSizeAdjustmentInterval) {
+      clearInterval(this.adaptiveBatchSizeAdjustmentInterval);
     }
     
     // Optimize every 5 minutes
@@ -991,6 +1227,7 @@ class MiningOrchestrator extends EventEmitter {
     
     // CRITICAL: Start adaptive optimizations
     this.startBatchSizeOptimization();
+    this.startAdaptiveBatchSizeAdjustment(); // NEW: Start real-time adaptive batch sizing
     this.startWorkerCountOptimization();
     
     // OPTIMIZATION: Notify hash server about mining worker count
@@ -1100,8 +1337,11 @@ class MiningOrchestrator extends EventEmitter {
     
     // CRITICAL FIX: Clear adaptive optimization data
     this.batchPerformanceHistory = [];
+    this.recentBatchMetrics = [];
+    this.batchSizeChangeHistory = [];
     this.workerPerformanceHistory = [];
     this.optimalBatchSize = null;
+    this.currentBatchSizeTarget = null;
     this.optimalWorkerCount = null;
     this.workerAssignmentLock.clear();
     this.workerHashesSinceLastUpdate.clear();
@@ -2636,15 +2876,31 @@ class MiningOrchestrator extends EventEmitter {
           preimages[i] = batchData[i].preimage;
         }
         
-        // EXTREME OPTIMIZATION: Track performance only every 1000 batches (100x reduction)
-        // User wants maximum tick speed - minimize all overhead
-        const shouldTrackPerformance = batchCounter % 1000 === 0;
-        const batchStartTime = shouldTrackPerformance ? Date.now() : 0;
+        // NEW: Track performance more frequently for real-time adaptive sizing (every 100 batches for adaptive, every 1000 for historical)
+        const shouldTrackAdaptive = batchCounter % 100 === 0; // More frequent for real-time adaptation
+        const shouldTrackHistorical = batchCounter % 1000 === 0; // Less frequent for historical analysis
+        const batchStartTime = (shouldTrackAdaptive || shouldTrackHistorical) ? Date.now() : 0;
         const hashes = await hashEngine.hashBatchAsync(preimages);
-        const batchProcessingTime = shouldTrackPerformance ? Date.now() - batchStartTime : 0;
+        const batchProcessingTime = (shouldTrackAdaptive || shouldTrackHistorical) ? Date.now() - batchStartTime : 0;
         
-        // Record batch performance (extremely sampled to reduce overhead)
-        if (shouldTrackPerformance && this.isRunning && this.isMining && batchData.length > 0) {
+        // NEW: Record real-time metrics for adaptive batch sizing (more frequent)
+        if (shouldTrackAdaptive && this.isRunning && this.isMining && batchData.length > 0 && batchProcessingTime > 0) {
+          const throughput = (batchData.length / batchProcessingTime) * 1000; // Hashes per second for this batch
+          this.recentBatchMetrics.push({
+            batchSize: batchData.length,
+            processingTime: batchProcessingTime,
+            timestamp: Date.now(),
+            throughput: throughput,
+          });
+          
+          // Keep only last 200 samples (last ~20 seconds at 100 batches per sample)
+          if (this.recentBatchMetrics.length > 200) {
+            this.recentBatchMetrics = this.recentBatchMetrics.slice(-200);
+          }
+        }
+        
+        // Record batch performance for historical analysis (less frequent)
+        if (shouldTrackHistorical && this.isRunning && this.isMining && batchData.length > 0) {
           const currentHashRate = this.getCurrentHashRate();
           if (currentHashRate > 0) {
             this.batchPerformanceHistory.push({
