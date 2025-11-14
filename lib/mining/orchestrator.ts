@@ -1664,6 +1664,16 @@ class MiningOrchestrator extends EventEmitter {
         this.currentChallengeId = challengeId;
         this.currentChallenge = challenge.challenge;
 
+        // CRITICAL: Clear all failure counters for old challenge - they're no longer relevant
+        // New challenge means fresh start for all addresses
+        const oldChallengeFailures = Array.from(this.addressSubmissionFailures.keys()).filter(
+          key => !key.endsWith(`:${challengeId}`)
+        );
+        if (oldChallengeFailures.length > 0) {
+          console.log(`[Orchestrator] Clearing ${oldChallengeFailures.length} stale failure counters from previous challenge`);
+          oldChallengeFailures.forEach(key => this.addressSubmissionFailures.delete(key));
+        }
+
         // Load challenge state from receipts (restore progress, solutions count, etc.)
         this.loadChallengeState(challengeId);
 
@@ -1758,15 +1768,25 @@ class MiningOrchestrator extends EventEmitter {
     const MIN_RETRY_DELAY = 30000;
     const now = Date.now();
     
-    // CRITICAL: Reset failure counter if we're retrying after delay
+    // CRITICAL: Reset failure counter if we're retrying after delay OR if challenge data changed
     const submissionKey = `${addr.bech32}:${challengeId}`;
     const lastAttempt = lastMineAttempt.get(addr.bech32);
     const timeSinceLastAttempt = lastAttempt ? (now - lastAttempt) : 0;
     
-    if (timeSinceLastAttempt >= MIN_RETRY_DELAY) {
+    // Check if challenge data has changed since last attempt (indicates stale failures)
+    // Note: We can't compare to the challenge parameter here since it's passed in, but we can check
+    // if the current challenge has changed since the last attempt by checking if challengeId changed
+    // or if enough time has passed (challenge data updates frequently)
+    const challengeDataChanged = this.currentChallengeId !== challengeId || 
+      (lastAttempt && (now - lastAttempt) > 60000); // If >60s passed, challenge data likely changed
+    
+    if (timeSinceLastAttempt >= MIN_RETRY_DELAY || challengeDataChanged) {
       const failureCount = this.addressSubmissionFailures.get(submissionKey);
       if (failureCount && failureCount > 0) {
-        console.log(`[Orchestrator] Retrying address ${addr.index} after delay - clearing previous failure count (${failureCount})`);
+        const reason = challengeDataChanged 
+          ? 'challenge data changed (stale failures cleared)' 
+          : `retry after delay (${Math.floor(timeSinceLastAttempt / 1000)}s)`;
+        console.log(`[Orchestrator] Retrying address ${addr.index} - clearing previous failure count (${failureCount}) - ${reason}`);
         this.addressSubmissionFailures.delete(submissionKey);
       }
     }
@@ -3351,7 +3371,10 @@ class MiningOrchestrator extends EventEmitter {
                 // CRITICAL FIX: Don't increment failure counter for duplicate/conflict errors
                 // These are treated as success, not failure
               } else {
-              console.error(`[Orchestrator] Worker ${workerId}: Submission failed:`, error.message);
+              const errorMsg = error?.response?.data?.message || error?.message || 'Unknown error';
+              const statusCode = error?.response?.status;
+              console.error(`[Orchestrator] Worker ${workerId}: Submission failed:`, errorMsg);
+              console.error(`[Orchestrator]   Status: ${statusCode || 'N/A'}, Address: ${addr.index}`);
               submissionSuccess = false;
 
                 // Only increment failure counter for actual failures (not duplicates)
@@ -3359,6 +3382,17 @@ class MiningOrchestrator extends EventEmitter {
                 const currentFailures = this.addressSubmissionFailures.get(pauseKey) || 0;
                 this.addressSubmissionFailures.set(pauseKey, currentFailures + 1);
               console.log(`[Orchestrator] Worker ${workerId}: Submission failure ${currentFailures + 1}/${maxFailures} for address ${addr.index}`);
+              
+              // CRITICAL: If challenge data might be stale, suggest refreshing
+              // Check if the challenge we're submitting for differs from current challenge
+              if (this.currentChallengeId !== challengeId) {
+                console.log(`[Orchestrator] Worker ${workerId}: ⚠️  Challenge changed during mining - solution may be invalid`);
+              } else if (this.currentChallenge && (
+                challenge.latest_submission !== this.currentChallenge.latest_submission ||
+                challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour
+              )) {
+                console.log(`[Orchestrator] Worker ${workerId}: ⚠️  Challenge data changed - will refresh on next retry`);
+              }
               }
             } finally {
               // CRITICAL: Always clear timeout to prevent memory leak
