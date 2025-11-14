@@ -70,9 +70,8 @@ class MiningOrchestrator extends EventEmitter {
     const savedConfig = configManager.loadConfig();
     this.workerThreads = savedConfig.workerThreads;
     this.customBatchSize = savedConfig.batchSize;
-    this.workerGroupingMode = savedConfig.workerGroupingMode;
-    this.workersPerAddress = savedConfig.workersPerAddress;
     this.addressOffset = savedConfig.addressOffset;
+    // workerGroupingMode and workersPerAddress are not persisted, use defaults
     console.log('[Orchestrator] Initialized with saved configuration:', savedConfig);
   }
 
@@ -107,14 +106,12 @@ class MiningOrchestrator extends EventEmitter {
       this.addressOffset = Math.max(0, config.addressOffset);
     }
 
-    // Save updated configuration to disk
+    // Save updated configuration to disk (only persist essential fields)
     configManager.saveConfig({
-      workerThreads: this.workerThreads,
-      batchSize: this.customBatchSize,
-      workerGroupingMode: this.workerGroupingMode,
-      workersPerAddress: this.workersPerAddress,
       addressOffset: this.addressOffset,
-    });
+      workerThreads: this.workerThreads,
+      batchSize: this.customBatchSize || null,
+    }, this.isRunning);
   }
 
   /**
@@ -310,6 +307,13 @@ class MiningOrchestrator extends EventEmitter {
     this.startTime = Date.now();
     this.solutionsFound = 0;
 
+    // Save config with mining active status
+    configManager.saveConfig({
+      addressOffset: this.addressOffset,
+      workerThreads: this.workerThreads,
+      batchSize: this.customBatchSize || null,
+    }, true);
+
     // Start polling
     this.pollLoop();
 
@@ -346,6 +350,13 @@ class MiningOrchestrator extends EventEmitter {
 
     // Stop watchdog monitor
     this.stopWatchdog();
+
+    // Save config with mining inactive status
+    configManager.saveConfig({
+      addressOffset: this.addressOffset,
+      workerThreads: this.workerThreads,
+      batchSize: this.customBatchSize || null,
+    }, false);
 
     this.emit('status', {
       type: 'status',

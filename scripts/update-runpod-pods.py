@@ -51,8 +51,12 @@ SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 SESSION_NAME = "midnightbot"
 SETUP_COMMAND = (
     "cd midnight_fetcher_bot_public/ && "
-    "git fetch origin main && "
+    "git checkout . && "
     "git reset --hard origin/main && "
+    "git fetch origin known_working_merged_latest && "
+    "git checkout known_working_merged_latest && "
+    "git fetch origin known_working_merged_latest && "
+    "git reset --hard origin/known_working_merged_latest && "
     "sh setup.sh"
 )
 
