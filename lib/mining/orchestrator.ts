@@ -1332,8 +1332,12 @@ class MiningOrchestrator extends EventEmitter {
     }
     this.hashRateHistory = [];
     this.lastHashRateRestart = 0; // Reset restart timestamp when manually stopping
-    this.baselineHashRate = null; // Reset baseline when manually stopping
-    this.baselineStartTime = null;
+    // CRITICAL FIX: DO NOT reset baseline when manually stopping
+    // Baseline should only be established once at startup and used forever
+    // This ensures hash rate monitoring always uses the original baseline
+    // Only reset baseline if explicitly requested (e.g., reinitialize)
+    // this.baselineHashRate = null; // REMOVED - keep baseline for failsafe monitoring
+    // this.baselineStartTime = null; // REMOVED - keep baseline start time
 
     // Clear stability check interval
     if (this.stabilityCheckInterval) {
@@ -1793,10 +1797,14 @@ class MiningOrchestrator extends EventEmitter {
         
         if (noPreMineHourChanged && this.currentChallenge) {
           console.log(`[Orchestrator] ⚠️  HOUR BOUNDARY DETECTED: no_pre_mine_hour changed from ${this.currentChallenge.no_pre_mine_hour} to ${challenge.challenge.no_pre_mine_hour}`);
-          console.log(`[Orchestrator] Stopping all workers to refresh with new challenge data...`);
+          console.log(`[Orchestrator] Restarting mining to refresh all workers with new challenge data...`);
+          
+          // CRITICAL FIX: Actually restart mining (like stop/start does)
+          // Simply clearing workers isn't enough - we need to restart the mining loop
+          const wasMining = this.isMining;
+          this.isMining = false; // Stop mining loop
           
           // Stop all active workers - they're using stale challenge data
-          // Workers will automatically restart with fresh challenge data
           const activeWorkers = Array.from(this.workerAddressAssignment.keys());
           for (const workerId of activeWorkers) {
             this.deleteWorkerAssignment(workerId);
@@ -1816,7 +1824,22 @@ class MiningOrchestrator extends EventEmitter {
           // Clear static preimage cache - it's based on challenge data
           this.staticPreimageCache.clear();
           
-          console.log(`[Orchestrator] ✓ Cleared ${activeWorkers.length} worker assignments for hour boundary refresh`);
+          // Clear blocked addresses so they can retry immediately with fresh data
+          this.lastMineAttempt.clear();
+          this.addressSubmissionFailures.clear();
+          this.pausedAddresses.clear();
+          this.submittingAddresses.clear();
+          
+          console.log(`[Orchestrator] ✓ Cleared ${activeWorkers.length} worker assignments and all blocked state for hour boundary refresh`);
+          
+          // CRITICAL: Restart mining loop with fresh challenge data
+          // Wait a moment for workers to finish current operations
+          await this.sleep(1000);
+          
+          if (wasMining && this.isRunning && this.currentChallengeId) {
+            console.log(`[Orchestrator] 🔄 Restarting mining loop with fresh challenge data...`);
+            this.startMining(); // Restart mining - workers will capture fresh challenge data
+          }
           
           // Emit status event to notify UI of challenge data update
           this.emit('status', {
@@ -5042,15 +5065,21 @@ class MiningOrchestrator extends EventEmitter {
       const registeredCount = this.cachedRegisteredAddresses.length;
       const allAddressesRegistered = registeredCount >= this.addresses.length;
       
-      // If registration just completed and baseline hasn't started, start it now
+      // CRITICAL FIX: Only establish baseline ONCE at startup
+      // If baseline already exists, never reset it (even if registration completes again)
+      // This ensures we always use the original baseline for monitoring
       if (allAddressesRegistered && !this.baselineRegistrationComplete && this.baselineHashRate === null) {
         console.log(`[Orchestrator] ✓ All addresses registered! Starting baseline hash rate collection (5 minutes)...`);
+        console.log(`[Orchestrator] NOTE: Baseline will be established once and used forever for monitoring`);
         this.baselineStartTime = now;
         this.baselineWorkerThreads = this.workerThreads;
         this.baselineBatchSize = this.getBatchSize();
         this.baselineRegistrationComplete = true;
         this.hashRateHistory = []; // Reset history to start fresh baseline collection after registration
       }
+      
+      // CRITICAL: Never reset baseline once established
+      // Even if registration completes again (e.g., after restart), keep original baseline
       
       // CRITICAL: Collect baseline during first 5 minutes AFTER registration completes
       if (this.baselineStartTime && this.baselineHashRate === null && this.baselineRegistrationComplete) {
@@ -5066,10 +5095,14 @@ class MiningOrchestrator extends EventEmitter {
           );
           
           if (baselineSamples.length > 0) {
+            // CRITICAL FIX: Only set baseline if it doesn't exist
+            // This ensures baseline is only established once at startup
+            // Note: We're inside a condition that checks baselineHashRate === null, so this will only run once
             this.baselineHashRate = baselineSamples.reduce((sum, h) => sum + h.hashRate, 0) / baselineSamples.length;
             console.log(`[Orchestrator] ✓ Baseline hash rate established: ${this.baselineHashRate.toFixed(2)} H/s`);
             console.log(`[Orchestrator]   Settings: ${this.baselineWorkerThreads} workers, batch size ${this.baselineBatchSize}`);
             console.log(`[Orchestrator]   Collected over 5 minutes after registration completed`);
+            console.log(`[Orchestrator]   CRITICAL: This baseline will be used FOREVER for monitoring (never reset)`);
             console.log(`[Orchestrator]   Will use this baseline for threshold calculation (50% drop triggers restart)`);
           }
         }
@@ -5080,25 +5113,26 @@ class MiningOrchestrator extends EventEmitter {
         return; // Not enough data yet
       }
 
-      // Determine which threshold to use
+      // CRITICAL FIX: Always use original baseline if it exists
+      // User requirement: baseline should only be established once at startup
+      // For subsequent retries and fixes, always use the original baseline
+      // This ensures consistent monitoring even after restarts/recoveries
       let thresholdHashRate: number;
       let thresholdSource: string;
       
-      // Check if baseline is valid (settings match)
-      const currentWorkerThreads = this.workerThreads;
-      const currentBatchSize = this.getBatchSize();
-      const settingsMatch = this.baselineHashRate !== null &&
-                           this.baselineWorkerThreads === currentWorkerThreads &&
-                           this.baselineBatchSize === currentBatchSize;
-      
-      if (settingsMatch && this.baselineHashRate !== null) {
-        // Use baseline from first 10 minutes
+      if (this.baselineHashRate !== null) {
+        // CRITICAL: Always use original baseline if it exists
+        // Don't check if settings match - use original baseline regardless
+        // This ensures we detect drops even if settings changed
         thresholdHashRate = this.baselineHashRate;
-        thresholdSource = 'baseline (first 10 min)';
-      } else {
-        // Use rolling 10-minute average
+        thresholdSource = `original baseline (${this.baselineWorkerThreads} workers, batch ${this.baselineBatchSize})`;
+      } else if (this.hashRateHistory.length >= 10) {
+        // Fallback to rolling average only if baseline not established yet
         thresholdHashRate = this.hashRateHistory.reduce((sum, h) => sum + h.hashRate, 0) / this.hashRateHistory.length;
-        thresholdSource = 'rolling 10-min average';
+        thresholdSource = 'rolling 10-min average (baseline not established yet)';
+      } else {
+        // Not enough data yet
+        return;
       }
 
       // Only check if threshold was meaningful (> 10 H/s) to avoid false positives at startup
@@ -5106,23 +5140,37 @@ class MiningOrchestrator extends EventEmitter {
         return;
       }
 
-      // Check if we should restart due to low hash rate (50% drop from baseline)
+      // CRITICAL FIX: Detect significant hash rate drops (50% drop from baseline)
+      // A 90% drop will definitely trigger this (currentHashRate < 0.5 * baseline)
+      // This ensures we catch severe performance degradation
       const stopThreshold = thresholdHashRate * 0.5; // 50% of threshold = 50% drop
+      
+      // Also check for very severe drops (90%+) - trigger faster recovery
+      const severeDropThreshold = thresholdHashRate * 0.1; // 10% of threshold = 90% drop
+      const isSevereDrop = currentHashRate < severeDropThreshold;
+      
       if (currentHashRate < stopThreshold) {
         if (this.badHashRateStartTime === null) {
           // First time we detect bad hash rate - start tracking
           this.badHashRateStartTime = now;
-          console.warn(`[Orchestrator] ⚠️  Hash rate drop detected!`);
+          const dropPercent = ((thresholdHashRate - currentHashRate) / thresholdHashRate * 100).toFixed(1);
+          console.warn(`[Orchestrator] ⚠️  Hash rate drop detected! (${dropPercent}% drop)`);
           console.warn(`[Orchestrator] Current: ${currentHashRate.toFixed(2)} H/s`);
           console.warn(`[Orchestrator] Threshold (${thresholdSource}): ${thresholdHashRate.toFixed(2)} H/s`);
           console.warn(`[Orchestrator] Stop threshold (50%): ${stopThreshold.toFixed(2)} H/s`);
-          console.warn(`[Orchestrator] Monitoring for 5 minutes before restart...`);
+          if (isSevereDrop) {
+            console.warn(`[Orchestrator] 🚨 SEVERE DROP (90%+) - Monitoring for 2 minutes before restart...`);
+          } else {
+            console.warn(`[Orchestrator] Monitoring for 5 minutes before restart...`);
+          }
         } else {
-          // Check if we've had bad hash rate for 5 full minutes
+          // CRITICAL FIX: For severe drops (90%+), use shorter threshold (2 minutes instead of 5)
+          // For normal drops (50-90%), use 5 minutes
           const timeSinceBadStart = now - this.badHashRateStartTime;
-          const fiveMinutes = 5 * 60 * 1000; // 5 minutes in milliseconds
+          const thresholdTime = isSevereDrop ? 2 * 60 * 1000 : 5 * 60 * 1000; // 2 minutes for severe, 5 minutes for normal
+          const thresholdMinutes = isSevereDrop ? 2 : 5;
           
-          if (timeSinceBadStart >= fiveMinutes) {
+          if (timeSinceBadStart >= thresholdTime) {
             // Rate limiting: don't restart more than once every 20 minutes
             const timeSinceLastRestart = now - this.lastHashRateRestart;
             const minRestartInterval = 20 * 60 * 1000; // 20 minutes
@@ -5132,11 +5180,16 @@ class MiningOrchestrator extends EventEmitter {
               return;
             }
             
-            console.warn(`[Orchestrator] ⚠️  Hash rate drop persisted for 5+ minutes!`);
+            const dropPercent = ((thresholdHashRate - currentHashRate) / thresholdHashRate * 100).toFixed(1);
+            console.warn(`[Orchestrator] ⚠️  Hash rate drop persisted for ${thresholdMinutes}+ minutes! (${dropPercent}% drop)`);
             console.warn(`[Orchestrator] Current: ${currentHashRate.toFixed(2)} H/s`);
             console.warn(`[Orchestrator] Threshold (${thresholdSource}): ${thresholdHashRate.toFixed(2)} H/s`);
             console.warn(`[Orchestrator] Stop threshold (50%): ${stopThreshold.toFixed(2)} H/s`);
-            console.warn(`[Orchestrator] Automatically restarting mining (stop 5s, then resume)...`);
+            if (isSevereDrop) {
+              console.warn(`[Orchestrator] 🚨 SEVERE DROP - Automatically restarting mining immediately...`);
+            } else {
+              console.warn(`[Orchestrator] Automatically restarting mining (stop 5s, then resume)...`);
+            }
 
             // Emit warning event
             this.emit('error', {
@@ -5152,9 +5205,11 @@ class MiningOrchestrator extends EventEmitter {
             this.restartMiningForHashRateRecovery(password, addressOffset);
           } else {
             // Still monitoring, log progress occasionally
-            const minutesRemaining = Math.ceil((fiveMinutes - timeSinceBadStart) / 60000);
+            const thresholdTime = isSevereDrop ? 2 * 60 * 1000 : 5 * 60 * 1000;
+            const minutesRemaining = Math.ceil((thresholdTime - timeSinceBadStart) / 60000);
             if (Math.random() < 0.1) { // Log occasionally to avoid spam
-              console.warn(`[Orchestrator] ⚠️  Hash rate still below threshold. ${minutesRemaining} minute(s) remaining before restart...`);
+              const dropPercent = ((thresholdHashRate - currentHashRate) / thresholdHashRate * 100).toFixed(1);
+              console.warn(`[Orchestrator] ⚠️  Hash rate still below threshold (${dropPercent}% drop). ${minutesRemaining} minute(s) remaining before restart...`);
             }
           }
         }
