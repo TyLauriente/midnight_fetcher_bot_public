@@ -43,7 +43,7 @@ SETUP_COMMAND = (
 )
 
 ATTACH_DURATION = 1
-DEFAULT_WORKER_THREADS = 200
+DEFAULT_WORKER_THREADS = 128
 DEFAULT_BATCH_SIZE = 850
 
 def stream_output(channel, timeout=None):
@@ -126,8 +126,6 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for host in HOSTS:
-            if iteration > 12:
-                iteration = 0
             if UPDATE_ALL or host in ACTIVE_HOSTS:
                 tasks.append(executor.submit(run_host, host, iteration))
             iteration += 1

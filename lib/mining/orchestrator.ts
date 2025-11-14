@@ -357,8 +357,16 @@ class MiningOrchestrator extends EventEmitter {
     for (const [batchSize, samples] of batchSizeGroups.entries()) {
       if (samples.length < 10) continue; // Need at least 10 samples
       
-      const avgProcessingTime = samples.reduce((sum, s) => sum + s.processingTime, 0) / samples.length;
-      const avgHashRate = samples.reduce((sum, s) => sum + s.hashRate, 0) / samples.length;
+      // OPTIMIZATION: Calculate averages in single pass
+      let sumProcessingTime = 0;
+      let sumHashRate = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        sumProcessingTime += s.processingTime;
+        sumHashRate += s.hashRate;
+      }
+      const avgProcessingTime = sumProcessingTime / samples.length;
+      const avgHashRate = sumHashRate / samples.length;
       
       // Calculate throughput: hashes per second
       // Account for overhead: smaller batches have proportionally more overhead
@@ -397,10 +405,19 @@ class MiningOrchestrator extends EventEmitter {
     const recent = this.recentBatchMetrics.slice(-50); // Last 50 samples (~5 seconds of data)
     const currentBatchSize = this.getBatchSize();
     
-    // Calculate average metrics
-    const avgThroughput = recent.reduce((sum, m) => sum + m.throughput, 0) / recent.length;
-    const avgLatency = recent.reduce((sum, m) => sum + m.processingTime, 0) / recent.length;
-    const avgBatchSize = recent.reduce((sum, m) => sum + m.batchSize, 0) / recent.length;
+    // OPTIMIZATION: Calculate all averages in single pass instead of 3 separate reduce operations
+    let sumThroughput = 0;
+    let sumLatency = 0;
+    let sumBatchSize = 0;
+    for (let i = 0; i < recent.length; i++) {
+      const m = recent[i];
+      sumThroughput += m.throughput;
+      sumLatency += m.processingTime;
+      sumBatchSize += m.batchSize;
+    }
+    const avgThroughput = sumThroughput / recent.length;
+    const avgLatency = sumLatency / recent.length;
+    const avgBatchSize = sumBatchSize / recent.length;
     
     // Determine optimal latency range (target: 50-200ms for good balance)
     const targetMinLatency = 50; // ms
@@ -501,8 +518,16 @@ class MiningOrchestrator extends EventEmitter {
       }
       
       // Calculate after metrics
-      const avgAfterThroughput = afterMetrics.reduce((sum, m) => sum + m.throughput, 0) / afterMetrics.length;
-      const avgAfterLatency = afterMetrics.reduce((sum, m) => sum + m.processingTime, 0) / afterMetrics.length;
+      // OPTIMIZATION: Calculate averages in single pass
+      let sumAfterThroughput = 0;
+      let sumAfterLatency = 0;
+      for (let i = 0; i < afterMetrics.length; i++) {
+        const m = afterMetrics[i];
+        sumAfterThroughput += m.throughput;
+        sumAfterLatency += m.processingTime;
+      }
+      const avgAfterThroughput = sumAfterThroughput / afterMetrics.length;
+      const avgAfterLatency = sumAfterLatency / afterMetrics.length;
       
       change.afterMetrics = {
         avgThroughput: avgAfterThroughput,
@@ -568,10 +593,18 @@ class MiningOrchestrator extends EventEmitter {
         const newSize = analysis.targetSize;
         
         // Capture before metrics
+        // OPTIMIZATION: Calculate averages in single pass
         const recent = this.recentBatchMetrics.slice(-20);
+        let sumThroughput = 0;
+        let sumLatency = 0;
+        for (let i = 0; i < recent.length; i++) {
+          const m = recent[i];
+          sumThroughput += m.throughput;
+          sumLatency += m.processingTime;
+        }
         const beforeMetrics = {
-          avgThroughput: recent.reduce((sum, m) => sum + m.throughput, 0) / recent.length,
-          avgLatency: recent.reduce((sum, m) => sum + m.processingTime, 0) / recent.length,
+          avgThroughput: sumThroughput / recent.length,
+          avgLatency: sumLatency / recent.length,
         };
         
         // Update target batch size
@@ -822,8 +855,16 @@ class MiningOrchestrator extends EventEmitter {
       if (samples.length < 5) continue; // Need at least 5 samples
       if (workerCount > maxCpuThreads) continue; // Don't exceed CPU threads
       
-      const avgHashRate = samples.reduce((sum, s) => sum + s.hashRate, 0) / samples.length;
-      const avgCpuUsage = samples.reduce((sum, s) => sum + s.cpuUsage, 0) / samples.length;
+      // OPTIMIZATION: Calculate averages in single pass
+      let sumHashRate = 0;
+      let sumCpuUsage = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        sumHashRate += s.hashRate;
+        sumCpuUsage += s.cpuUsage;
+      }
+      const avgHashRate = sumHashRate / samples.length;
+      const avgCpuUsage = sumCpuUsage / samples.length;
       
       // Efficiency metric: hash rate per CPU usage per worker
       // Higher is better - we want more hash rate with less CPU per worker
@@ -2276,15 +2317,27 @@ class MiningOrchestrator extends EventEmitter {
     this.lastMineAttempt.clear(); // Clear any stale entries from previous mining session
     const MIN_RETRY_DELAY = 5000; // Retry failed addresses after 5 seconds (reduced from 30s to prevent worker idling)
 
+    // OPTIMIZATION: Counter for throttling expensive checks (run every 30 ticks)
+    let iterationCounter = 0;
+    const THROTTLE_INTERVAL = 30; // Run expensive checks every 30 iterations
+
+    // OPTIMIZATION: Cache frequently accessed values that don't change during mining session
+    // Use let for workerThreadsCached so it can be updated if workerThreads changes during session
+    const totalAddressesCount = this.addresses.length;
+    const maxConcurrentAddressesCached = this.maxConcurrentAddresses;
+    let workerThreadsCached = this.workerThreads;
+
     // Mine addresses dynamically - refresh list before each iteration to pick up newly registered addresses
     // This ensures that as addresses finish registering in the background, they automatically become available for mining
     while (this.isRunning && this.isMining && this.currentChallengeId === currentChallengeId) {
       // OPTIMIZATION: Cache Date.now() at start of loop iteration to reduce system calls
       const now = Date.now();
+      iterationCounter++;
+      const shouldRunExpensiveChecks = (iterationCounter % THROTTLE_INTERVAL) === 0;
       
       // CRITICAL: Check for batch size recovery periodically (not just after successful hashes)
-      // This ensures recovery happens even if there are continuous timeouts
-      if (this.hashServiceTimeoutCount > 0 && this.adaptiveBatchSize !== null) {
+      // OPTIMIZATION: Only check every 30 ticks to reduce overhead in hot path
+      if (shouldRunExpensiveChecks && this.hashServiceTimeoutCount > 0 && this.adaptiveBatchSize !== null) {
         const timeSinceLastTimeout = now - this.lastHashServiceTimeout;
         // Reset after 10 seconds of no timeouts (faster recovery - was 20 seconds)
         if (timeSinceLastTimeout > 10000) {
@@ -2305,64 +2358,55 @@ class MiningOrchestrator extends EventEmitter {
       // Dynamically get available addresses (includes newly registered ones)
       const addressesToMine = this.getAvailableAddressesForMining();
 
+      // OPTIMIZATION: Pre-allocate array and use single pass instead of filter (faster)
       // Filter out addresses currently being mined, but allow retries after delay
-      const newAddressesToMine = addressesToMine.filter(addr => {
+      const newAddressesToMine: DerivedAddress[] = [];
+      for (let i = 0; i < addressesToMine.length; i++) {
+        const addr = addressesToMine[i];
         // Skip if currently being mined
         if (addressesInProgress.has(addr.bech32)) {
-          return false;
+          continue;
         }
         
-        // CRITICAL FIX: Remove retry delay entirely - it's unnecessary and causes workers to sit idle
-        // When an address fails after 6 attempts, it's because:
-        // 1. Challenge data changed while mining (server rejects solution) - we need NEW solution with NEW data
-        // 2. Network/API errors - retrying immediately won't help, need to wait for network recovery
-        // 3. Solution already submitted - address is already solved, no retry needed
-        // 
-        // The retry delay was based on flawed logic: "wait for challenge data to update"
-        // But if challenge data updated, we need to find a NEW solution, not retry the old one
-        // And we already capture fresh challenge data at the START of each mining attempt (line 2580)
-        // So there's no need to wait - just let addresses be retried naturally when they cycle through
-        // 
-        // If we want to avoid hammering a failing address, we can use a very short delay (2-5 seconds)
-        // just to prevent immediate retry loops, but 30 seconds is way too long and causes worker idling
+        // Check retry delay
         const lastAttempt = this.lastMineAttempt.get(addr.bech32);
-        if (lastAttempt) {
-          // Use a minimal delay (5 seconds) just to prevent immediate retry loops
-          // This is much shorter than the old 30s delay and won't cause worker idling
-          const MIN_RETRY_DELAY = 5000; // 5 seconds - just enough to prevent retry loops
-          if ((now - lastAttempt) < MIN_RETRY_DELAY) {
-            return false;
-          }
+        if (lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY) {
+          continue;
         }
         
-        return true;
-      });
+        newAddressesToMine.push(addr);
+      }
 
       // OPTIMIZATION: Calculate counts once (used for logging and logic)
       // CRITICAL FIX: Update cache if stale instead of expensive filter fallback
-      const nowForCache = Date.now();
-      const cacheAge = nowForCache - this.lastRegisteredAddressesUpdate;
-      if (!this.cachedRegisteredAddresses || cacheAge > 5000) {
-        this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
-        this.lastRegisteredAddressesUpdate = nowForCache;
+      // OPTIMIZATION: Only update cache every 30 ticks to reduce overhead
+      if (shouldRunExpensiveChecks) {
+        const cacheAge = now - this.lastRegisteredAddressesUpdate;
+        if (!this.cachedRegisteredAddresses || cacheAge > 5000) {
+          this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
+          this.lastRegisteredAddressesUpdate = now;
+        }
       }
-      const registeredCount = this.cachedRegisteredAddresses.length;
+      const registeredCount = this.cachedRegisteredAddresses?.length || 0;
       const addressesInProgressCount = addressesInProgress.size;
-      // OPTIMIZATION: Count waiting addresses more efficiently (single pass)
+      // OPTIMIZATION: Count waiting addresses only when needed (every 30 ticks or for logging)
       let addressesWaitingRetry = 0;
-      for (let i = 0; i < addressesToMine.length; i++) {
-        const addr = addressesToMine[i];
-        if (!addressesInProgress.has(addr.bech32)) {
-          const lastAttempt = this.lastMineAttempt.get(addr.bech32);
-          if (lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY) {
-            addressesWaitingRetry++;
+      if (shouldRunExpensiveChecks || this.logLevel === 'debug') {
+        for (let i = 0; i < addressesToMine.length; i++) {
+          const addr = addressesToMine[i];
+          if (!addressesInProgress.has(addr.bech32)) {
+            const lastAttempt = this.lastMineAttempt.get(addr.bech32);
+            if (lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY) {
+              addressesWaitingRetry++;
+            }
           }
         }
       }
       
-      // Emit mining state event periodically (every 10 iterations to avoid spam)
-      if (Math.random() < 0.1) { // 10% chance
-        const allAddressesRegistered = registeredCount >= this.addresses.length;
+      // OPTIMIZATION: Use counter instead of Math.random() (expensive) - emit every 30 ticks
+      if (shouldRunExpensiveChecks) {
+        // OPTIMIZATION: Cache calculation that's used multiple times
+        const allAddressesRegistered = registeredCount >= totalAddressesCount;
         const addressesSolved = this.solvedAddressChallenges.size;
         const substate = allAddressesRegistered 
           ? (this.baselineHashRate === null ? 'baseline_collection' : 'normal')
@@ -2381,13 +2425,12 @@ class MiningOrchestrator extends EventEmitter {
         } as MiningEvent);
       }
       
-      // OPTIMIZATION: Reduce logging frequency - only log every 20 iterations (every ~10-20 seconds)
-      // Further reduced from 10% to 5% to minimize overhead in hot path
-      const shouldLogStatus = Math.random() < 0.05; // 5% chance to log (reduces overhead)
+      // OPTIMIZATION: Use counter instead of Math.random() - log every 30 ticks
+      const shouldLogStatus = shouldRunExpensiveChecks;
       
       if (shouldLogStatus || this.logLevel === 'debug') {
         // OPTIMIZATION: Cache string operations to avoid repeated work
-        const totalAddr = this.addresses.length.toString().padStart(3, ' ');
+        const totalAddr = totalAddressesCount.toString().padStart(3, ' ');
         const regAddr = registeredCount.toString().padStart(3, ' ');
         const availAddr = addressesToMine.length.toString().padStart(3, ' ');
         const readyAddr = newAddressesToMine.length.toString().padStart(3, ' ');
@@ -2409,85 +2452,98 @@ class MiningOrchestrator extends EventEmitter {
       }
 
       // CRITICAL STABILITY CHECK: Detect and repair stuck addresses and workers
-      // This is a major cause of hash rate drops - workers getting stuck
-      const stuckAddresses: string[] = [];
-      const stuckWorkers: number[] = [];
-      
-      for (const addressBech32 of addressesInProgress) {
-        // Check if any workers are actually assigned to this address
-        let hasActiveWorker = false;
-        for (const [workerId, assignedAddress] of this.workerAddressAssignment.entries()) {
-          if (assignedAddress === addressBech32) {
-            const workerData = this.workerStats.get(workerId);
-            // Worker exists and is actively mining
-            if (workerData && (workerData.status === 'mining' || workerData.status === 'submitting')) {
-              // CRITICAL: Check if worker is actually making progress (updated recently)
-              const timeSinceUpdate = now - workerData.lastUpdateTime;
-              if (timeSinceUpdate < 60000) { // Updated in last minute
-                hasActiveWorker = true;
-                break;
-              } else {
-                // Worker hasn't updated in >1 minute - it's stuck
-                console.warn(`[Orchestrator] 🔧 Worker ${workerId} stuck (no update in ${Math.floor(timeSinceUpdate / 1000)}s), marking for cleanup`);
-                stuckWorkers.push(workerId);
+      // OPTIMIZATION: Only run expensive stability checks every 30 ticks to reduce overhead
+      if (shouldRunExpensiveChecks) {
+        const stuckAddresses: string[] = [];
+        const stuckWorkers: number[] = [];
+        
+        // OPTIMIZATION: Use reverse lookup map (addressToWorkers) instead of nested loop (O(n*m) → O(n+m))
+        for (const addressBech32 of addressesInProgress) {
+          // Check if any workers are actually assigned to this address using reverse map
+          let hasActiveWorker = false;
+          const workerIds = this.addressToWorkers.get(addressBech32);
+          if (workerIds && workerIds.size > 0) {
+            // OPTIMIZATION: Iterate through workers for this address (much faster than iterating all workers)
+            for (const workerId of workerIds) {
+              const workerData = this.workerStats.get(workerId);
+              // Worker exists and is actively mining
+              if (workerData && (workerData.status === 'mining' || workerData.status === 'submitting')) {
+                // CRITICAL: Check if worker is actually making progress (updated recently)
+                const timeSinceUpdate = now - workerData.lastUpdateTime;
+                if (timeSinceUpdate < 60000) { // Updated in last minute
+                  hasActiveWorker = true;
+                  break;
+                } else {
+                  // Worker hasn't updated in >1 minute - it's stuck
+                  const timeSinceUpdateSeconds = Math.floor(timeSinceUpdate / 1000);
+                  console.warn(`[Orchestrator] 🔧 Worker ${workerId} stuck (no update in ${timeSinceUpdateSeconds}s), marking for cleanup`);
+                  stuckWorkers.push(workerId);
+                }
               }
             }
           }
-        }
-        // If no active workers found and it's been > 1 minute, it's stuck (reduced from 2 minutes for faster recovery)
-        if (!hasActiveWorker) {
-          const lastAttempt = this.lastMineAttempt.get(addressBech32);
-          if (!lastAttempt || (now - lastAttempt) > 60 * 1000) { // Reduced from 2 minutes to 1 minute
-            stuckAddresses.push(addressBech32);
+          // If no active workers found and it's been > 1 minute, it's stuck (reduced from 2 minutes for faster recovery)
+          if (!hasActiveWorker) {
+            const lastAttempt = this.lastMineAttempt.get(addressBech32);
+            if (!lastAttempt || (now - lastAttempt) > 60 * 1000) { // Reduced from 2 minutes to 1 minute
+              stuckAddresses.push(addressBech32);
+            }
           }
         }
-      }
-      
-      // Clean up stuck addresses
-      for (const addressBech32 of stuckAddresses) {
-        addressesInProgress.delete(addressBech32);
-        // Also clear lastMineAttempt to allow immediate retry
-        this.lastMineAttempt.delete(addressBech32);
-        // Clear any paused/submitting state for this address
-        const pauseKey = `${addressBech32}:${currentChallengeId}`;
-        this.pausedAddresses.delete(pauseKey);
-        this.submittingAddresses.delete(pauseKey);
-        console.log(`[Orchestrator] 🔧 Stability: Cleaned stuck address ${addressBech32.slice(0, 20)}... from in-progress`);
-      }
-      
-      // Clean up stuck workers
-      for (const workerId of stuckWorkers) {
-        // Clear worker assignment and stopped status
-        this.workerAddressAssignment.delete(workerId);
-        this.stoppedWorkers.delete(workerId);
-        // Reset worker status to idle so it can be reused
-        const workerData = this.workerStats.get(workerId);
-        if (workerData) {
-          workerData.status = 'idle';
-          workerData.lastUpdateTime = now;
+        
+        // Clean up stuck addresses
+        // OPTIMIZATION: Cache string operations
+        const challengeIdSuffix = `:${currentChallengeId}`;
+        for (const addressBech32 of stuckAddresses) {
+          addressesInProgress.delete(addressBech32);
+          // Also clear lastMineAttempt to allow immediate retry
+          this.lastMineAttempt.delete(addressBech32);
+          // Clear any paused/submitting state for this address
+          const pauseKey = `${addressBech32}${challengeIdSuffix}`;
+          this.pausedAddresses.delete(pauseKey);
+          this.submittingAddresses.delete(pauseKey);
+          // OPTIMIZATION: Cache slice operation result
+          const addressPrefix = addressBech32.slice(0, 20);
+          console.log(`[Orchestrator] 🔧 Stability: Cleaned stuck address ${addressPrefix}... from in-progress`);
         }
-        console.log(`[Orchestrator] 🔧 Stability: Reset stuck worker ${workerId} to idle state`);
-      }
-      
-      // CRITICAL: Check for workers stuck in paused state (> 60 seconds)
-      for (const pauseKey of this.pausedAddresses) {
-        const parts = pauseKey.split(':');
-        if (parts.length >= 2) {
-          const challengeIdFromKey = parts.slice(1).join(':');
-          if (challengeIdFromKey === currentChallengeId) {
-            const addressBech32 = parts[0];
-            // Find workers assigned to this address
-            for (const [workerId, assignedAddress] of this.workerAddressAssignment.entries()) {
-              if (assignedAddress === addressBech32) {
-                const workerData = this.workerStats.get(workerId);
-                if (workerData && workerData.status === 'submitting') {
-                  const timeSinceSubmission = now - workerData.lastUpdateTime;
-                  if (timeSinceSubmission > 60000) { // > 60 seconds
-                    console.warn(`[Orchestrator] 🔧 Worker ${workerId} stuck in submission for ${Math.floor(timeSinceSubmission / 1000)}s, clearing pause lock`);
-                    this.pausedAddresses.delete(pauseKey);
-                    this.submittingAddresses.delete(pauseKey);
-                    workerData.status = 'mining';
-                    workerData.lastUpdateTime = now;
+        
+        // Clean up stuck workers
+        for (const workerId of stuckWorkers) {
+          // Clear worker assignment and stopped status
+          this.workerAddressAssignment.delete(workerId);
+          this.stoppedWorkers.delete(workerId);
+          // Reset worker status to idle so it can be reused
+          const workerData = this.workerStats.get(workerId);
+          if (workerData) {
+            workerData.status = 'idle';
+            workerData.lastUpdateTime = now;
+          }
+          console.log(`[Orchestrator] 🔧 Stability: Reset stuck worker ${workerId} to idle state`);
+        }
+        
+        // CRITICAL: Check for workers stuck in paused state (> 60 seconds)
+        // OPTIMIZATION: Use indexOf instead of split/join, and reverse lookup map for better performance
+        for (const pauseKey of this.pausedAddresses) {
+          const colonIndex = pauseKey.indexOf(':');
+          if (colonIndex > 0 && colonIndex < pauseKey.length - 1) {
+            const addressBech32 = pauseKey.substring(0, colonIndex);
+            const challengeIdFromKey = pauseKey.substring(colonIndex + 1);
+            if (challengeIdFromKey === currentChallengeId) {
+              // OPTIMIZATION: Use reverse lookup map instead of iterating all worker assignments
+              const workerIds = this.addressToWorkers.get(addressBech32);
+              if (workerIds && workerIds.size > 0) {
+                for (const workerId of workerIds) {
+                  const workerData = this.workerStats.get(workerId);
+                  if (workerData && workerData.status === 'submitting') {
+                    const timeSinceSubmission = now - workerData.lastUpdateTime;
+                    if (timeSinceSubmission > 60000) { // > 60 seconds
+                      const timeSinceSubmissionSeconds = Math.floor(timeSinceSubmission / 1000);
+                      console.warn(`[Orchestrator] 🔧 Worker ${workerId} stuck in submission for ${timeSinceSubmissionSeconds}s, clearing pause lock`);
+                      this.pausedAddresses.delete(pauseKey);
+                      this.submittingAddresses.delete(pauseKey);
+                      workerData.status = 'mining';
+                      workerData.lastUpdateTime = now;
+                    }
                   }
                 }
               }
@@ -2501,7 +2557,7 @@ class MiningOrchestrator extends EventEmitter {
         // OPTIMIZATION: Use cached registered count instead of expensive filter
         const allRegisteredCount = registeredCount;
         const allAvailableCount = addressesToMine.length;
-        const unregisteredCount = this.addresses.length - registeredCount;
+        const unregisteredCount = totalAddressesCount - registeredCount;
 
         if (allAvailableCount === 0 && allRegisteredCount > 0) {
           // All registered addresses have been solved for this challenge
@@ -2518,20 +2574,37 @@ class MiningOrchestrator extends EventEmitter {
         } else if (addressesWaitingRetry > 0) {
           // Some addresses are waiting for retry delay
           // CRITICAL FIX: If many addresses are waiting retry, reduce delay to keep workers busy
-          // This prevents all workers from sitting idle when many addresses fail
-          const waitingAddresses = Array.from(this.lastMineAttempt.entries()).filter(([_, t]: [string, number]) => (now - t) < MIN_RETRY_DELAY);
-          const nextRetryIn = waitingAddresses.length > 0 
-            ? Math.min(...waitingAddresses.map(([_, t]: [string, number]) => Math.max(0, MIN_RETRY_DELAY - (now - t))))
-            : 0;
+          // OPTIMIZATION: Calculate retry times in single pass instead of multiple filter/map operations
+          const waitingAddresses: Array<[string, number]> = [];
+          let minRetryTime = Infinity;
+          const totalAvailable = addressesToMine.length;
+          
+          for (const [address, lastAttemptTime] of this.lastMineAttempt.entries()) {
+            const timeSinceAttempt = now - lastAttemptTime;
+            if (timeSinceAttempt < MIN_RETRY_DELAY) {
+              waitingAddresses.push([address, lastAttemptTime]);
+              const retryTime = MIN_RETRY_DELAY - timeSinceAttempt;
+              if (retryTime < minRetryTime) {
+                minRetryTime = retryTime;
+              }
+            }
+          }
+          
+          const nextRetryIn = minRetryTime === Infinity ? 0 : minRetryTime;
           
           // CRITICAL: If more than 50% of addresses are waiting retry, reduce delay to 10 seconds
           // This ensures workers stay busy even when many addresses fail
-          const totalAvailable = addressesToMine.length;
           const retryRatio = totalAvailable > 0 ? addressesWaitingRetry / totalAvailable : 0;
-          const effectiveRetryDelay = retryRatio > 0.5 ? 10000 : MIN_RETRY_DELAY; // 10s if >50% waiting, else 30s
+          const effectiveRetryDelay = retryRatio > 0.5 ? 10000 : MIN_RETRY_DELAY; // 10s if >50% waiting, else 5s
           
           // Allow retries sooner if many addresses are waiting
-          const addressesReadyForRetry = waitingAddresses.filter(([_, t]: [string, number]) => (now - t) >= effectiveRetryDelay);
+          // OPTIMIZATION: Calculate in same pass
+          const addressesReadyForRetry: Array<[string, number]> = [];
+          for (const [address, lastAttemptTime] of waitingAddresses) {
+            if ((now - lastAttemptTime) >= effectiveRetryDelay) {
+              addressesReadyForRetry.push([address, lastAttemptTime]);
+            }
+          }
           if (addressesReadyForRetry.length > 0) {
             // Some addresses are ready for retry - continue loop to pick them up
             console.log(`[Orchestrator] ⚡ ${addressesReadyForRetry.length} addresses ready for retry (${addressesWaitingRetry} total waiting)`);
@@ -2558,7 +2631,8 @@ class MiningOrchestrator extends EventEmitter {
 
       // Process multiple addresses in parallel for high-end systems
       // Take up to maxConcurrentAddresses addresses at once
-      const addressesToProcess = newAddressesToMine.slice(0, this.maxConcurrentAddresses);
+      // OPTIMIZATION: Use cached value
+      const addressesToProcess = newAddressesToMine.slice(0, maxConcurrentAddressesCached);
       
       // CRITICAL: Safety check - ensure we have addresses to process
       if (addressesToProcess.length === 0) {
@@ -2569,42 +2643,51 @@ class MiningOrchestrator extends EventEmitter {
       
       // CRITICAL: Use 50% of workers until all addresses are registered
       // This reserves workers for registration tasks and prevents overwhelming the system during initialization
-      const allAddressesRegistered = registeredCount >= this.addresses.length;
+      // OPTIMIZATION: Cache calculation
+      const allAddressesRegistered = registeredCount >= totalAddressesCount;
       
       // CRITICAL: After registration completes, ensure we're using the full persisted worker count from config
       // Reload config to ensure we have the latest persisted value (in case it was changed externally)
       // CRITICAL: Do NOT save the temporary 50% reduction to config - it's only for runtime use
-      if (allAddressesRegistered && this.workerThreads !== ConfigManager.loadConfig().workerThreads) {
-        const persistedConfig = ConfigManager.loadConfig();
+      // OPTIMIZATION: Cache config load result (avoid calling twice)
+      let persistedConfig = null;
+      if (allAddressesRegistered && workerThreadsCached !== (persistedConfig = ConfigManager.loadConfig()).workerThreads) {
         // CRITICAL: Validate and correct worker count if it exceeds maximum allowed
         const MAX_WORKERS = 1024;
         if (persistedConfig.workerThreads > MAX_WORKERS) {
           const correctedWorkerCount = Math.max(1, Math.floor(persistedConfig.workerThreads / 2));
           console.warn(`[Orchestrator] ⚠️  Worker count in config (${persistedConfig.workerThreads}) exceeds maximum (${MAX_WORKERS}). Reducing to ${correctedWorkerCount} and saving to config.`);
           this.workerThreads = correctedWorkerCount;
+          // OPTIMIZATION: Update cached value to avoid stale cache
+          workerThreadsCached = correctedWorkerCount;
           ConfigManager.setWorkerThreads(correctedWorkerCount);
         } else {
           this.workerThreads = persistedConfig.workerThreads;
+          // OPTIMIZATION: Update cached value to avoid stale cache
+          workerThreadsCached = persistedConfig.workerThreads;
         }
         console.log(`[Orchestrator] ✓ All addresses registered! Restored full worker count from config: ${this.workerThreads} workers`);
       }
       
       // CRITICAL: effectiveWorkerCount is ONLY for runtime use - it is NEVER saved to config
       // The 50% reduction during registration is temporary and does not persist
+      // OPTIMIZATION: Use cached workerThreads value
       const effectiveWorkerCount = allAddressesRegistered 
-        ? this.workerThreads  // Use 100% of persisted worker count from config once all addresses are registered
-        : Math.max(1, Math.floor(this.workerThreads * 0.5)); // Use 50% during registration (TEMPORARY - not saved)
+        ? workerThreadsCached  // Use 100% of persisted worker count from config once all addresses are registered
+        : Math.max(1, Math.floor(workerThreadsCached * 0.5)); // Use 50% during registration (TEMPORARY - not saved)
       
       // Log worker count adjustment
       if (!allAddressesRegistered) {
-        const unregisteredCount = this.addresses.length - registeredCount;
+        const unregisteredCount = totalAddressesCount - registeredCount;
         // Log at info level (not just debug) so user knows why performance is reduced
-        console.log(`[Orchestrator] ⚙️  Registration mode: Using ${effectiveWorkerCount}/${this.workerThreads} workers (${unregisteredCount} addresses still registering)`);
-      } else if (effectiveWorkerCount === this.workerThreads) {
+        // OPTIMIZATION: Use cached value
+        console.log(`[Orchestrator] ⚙️  Registration mode: Using ${effectiveWorkerCount}/${workerThreadsCached} workers (${unregisteredCount} addresses still registering)`);
+      } else if (effectiveWorkerCount === workerThreadsCached) {
         // Log when we switch back to full worker count (only once, not every iteration)
         // Use a flag to track if we've already logged this transition
         if (!this.hasLoggedFullWorkerRestore) {
-          console.log(`[Orchestrator] ✓ Registration complete! Using full worker count: ${this.workerThreads} workers (from persisted config)`);
+          // OPTIMIZATION: Use cached value
+          console.log(`[Orchestrator] ✓ Registration complete! Using full worker count: ${workerThreadsCached} workers (from persisted config)`);
           this.hasLoggedFullWorkerRestore = true;
         }
       }
@@ -2624,7 +2707,8 @@ class MiningOrchestrator extends EventEmitter {
           // Distribute workers across addresses: address 0 gets workers 0-N, address 1 gets workers N+1-2N, etc.
           // CRITICAL: Use effective worker count (50% during registration, 100% when all registered)
           // CRITICAL: Never exceed the configured workerThreads - this ensures we don't create more workers than set
-          const totalUserWorkers = Math.min(effectiveWorkerCount, this.workerThreads);
+          // OPTIMIZATION: Use cached workerThreads value
+          const totalUserWorkers = Math.min(effectiveWorkerCount, workerThreadsCached);
           
           // CRITICAL: Log worker count to verify no duplication (log for first address only)
           if (idx === 0) {
@@ -5766,12 +5850,12 @@ class MiningOrchestrator extends EventEmitter {
     } as MiningEvent);
 
     // Check 1: Clean up stale paused addresses (for old challenges)
+    // OPTIMIZATION: Use indexOf instead of split/join for better performance
     const pausedAddressesToClean: string[] = [];
     for (const pausedKey of this.pausedAddresses) {
-      // Extract address and challenge from key (format: "address:challengeId")
-      const parts = pausedKey.split(':');
-      if (parts.length >= 2) {
-        const challengeId = parts.slice(1).join(':'); // Handle challenge IDs with colons
+      const colonIndex = pausedKey.indexOf(':');
+      if (colonIndex > 0 && colonIndex < pausedKey.length - 1) {
+        const challengeId = pausedKey.substring(colonIndex + 1);
         // If challenge changed, clean it up
         if (this.currentChallengeId !== challengeId || !this.currentChallengeId) {
           pausedAddressesToClean.push(pausedKey);
@@ -5787,11 +5871,12 @@ class MiningOrchestrator extends EventEmitter {
     }
 
     // Check 2: Clean up stale submitting addresses (for old challenges)
+    // OPTIMIZATION: Use indexOf instead of split/join for better performance
     const submittingAddressesToClean: string[] = [];
     for (const submittingKey of this.submittingAddresses) {
-      const parts = submittingKey.split(':');
-      if (parts.length >= 2) {
-        const challengeId = parts.slice(1).join(':');
+      const colonIndex = submittingKey.indexOf(':');
+      if (colonIndex > 0 && colonIndex < submittingKey.length - 1) {
+        const challengeId = submittingKey.substring(colonIndex + 1);
         // If challenge changed, clean it up
         if (this.currentChallengeId !== challengeId || !this.currentChallengeId) {
           submittingAddressesToClean.push(submittingKey);
