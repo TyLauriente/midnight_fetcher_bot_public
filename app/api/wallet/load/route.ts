@@ -1,15 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { WalletManager } from '@/lib/wallet/manager';
 
+const DEFAULT_PASSWORD = 'Rascalismydog@1';
+
 export async function POST(request: NextRequest) {
   try {
-    const { password } = await request.json();
+    let { password } = await request.json();
 
+    // Try default password if no password provided
     if (!password) {
-      return NextResponse.json(
-        { error: 'Password is required' },
-        { status: 400 }
-      );
+      password = DEFAULT_PASSWORD;
+      console.log('[API] No password provided, trying default password...');
     }
 
     const manager = new WalletManager();
@@ -21,7 +22,20 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const addresses = await manager.loadWallet(password);
+    // Try to load with provided password (or default)
+    let addresses;
+    try {
+      addresses = await manager.loadWallet(password);
+    } catch (error: any) {
+      // If default password was used and failed, try user-provided password
+      if (password === DEFAULT_PASSWORD && error.message.includes('Failed to decrypt')) {
+        return NextResponse.json(
+          { error: 'Incorrect password. Please provide your wallet password.' },
+          { status: 401 }
+        );
+      }
+      throw error;
+    }
 
     return NextResponse.json({
       success: true,

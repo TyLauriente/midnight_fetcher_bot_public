@@ -7,7 +7,7 @@ import { miningOrchestrator } from '@/lib/mining/orchestrator';
 
 export async function POST(req: NextRequest) {
   try {
-    const { workerThreads, batchSize, workerGroupingMode, workersPerAddress } = await req.json();
+    const { workerThreads, batchSize, workerGroupingMode, workersPerAddress, addressOffset } = await req.json();
 
     // Validate workerThreads
     if (workerThreads !== undefined) {
@@ -49,12 +49,23 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Validate addressOffset
+    if (addressOffset !== undefined) {
+      if (typeof addressOffset !== 'number' || addressOffset < 0 || addressOffset > 1000) {
+        return NextResponse.json(
+          { success: false, error: 'Invalid addressOffset value (must be between 0 and 1000)' },
+          { status: 400 }
+        );
+      }
+    }
+
     // Update configuration in the orchestrator
     miningOrchestrator.updateConfiguration({
       workerThreads,
       batchSize,
       workerGroupingMode,
       workersPerAddress,
+      addressOffset,
     });
 
     // Get updated configuration

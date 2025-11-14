@@ -11,6 +11,7 @@ export interface MiningConfig {
   batchSize: number | null;
   workerGroupingMode: 'auto' | 'all-on-one' | 'grouped';
   workersPerAddress: number;
+  addressOffset: number; // Address offset index (0 = 0-199, 1 = 200-399, etc.)
 }
 
 class ConfigManager {
@@ -20,6 +21,7 @@ class ConfigManager {
     batchSize: null, // null means use default
     workerGroupingMode: 'auto',
     workersPerAddress: 5,
+    addressOffset: 0, // Default to 0 (addresses 0-199)
   };
 
   constructor() {

@@ -357,6 +357,34 @@ else
 fi
 echo ""
 
+# Auto-start mining with default password if wallet exists
+echo "[8/8] Attempting to auto-start mining..."
+sleep 3  # Give Next.js a bit more time to fully initialize
+
+DEFAULT_PASSWORD="Rascalismydog@1"
+WALLET_EXISTS=false
+
+# Check if wallet exists (check both old and new locations)
+if [ -f "secure/wallet-seed.json.enc" ] || [ -f "$HOME/Documents/MidnightFetcherBot/secure/wallet-seed.json.enc" ]; then
+    WALLET_EXISTS=true
+    echo "  - Wallet found, attempting to start mining with default password..."
+    
+    # Try to start mining via API
+    START_RESPONSE=$(curl -s -X POST http://localhost:3001/api/mining/start \
+        -H "Content-Type: application/json" \
+        -d "{\"password\": \"$DEFAULT_PASSWORD\"}" 2>&1)
+    
+    if echo "$START_RESPONSE" | grep -q "success"; then
+        echo "  ✓ Mining started successfully!"
+    else
+        echo "  ⚠️  Could not auto-start mining (wallet may use different password)"
+        echo "     You can start mining manually from the web dashboard"
+    fi
+else
+    echo "  ℹ️  No wallet found - please create one from the web dashboard"
+fi
+echo ""
+
 echo ""
 echo "================================================================================"
 echo "                    Setup Complete - Services Running!"
@@ -364,6 +392,11 @@ echo "==========================================================================
 echo ""
 echo "✅ Hash Server:     Running (PID: $HASH_SERVER_PID)"
 echo "✅ Next.js Server:  Running (PID: $NEXTJS_PID)"
+if [ "$WALLET_EXISTS" = true ]; then
+    echo "✅ Mining:          Auto-started (if wallet uses default password)"
+else
+    echo "⏸️  Mining:          Not started (no wallet found)"
+fi
 echo ""
 echo "📊 Web Dashboard:   http://localhost:3001"
 echo "🔧 Hash Service:    http://127.0.0.1:9001/health"
@@ -376,10 +409,15 @@ echo "   ./logs.sh    - View live logs"
 echo "   ./stop.sh    - Stop all services"
 echo "   ./start.sh   - Restart services"
 echo ""
-echo "🎯 Next Steps:"
-echo "   1. Open http://localhost:3001 in your browser"
-echo "   2. Create a new wallet or load existing one"
-echo "   3. Start mining!"
+if [ "$WALLET_EXISTS" = false ]; then
+    echo "🎯 Next Steps:"
+    echo "   1. Open http://localhost:3001 in your browser"
+    echo "   2. Create a new wallet or load existing one"
+    echo "   3. Start mining!"
+else
+    echo "🎯 Mining should be running automatically!"
+    echo "   Open http://localhost:3001 to view the dashboard"
+fi
 echo ""
 echo "================================================================================"
 echo ""

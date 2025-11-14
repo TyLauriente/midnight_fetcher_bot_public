@@ -33,9 +33,8 @@ class MiningOrchestrator extends EventEmitter {
   private walletManager: WalletManager | null = null;
   private isDevFeeMining = false; // Flag to prevent multiple simultaneous dev fee mining operations
   private addresses: DerivedAddress[] = [];
-  private instanceId: number = 0; // Instance ID for multi-computer setups (0, 1, 2, ...)
+  private addressOffset: number = 0; // Address offset index (0 = 0-199, 1 = 200-399, etc.)
   private addressesPerInstance: number = 200; // Number of addresses per instance
-  private instanceConfigPath: string = path.join(process.cwd(), 'secure', 'instance-config.json');
   private solutionsFound = 0;
   private startTime: number | null = null;
   private isMining = false;
@@ -73,6 +72,7 @@ class MiningOrchestrator extends EventEmitter {
     this.customBatchSize = savedConfig.batchSize;
     this.workerGroupingMode = savedConfig.workerGroupingMode;
     this.workersPerAddress = savedConfig.workersPerAddress;
+    this.addressOffset = savedConfig.addressOffset;
     console.log('[Orchestrator] Initialized with saved configuration:', savedConfig);
   }
 
@@ -84,6 +84,7 @@ class MiningOrchestrator extends EventEmitter {
     batchSize?: number;
     workerGroupingMode?: 'auto' | 'all-on-one' | 'grouped';
     workersPerAddress?: number;
+    addressOffset?: number;
   }): void {
     if (config.workerThreads !== undefined) {
       console.log(`[Orchestrator] Updating workerThreads: ${this.workerThreads} -> ${config.workerThreads}`);
@@ -101,6 +102,10 @@ class MiningOrchestrator extends EventEmitter {
       console.log(`[Orchestrator] Updating workersPerAddress: ${this.workersPerAddress} -> ${config.workersPerAddress}`);
       this.workersPerAddress = Math.max(1, config.workersPerAddress);
     }
+    if (config.addressOffset !== undefined) {
+      console.log(`[Orchestrator] Updating addressOffset: ${this.addressOffset} -> ${config.addressOffset}`);
+      this.addressOffset = Math.max(0, config.addressOffset);
+    }
 
     // Save updated configuration to disk
     configManager.saveConfig({
@@ -108,6 +113,7 @@ class MiningOrchestrator extends EventEmitter {
       batchSize: this.customBatchSize,
       workerGroupingMode: this.workerGroupingMode,
       workersPerAddress: this.workersPerAddress,
+      addressOffset: this.addressOffset,
     });
   }
 
@@ -119,12 +125,14 @@ class MiningOrchestrator extends EventEmitter {
     batchSize: number;
     workerGroupingMode: 'auto' | 'all-on-one' | 'grouped';
     workersPerAddress: number;
+    addressOffset: number;
   } {
     return {
       workerThreads: this.workerThreads,
       batchSize: this.getBatchSize(),
       workerGroupingMode: this.workerGroupingMode,
       workersPerAddress: this.workersPerAddress,
+      addressOffset: this.addressOffset,
     };
   }
 
@@ -245,91 +253,6 @@ class MiningOrchestrator extends EventEmitter {
 
     return groups;
   }
-  /**  
-   * Automatically detect or assign instance ID based on machine characteristics
-   * This ensures each computer gets a unique, persistent address range
-   */
-  private async detectOrAssignInstanceId(): Promise<number> {
-    // Generate a unique machine identifier
-    const machineId = this.generateMachineId();
-    
-    // Check if we have a saved instance config
-    let instanceId: number;
-    
-    try {
-      if (fs.existsSync(this.instanceConfigPath)) {
-        const config = JSON.parse(fs.readFileSync(this.instanceConfigPath, 'utf8'));
-        
-        // Verify it's for this machine
-        if (config.machineId === machineId) {
-          instanceId = config.instanceId;
-          console.log(`[Orchestrator] Using saved instance ID: ${instanceId} (for this machine)`);
-          return instanceId;
-        } else {
-          console.log(`[Orchestrator] Instance config found but for different machine - will assign new ID`);
-        }
-      }
-    } catch (error) {
-      console.log(`[Orchestrator] Could not read instance config - will create new one`);
-    }
-    
-    // No valid config found - assign a new instance ID based on machine ID hash
-    // This ensures deterministic assignment: same machine ID = same instance ID
-    const hash = crypto.createHash('sha256').update(machineId).digest('hex');
-    // Use first 8 hex chars to get a number, then modulo to reasonable range (0-999)
-    // This gives us up to 1000 different instances
-    instanceId = parseInt(hash.substring(0, 8), 16) % 1000;
-    
-    // Save the config for future runs
-    try {
-      const secureDir = path.dirname(this.instanceConfigPath);
-      if (!fs.existsSync(secureDir)) {
-        fs.mkdirSync(secureDir, { recursive: true, mode: 0o700 });
-      }
-      
-      const config = {
-        machineId,
-        instanceId,
-        assignedAt: new Date().toISOString(),
-      };
-      
-      fs.writeFileSync(this.instanceConfigPath, JSON.stringify(config, null, 2), { mode: 0o600 });
-      console.log(`[Orchestrator] ✓ Assigned and saved instance ID: ${instanceId} (machine ID: ${machineId.substring(0, 16)}...)`);
-    } catch (error) {
-      console.warn(`[Orchestrator] Could not save instance config: ${error}`);
-    }
-    
-    return instanceId;
-  }
-
-  /**
-   * Generate a unique machine identifier based on hostname and network interfaces
-   */
-  private generateMachineId(): string {
-    const hostname = os.hostname();
-    const networkInterfaces = os.networkInterfaces();
-    
-    // Collect MAC addresses from network interfaces (most stable identifier)
-    const macAddresses: string[] = [];
-    for (const iface of Object.values(networkInterfaces)) {
-      if (iface) {
-        for (const addr of iface) {
-          if (addr.mac && addr.mac !== '00:00:00:00:00:00') {
-            macAddresses.push(addr.mac);
-          }
-        }
-      }
-    }
-    
-    // Sort MAC addresses for consistency
-    macAddresses.sort();
-    
-    // Combine hostname and MAC addresses to create unique machine ID
-    const machineData = `${hostname}:${macAddresses.join(',')}`;
-    const machineId = crypto.createHash('sha256').update(machineData).digest('hex');
-    
-    return machineId;
-  }
 
   /**
    * Start mining with loaded wallet
@@ -344,21 +267,18 @@ class MiningOrchestrator extends EventEmitter {
     this.walletManager = new WalletManager();
     const allAddresses = await this.walletManager.loadWallet(password);
 
-    // Automatically detect and assign instance ID based on machine characteristics
-    // This ensures each computer gets a unique address range without manual configuration
-    this.instanceId = await this.detectOrAssignInstanceId();
+    // Use addressOffset from config to determine address range
+    // addressOffset 0 = addresses 0-199, 1 = 200-399, etc.
     this.addressesPerInstance = parseInt(process.env.MINING_ADDRESSES_PER_INSTANCE || '200', 10);
-
-    // Filter addresses to this instance's range to avoid conflicts with other computers
-    const startIndex = this.instanceId * this.addressesPerInstance;
+    const startIndex = this.addressOffset * this.addressesPerInstance;
     const endIndex = startIndex + this.addressesPerInstance;
     this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
 
-    console.log(`[Orchestrator] 🤖 Auto-detected Instance ID: ${this.instanceId} (using addresses ${startIndex}-${endIndex - 1})`);
+    console.log(`[Orchestrator] Using addressOffset: ${this.addressOffset} (using addresses ${startIndex}-${endIndex - 1})`);
     console.log(`[Orchestrator] Loaded wallet with ${allAddresses.length} total addresses`);
     console.log(`[Orchestrator] Using ${this.addresses.length} addresses for this instance (indices ${startIndex}-${endIndex - 1})`);
     
-    if (this.instanceId > 0) {
+    if (this.addressOffset > 0) {
       console.log(`[Orchestrator] ✓ Multi-computer setup detected - this machine will use a unique address range`);
     }
 

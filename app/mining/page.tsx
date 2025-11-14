@@ -138,8 +138,10 @@ function MiningDashboardContent() {
   const [editedBatchSize, setEditedBatchSize] = useState<number | null>(null);
   const [workerGroupingMode, setWorkerGroupingMode] = useState<'auto' | 'all-on-one' | 'grouped'>('auto');
   const [workersPerAddress, setWorkersPerAddress] = useState<number>(5);
+  const [addressOffset, setAddressOffset] = useState<number>(0);
   const [initialWorkerGroupingMode, setInitialWorkerGroupingMode] = useState<'auto' | 'all-on-one' | 'grouped'>('auto');
   const [initialWorkersPerAddress, setInitialWorkersPerAddress] = useState<number>(5);
+  const [initialAddressOffset, setInitialAddressOffset] = useState<number>(0);
   const [applyingChanges, setApplyingChanges] = useState(false);
   const [showApplyConfirmation, setShowApplyConfirmation] = useState(false);
 
@@ -599,10 +601,13 @@ function MiningDashboardContent() {
       if (statusData.config) {
         const mode = statusData.config.workerGroupingMode || 'auto';
         const workers = statusData.config.workersPerAddress || 5;
+        const offset = statusData.config.addressOffset || 0;
         setWorkerGroupingMode(mode);
         setWorkersPerAddress(workers);
+        setAddressOffset(offset);
         setInitialWorkerGroupingMode(mode);
         setInitialWorkersPerAddress(workers);
+        setInitialAddressOffset(offset);
       }
     } catch (err: any) {
       setScaleError(err.message || 'Failed to connect to API');
@@ -673,6 +678,7 @@ function MiningDashboardContent() {
           batchSize: editedBatchSize,
           workerGroupingMode,
           workersPerAddress,
+          addressOffset,
         }),
       });
 
@@ -705,7 +711,8 @@ function MiningDashboardContent() {
       editedWorkerThreads !== scaleRecommendations.workerThreads.current ||
       editedBatchSize !== scaleRecommendations.batchSize.current ||
       workerGroupingMode !== initialWorkerGroupingMode ||
-      workersPerAddress !== initialWorkersPerAddress
+      workersPerAddress !== initialWorkersPerAddress ||
+      addressOffset !== initialAddressOffset
     );
   };
 
@@ -1437,6 +1444,23 @@ function MiningDashboardContent() {
         {/* History Tab */}
         {activeTab === 'history' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             {historyLoading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-12 h-12 animate-spin text-blue-500" />
@@ -1783,6 +1807,23 @@ function MiningDashboardContent() {
         {/* Rewards Tab */}
         {activeTab === 'rewards' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             {rewardsLoading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-12 h-12 animate-spin text-blue-500" />
@@ -2030,6 +2071,23 @@ function MiningDashboardContent() {
         {/* Workers Tab */}
         {activeTab === 'workers' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             {workers.size === 0 ? (
               <Card variant="bordered">
                 <CardContent className="text-center py-12">
@@ -2209,6 +2267,23 @@ function MiningDashboardContent() {
         {/* Addresses Tab */}
         {activeTab === 'addresses' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             {addressesLoading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-12 h-12 animate-spin text-blue-500" />
@@ -2699,6 +2774,44 @@ function MiningDashboardContent() {
                   </CardContent>
                 </Card>
 
+                {/* Address Offset Configuration */}
+                <Card variant="elevated">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <MapPin className="w-6 h-6 text-blue-400" />
+                      Address Offset
+                    </CardTitle>
+                    <CardDescription>
+                      Configure which address range to use (0 = 0-199, 1 = 200-399, etc.)
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div className="space-y-2">
+                      <label className="block text-sm font-medium text-gray-300">
+                        Address Offset Index
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        max="1000"
+                        value={addressOffset}
+                        onChange={(e) => setAddressOffset(Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
+                        className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                      <p className="text-xs text-gray-500">
+                        Using addresses {addressOffset * 200}-{(addressOffset * 200) + 199} (offset {addressOffset})
+                      </p>
+                    </div>
+                    <Alert variant="info">
+                      <Info className="w-4 h-4" />
+                      <span className="text-sm">
+                        Address offset allows multiple computers to mine different address ranges. 
+                        Offset 0 uses addresses 0-199, offset 1 uses 200-399, and so on.
+                      </span>
+                    </Alert>
+                  </CardContent>
+                </Card>
+
                 {/* Recommendations - Visual Cards */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   {/* Worker Threads Card */}
@@ -2957,6 +3070,23 @@ function MiningDashboardContent() {
         {/* Consolidate Tab */}
         {activeTab === 'consolidate' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             {/* Warning Banner */}
             <Alert variant="warning" className="bg-gradient-to-r from-yellow-900/40 to-amber-900/40 border-2 border-yellow-600/60">
               <div className="flex items-start gap-4">
@@ -3820,6 +3950,23 @@ function MiningDashboardContent() {
         {/* Diagnostics Tab */}
         {activeTab === 'diagnostics' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             <Card variant="bordered">
               <CardHeader>
                 <CardTitle className="text-2xl flex items-center gap-2">
@@ -4237,6 +4384,23 @@ function MiningDashboardContent() {
         {/* Dev Fee Tab */}
         {activeTab === 'devfee' && (
           <div className="space-y-6">
+            {/* Hash Rate Display */}
+            {stats && (
+              <Card variant="bordered" className="bg-gradient-to-br from-purple-900/20 to-purple-800/10 border-purple-700/50">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Hash className="w-5 h-5 text-purple-400" />
+                      <span className="text-sm text-gray-400 font-medium">Hash Rate</span>
+                    </div>
+                    <span className="text-xl font-bold text-white">
+                      {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                      <span className="text-sm text-gray-400 ml-1">H/s</span>
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
             {/* Dev Fee Explanation Card */}
             <Card variant="bordered" className="bg-gradient-to-br from-blue-900/20 to-purple-900/20">
               <CardHeader>

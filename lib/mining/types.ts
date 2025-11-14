@@ -34,6 +34,7 @@ export interface MiningStats {
     batchSize: number;
     workerGroupingMode: 'auto' | 'all-on-one' | 'grouped';
     workersPerAddress: number;
+    addressOffset: number;
   };
 }
 

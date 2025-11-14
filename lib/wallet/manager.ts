@@ -148,7 +148,7 @@ export class WalletManager {
   }
 
   /**
-   * Derive addresses from mnemonic
+   * Derive addresses from mnemonic (parallelized for performance)
    */
   private async deriveAddresses(count: number): Promise<void> {
     if (!this.mnemonic) {
@@ -157,21 +157,49 @@ export class WalletManager {
 
     this.derivedAddresses = [];
 
-    for (let i = 0; i < count; i++) {
-      try {
-        const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
+    // Generate all addresses in parallel batches for better performance
+    const BATCH_SIZE = 20; // Process 20 addresses at a time
+    const batches: number[][] = [];
+    
+    for (let i = 0; i < count; i += BATCH_SIZE) {
+      const batch = [];
+      for (let j = i; j < Math.min(i + BATCH_SIZE, count); j++) {
+        batch.push(j);
+      }
+      batches.push(batch);
+    }
 
-        this.derivedAddresses.push({
-          index: i,
-          bech32: address,
-          publicKeyHex: pubKeyHex,
-          registered: false,
-        });
-      } catch (err: any) {
-        console.error(`Failed to derive address at index ${i}:`, err.message);
-        throw err;
+    console.log(`[Wallet] Generating ${count} addresses in ${batches.length} parallel batches...`);
+
+    // Process batches sequentially, but addresses within each batch in parallel
+    for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+      const batch = batches[batchIdx];
+      const batchPromises = batch.map(async (index) => {
+        try {
+          const { address, pubKeyHex } = await this.deriveAddressAtIndex(index);
+          return {
+            index,
+            bech32: address,
+            publicKeyHex: pubKeyHex,
+            registered: false,
+          };
+        } catch (err: any) {
+          console.error(`Failed to derive address at index ${index}:`, err.message);
+          throw err;
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      this.derivedAddresses.push(...batchResults);
+      
+      if ((batchIdx + 1) % 10 === 0 || batchIdx === batches.length - 1) {
+        console.log(`[Wallet] Generated ${this.derivedAddresses.length}/${count} addresses...`);
       }
     }
+
+    // Sort by index to ensure correct order
+    this.derivedAddresses.sort((a, b) => a.index - b.index);
+    console.log(`[Wallet] ✓ Successfully generated ${this.derivedAddresses.length} addresses`);
   }
 
   /**
