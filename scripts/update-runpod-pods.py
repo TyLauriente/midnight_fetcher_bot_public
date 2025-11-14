@@ -108,6 +108,7 @@ def run_host(host, iteration):
 
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
+    channel.send("sh stop.sh\n")
 
     stream_output(channel, timeout=1)
     channel.send(
