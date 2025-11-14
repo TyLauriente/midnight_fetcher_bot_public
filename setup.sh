@@ -102,7 +102,7 @@ if ! command -v cargo &> /dev/null; then
     echo "Rust not found. Installing Rust..."
     echo ""
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
+    . "$HOME/.cargo/env"
     echo "Rust installed!"
     cargo --version
     echo ""
