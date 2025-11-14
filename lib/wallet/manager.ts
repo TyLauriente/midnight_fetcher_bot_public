@@ -297,9 +297,35 @@ export class WalletManager {
   }
 
   /**
-   * Mark address as registered
-   * Ensures the address is saved to disk even if not in current in-memory list
+   * Check if an address is registered in persistent storage
+   * This is a lightweight check that reads directly from disk without loading the full wallet
    */
+  isAddressRegistered(index: number): boolean {
+    if (!fs.existsSync(DERIVED_ADDRESSES_FILE)) {
+      return false;
+    }
+    
+    try {
+      const addressesFileContent = fs.readFileSync(DERIVED_ADDRESSES_FILE, 'utf8').trim();
+      if (!addressesFileContent || addressesFileContent.length === 0) {
+        return false;
+      }
+      
+      const addresses: DerivedAddress[] = JSON.parse(addressesFileContent);
+      if (!Array.isArray(addresses)) {
+        return false;
+      }
+      
+      const addr = addresses.find(a => a.index === index);
+      return addr?.registered === true;
+    } catch (err: any) {
+      console.warn(`[WalletManager] Failed to check registration status for address ${index}: ${err.message}`);
+      // Fallback to in-memory check
+      const inMemoryAddr = this.derivedAddresses.find(a => a.index === index);
+      return inMemoryAddr?.registered === true;
+    }
+  }
+
   markAddressRegistered(index: number): void {
     // Reload addresses from disk to ensure we have the latest state
     let addresses: DerivedAddress[] = [];

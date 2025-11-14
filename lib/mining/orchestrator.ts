@@ -204,6 +204,7 @@ class MiningOrchestrator extends EventEmitter {
   private hexByteLookup = new Map<string, number>(); // Lookup table for hex byte -> number (0-255) to avoid parseInt in hot path
   private staticPreimageCache = new Map<string, string>(); // Cache static preimage suffix per address+challenge (key: address:challengeId)
   private hourlyRestartTimer: NodeJS.Timeout | null = null; // Timer for hourly restart
+  private delayedWorkerResetTimer: NodeJS.Timeout | null = null; // Timer for delayed worker reset after new challenge
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
   private addressSubmissionFailures = new Map<string, number>(); // Track submission failures per address (address+challenge key)
@@ -1338,6 +1339,12 @@ class MiningOrchestrator extends EventEmitter {
       this.hourlyRestartTimer = null;
     }
 
+    // Clear delayed worker reset timer
+    if (this.delayedWorkerResetTimer) {
+      clearTimeout(this.delayedWorkerResetTimer);
+      this.delayedWorkerResetTimer = null;
+    }
+
     // Clear hash rate monitoring
     if (this.hashRateMonitorInterval) {
       clearInterval(this.hashRateMonitorInterval);
@@ -1672,30 +1679,16 @@ class MiningOrchestrator extends EventEmitter {
           await this.sleep(1000);
         }
 
-        // CRITICAL: Kill all workers as they are working on void challenge solutions
-        console.log('[Orchestrator] Killing all hash workers (old challenge solutions are void)...');
-        try {
-          await hashEngine.killWorkers();
-          console.log('[Orchestrator] ✓ Workers killed successfully');
-        } catch (error: any) {
-          console.error('[Orchestrator] Failed to kill workers:', error.message);
-        }
-
         // CRITICAL: Save old challenge ID before updating (needed for cleanup)
         const oldChallengeId = this.currentChallengeId;
+
+        // CRITICAL: Completely reset all workers to initial state (like first launch)
+        // This ensures workers are in a clean state for the new challenge
+        await this.resetAllWorkers();
 
         // Reset challenge progress tracking
         this.addressesProcessedCurrentChallenge.clear();
         this.submittedSolutions.clear(); // Clear submitted solutions for new challenge
-        
-        // CRITICAL: Clear all failure counters for new challenge
-        // This ensures addresses can be retried on new challenges even if they failed on previous ones
-        this.addressSubmissionFailures.clear();
-        
-        // Clear worker address assignments for new challenge
-    this.workerAddressAssignment.clear();
-    this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
-    this.staticPreimageCache.clear(); // Clear preimage cache on challenge change
         
         // Reset hash service timeout tracking for new challenge
         this.hashServiceTimeoutCount = 0;
@@ -1770,6 +1763,56 @@ class MiningOrchestrator extends EventEmitter {
           oldChallengeFailures.forEach(key => this.addressSubmissionFailures.delete(key));
         }
 
+        // CRITICAL: Schedule delayed worker reset 30 seconds after new challenge
+        // This catches any stragglers that might still be processing old challenge data
+        // Clear any existing delayed reset timer first
+        if (this.delayedWorkerResetTimer) {
+          clearTimeout(this.delayedWorkerResetTimer);
+          this.delayedWorkerResetTimer = null;
+        }
+        
+        console.log('[Orchestrator] Scheduling delayed worker reset in 30 seconds...');
+        this.delayedWorkerResetTimer = setTimeout(async () => {
+          if (!this.isRunning || this.currentChallengeId !== challengeId) {
+            // Challenge changed again or mining stopped, skip reset
+            return;
+          }
+          
+          console.log('[Orchestrator] ========================================');
+          console.log('[Orchestrator] DELAYED WORKER RESET (30s after new challenge)');
+          console.log('[Orchestrator] ========================================');
+          
+          try {
+            // Stop mining temporarily
+            const wasMining = this.isMining;
+            this.isMining = false;
+            
+            // Give workers time to finish current batch
+            await this.sleep(1000);
+            
+            // Reset all workers to initial state
+            await this.resetAllWorkers();
+            
+            // Restart mining if it was running
+            if (wasMining && this.isRunning && this.currentChallengeId === challengeId) {
+              console.log('[Orchestrator] Resuming mining after delayed worker reset...');
+              this.startMining();
+            }
+            
+            console.log('[Orchestrator] ========================================');
+            console.log('[Orchestrator] DELAYED WORKER RESET COMPLETE');
+            console.log('[Orchestrator] ========================================');
+          } catch (error: any) {
+            console.error('[Orchestrator] Delayed worker reset failed:', error.message);
+            // Try to resume mining anyway
+            if (this.isRunning && this.currentChallengeId === challengeId) {
+              this.startMining();
+            }
+          }
+          
+          this.delayedWorkerResetTimer = null;
+        }, 30000); // 30 seconds
+
         // Load challenge state from receipts (restore progress, solutions count, etc.)
         this.loadChallengeState(challengeId);
 
@@ -1821,45 +1864,19 @@ class MiningOrchestrator extends EventEmitter {
         
         if (noPreMineHourChanged && this.currentChallenge) {
           console.log(`[Orchestrator] ⚠️  HOUR BOUNDARY DETECTED: no_pre_mine_hour changed from ${this.currentChallenge.no_pre_mine_hour} to ${challenge.challenge.no_pre_mine_hour}`);
-          console.log(`[Orchestrator] Restarting mining to refresh all workers with new challenge data...`);
+          console.log(`[Orchestrator] Resetting all workers to initial state for hour boundary...`);
           
-          // CRITICAL FIX: Actually restart mining (like stop/start does)
-          // Simply clearing workers isn't enough - we need to restart the mining loop
+          // CRITICAL: Stop mining loop and completely reset all workers (like first launch)
           const wasMining = this.isMining;
           this.isMining = false; // Stop mining loop
           
-          // Stop all active workers - they're using stale challenge data
-          const activeWorkers = Array.from(this.workerAddressAssignment.keys());
-          for (const workerId of activeWorkers) {
-            this.deleteWorkerAssignment(workerId);
-            this.stoppedWorkers.add(workerId); // Signal workers to stop
-            const workerData = this.workerStats.get(workerId);
-            if (workerData && (workerData.status === 'mining' || workerData.status === 'submitting')) {
-              workerData.status = 'idle';
-              workerData.currentChallenge = null;
-              this.workerHashesSinceLastUpdate.delete(workerId);
-            }
-          }
-          
-          // Clear address assignments so workers can restart fresh
-          this.workerAddressAssignment.clear();
-          this.addressToWorkers.clear();
-          
-          // Clear static preimage cache - it's based on challenge data
-          this.staticPreimageCache.clear();
-          
-          // Clear blocked addresses so they can retry immediately with fresh data
-          this.lastMineAttempt.clear();
-          this.addressSubmissionFailures.clear();
-          this.pausedAddresses.clear();
-          this.submittingAddresses.clear();
-          
-          console.log(`[Orchestrator] ✓ Cleared ${activeWorkers.length} worker assignments and all blocked state for hour boundary refresh`);
-          
-          // CRITICAL: Restart mining loop with fresh challenge data
-          // Wait a moment for workers to finish current operations
+          // Give workers time to finish current operations
           await this.sleep(1000);
           
+          // CRITICAL: Completely reset all workers to initial state
+          await this.resetAllWorkers();
+          
+          // CRITICAL: Restart mining loop with fresh challenge data
           if (wasMining && this.isRunning && this.currentChallengeId) {
             console.log(`[Orchestrator] 🔄 Restarting mining loop with fresh challenge data...`);
             this.startMining(); // Restart mining - workers will capture fresh challenge data
@@ -1922,6 +1939,7 @@ class MiningOrchestrator extends EventEmitter {
    * This refreshes the registered addresses list and filters out solved addresses
    * Called before each address iteration to pick up newly registered addresses
    * OPTIMIZATION: Cache registered addresses to avoid filtering every iteration
+   * CRITICAL: Checks persistent storage to ensure addresses registered on disk are included
    */
   private getAvailableAddressesForMining(): DerivedAddress[] {
     const currentChallengeId = this.currentChallengeId;
@@ -1933,7 +1951,15 @@ class MiningOrchestrator extends EventEmitter {
     const now = Date.now();
     const cacheAge = now - this.lastRegisteredAddressesUpdate;
     if (!this.cachedRegisteredAddresses || cacheAge > 5000) {
-      // Refresh cache
+      // Refresh cache - check both in-memory status and persistent storage
+      if (this.walletManager) {
+        // Update in-memory status from persistent storage for any addresses that might have been registered
+        for (const addr of this.addresses) {
+          if (!addr.registered && this.walletManager.isAddressRegistered(addr.index)) {
+            addr.registered = true;
+          }
+        }
+      }
       this.cachedRegisteredAddresses = this.addresses.filter(a => a.registered);
       this.lastRegisteredAddressesUpdate = now;
     }
@@ -4436,6 +4462,39 @@ class MiningOrchestrator extends EventEmitter {
   private async ensureAddressesRegistered(): Promise<void> {
     // Get password from wallet manager context (stored during start)
     const password = (this as any).currentPassword || '';
+    
+    // CRITICAL FIX: Reload addresses from disk first to ensure we have the latest registration status
+    // This prevents attempting to register addresses that are already registered but not yet updated in memory
+    try {
+      if (this.walletManager) {
+        const reloadedAddresses = await this.walletManager.loadWallet(password);
+        const addressMap = new Map(reloadedAddresses.map(a => [a.index, a]));
+        
+        // Update in-memory addresses with latest registration status from disk
+        for (const addr of this.addresses) {
+          const reloaded = addressMap.get(addr.index);
+          if (reloaded) {
+            addr.registered = reloaded.registered;
+          }
+        }
+      }
+    } catch (error: any) {
+      console.warn(`[Orchestrator] Could not reload addresses before registration check: ${error.message}`);
+      // Continue with in-memory state if reload fails
+    }
+    
+    // CRITICAL FIX: Double-check each address against persistent storage
+    // This ensures we catch any addresses that might have been registered but not yet in memory
+    if (this.walletManager) {
+      for (const addr of this.addresses) {
+        // If address is not marked as registered in memory, check persistent storage
+        if (!addr.registered && this.walletManager.isAddressRegistered(addr.index)) {
+          console.log(`[Orchestrator] Address ${addr.index} found registered in persistent storage, updating in-memory status`);
+          addr.registered = true;
+        }
+      }
+    }
+    
     let unregistered = this.addresses.filter(a => !a.registered);
 
     if (unregistered.length === 0) {
@@ -4482,6 +4541,12 @@ class MiningOrchestrator extends EventEmitter {
       
       // Register batch in parallel
       const batchResults = await Promise.allSettled(batch.map(async (addr) => {
+        // CRITICAL: Check if this address is already registered (may have been registered by another process/instance)
+        if (addr.registered) {
+          console.log(`[Orchestrator] Address ${addr.index} is already registered, skipping`);
+          return { addr, success: true, skipped: true };
+        }
+        
         // CRITICAL: Check if this address is already being registered by another parallel batch
         if (addressesBeingRegistered.has(addr.index)) {
           console.warn(`[Orchestrator] ⚠️  Address ${addr.index} is already being registered, skipping duplicate attempt`);
@@ -4643,6 +4708,13 @@ class MiningOrchestrator extends EventEmitter {
       for (const result of batchResults) {
         if (result.status === 'rejected') {
           console.error(`[Orchestrator] Registration promise rejected:`, result.reason);
+        } else if (result.status === 'fulfilled') {
+          const { addr, success, skipped } = result.value;
+          // If address was skipped because it's already registered, count it as success
+          if (skipped && success && addr.registered) {
+            registeredCount++;
+            console.log(`[Orchestrator] Address ${addr.index} was already registered (counted as success)`);
+          }
         }
       }
       
@@ -4760,10 +4832,19 @@ class MiningOrchestrator extends EventEmitter {
   /**
    * Register a single address
    * Handles "already registered" errors gracefully (for multi-computer setups)
+   * CRITICAL: Always checks persistent storage first before attempting registration
    */
   private async registerAddress(addr: DerivedAddress): Promise<void> {
     if (!this.walletManager) {
       throw new Error('Wallet manager not initialized');
+    }
+
+    // CRITICAL FIX: Check persistent storage FIRST before attempting registration
+    // This prevents unnecessary registration attempts and rate limit errors
+    if (this.walletManager.isAddressRegistered(addr.index)) {
+      console.log(`[Orchestrator] Address ${addr.index} is already registered in persistent storage, skipping registration`);
+      addr.registered = true;
+      return; // Address is already registered, no need to attempt registration
     }
 
     try {
@@ -4821,6 +4902,56 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
+   * Completely reset all workers to initial state (like first launch)
+   * This ensures workers are in a clean state when challenge changes or hour flips
+   */
+  private async resetAllWorkers(): Promise<void> {
+    console.log('[Orchestrator] 🔄 Resetting all workers to initial state...');
+    
+    try {
+      // Kill all workers to ensure clean state
+      try {
+        await hashEngine.killWorkers();
+        console.log('[Orchestrator] ✓ All workers killed');
+      } catch (error: any) {
+        console.error('[Orchestrator] Failed to kill workers:', error.message);
+      }
+      
+      // Clear ALL worker-related state
+      this.workerStats.clear();
+      this.workerAddressAssignment.clear();
+      this.stoppedWorkers.clear();
+      this.addressToWorkers.clear();
+      this.workerHashesSinceLastUpdate.clear();
+      
+      // Clear all worker assignment locks
+      this.workerAssignmentLock.clear();
+      
+      // Clear address-related state that blocks workers
+      this.addressSubmissionFailures.clear();
+      this.submittingAddresses.clear();
+      this.pausedAddresses.clear();
+      this.lastMineAttempt.clear();
+      this.addressesProcessedCurrentChallenge.clear();
+      
+      // Clear caches that depend on challenge data
+      this.staticPreimageCache.clear();
+      this.cachedSubmissionKeys.clear();
+      
+      // Reset current mining address
+      this.currentMiningAddress = null;
+      
+      // Reset consecutive recovery attempts
+      this.consecutiveRecoveryAttempts = 0;
+      
+      console.log('[Orchestrator] ✓ All workers reset to initial state');
+    } catch (error: any) {
+      console.error('[Orchestrator] Error resetting workers:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Sleep helper
    */
   private sleep(ms: number): Promise<void> {
@@ -4863,24 +4994,8 @@ class MiningOrchestrator extends EventEmitter {
         // Give workers time to finish current batch
         await this.sleep(2000);
 
-        // Kill all workers to ensure clean state
-        console.log('[Orchestrator] Killing all workers for hourly cleanup...');
-        try {
-          await hashEngine.killWorkers();
-          console.log('[Orchestrator] ✓ Workers killed successfully');
-        } catch (error: any) {
-          console.error('[Orchestrator] Failed to kill workers:', error.message);
-        }
-
-        // Clear worker stats
-        this.workerStats.clear();
-        console.log('[Orchestrator] ✓ Worker stats cleared');
-
-        // Reset state
-        this.addressesProcessedCurrentChallenge.clear();
-        this.pausedAddresses.clear();
-        this.submittingAddresses.clear();
-        console.log('[Orchestrator] ✓ State reset complete');
+        // CRITICAL: Completely reset all workers to initial state (like first launch)
+        await this.resetAllWorkers();
 
         // Wait a bit before restarting
         await this.sleep(1000);
@@ -5763,14 +5878,18 @@ class MiningOrchestrator extends EventEmitter {
       }
     }
     // CRITICAL FIX: Don't delete idle workers too aggressively - they need to be reusable!
-    // Only clean up idle workers that have been idle for > 30 minutes (not 10 minutes)
+    // Only clean up idle workers that have been idle for > 30 minutes AND we're not below expected worker count
     // This ensures workers are available for immediate reuse when new addresses need them
     for (const [workerId, workerData] of this.workerStats.entries()) {
       if (workerData.status === 'idle') {
         const timeSinceUpdate = now - workerData.lastUpdateTime;
-        // Only delete if idle for > 30 minutes (increased from 10 minutes)
+        const currentWorkerCount = this.workerStats.size;
+        const isVeryOld = timeSinceUpdate > 30 * 60 * 1000; // 30 minutes
+        const isBelowExpected = currentWorkerCount <= this.workerThreads;
+        
+        // Only delete if very old AND we're not below expected count
         // This prevents workers from being deleted when they're needed for new addresses
-        if (timeSinceUpdate > 30 * 60 * 1000) { // 30 minutes
+        if (isVeryOld && !isBelowExpected) {
           this.workerStats.delete(workerId);
           // Also clean up assignment and stopped status
           this.deleteWorkerAssignment(workerId);
@@ -6048,18 +6167,38 @@ class MiningOrchestrator extends EventEmitter {
       }
     }
 
-    // Check 15: Clean up old idle workers (been idle for > 5 minutes - more aggressive)
-    // This was in Check 4, but we make it more aggressive here
+    // Check 15: Clean up old idle workers (but preserve workers within expected range)
+    // CRITICAL FIX: Don't delete idle workers that are within the expected worker count
+    // These workers need to be available for immediate reuse when addresses are available
+    // Only clean up excess idle workers that have been idle for > 30 minutes
+    let currentWorkerCount = this.workerStats.size;
+    const idleWorkers: Array<{ workerId: number; timeSinceUpdate: number }> = [];
+    
     for (const [workerId, workerData] of this.workerStats.entries()) {
       if (workerData.status === 'idle') {
         const timeSinceUpdate = now - workerData.lastUpdateTime;
-        if (timeSinceUpdate > 5 * 60 * 1000) { // 5 minutes (reduced from 10)
-          this.workerStats.delete(workerId);
-          // Also clear assignment and stopped status
-          this.deleteWorkerAssignment(workerId);
-          this.stoppedWorkers.delete(workerId);
-          repairsMade++;
-        }
+        idleWorkers.push({ workerId, timeSinceUpdate });
+      }
+    }
+    
+    // Sort by time since update (oldest first)
+    idleWorkers.sort((a, b) => b.timeSinceUpdate - a.timeSinceUpdate);
+    
+    // Only delete idle workers if:
+    // 1. We have more idle workers than expected (workerThreads), OR
+    // 2. Worker has been idle for > 30 minutes AND we're not below expected worker count
+    for (const { workerId, timeSinceUpdate } of idleWorkers) {
+      const isExcessWorker = currentWorkerCount > this.workerThreads;
+      const isVeryOld = timeSinceUpdate > 30 * 60 * 1000; // 30 minutes
+      const isBelowExpected = currentWorkerCount <= this.workerThreads;
+      
+      // Only delete if it's an excess worker OR (very old AND we're not below expected count)
+      if (isExcessWorker || (isVeryOld && !isBelowExpected)) {
+        this.workerStats.delete(workerId);
+        this.deleteWorkerAssignment(workerId);
+        this.stoppedWorkers.delete(workerId);
+        repairsMade++;
+        currentWorkerCount--; // Update count after deletion
       }
     }
 
