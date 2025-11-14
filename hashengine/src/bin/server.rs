@@ -2,6 +2,7 @@ use actix_web::{web, App, HttpResponse, HttpServer, middleware};
 use actix_web::middleware::Compress;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use log::{info, error, warn, debug};
@@ -449,8 +450,8 @@ async fn main() -> std::io::Result<()> {
     .workers(workers)
     // OPTIMIZATION: Increase max connections per worker for high concurrency
     // Default is 256, but with many mining workers, we may need more
-    .client_timeout(180000) // 3 minutes for very large batches
-    .client_disconnect_timeout(180000) // 3 minutes
+    .client_timeout(Duration::from_millis(180000)) // 3 minutes for very large batches
+    .client_disconnect_timeout(Duration::from_millis(180000)) // 3 minutes
     .bind(format!("{}:{}", host, port))?
     .run()
     .await
