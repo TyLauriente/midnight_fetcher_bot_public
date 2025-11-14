@@ -204,8 +204,16 @@ class MiningOrchestrator extends EventEmitter {
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
   private addressSubmissionFailures = new Map<string, number>(); // Track submission failures per address (address+challenge key)
+  private lastMineAttempt = new Map<string, number>(); // Track when we last tried each address (CRITICAL: Must be class property to allow clearing on challenge changes)
   private customBatchSize: number | null = null; // Custom batch size override
   private workerAddressAssignment = new Map<number, string>(); // Track which address each worker is assigned to (workerId -> address bech32)
+  private automaticRecoveryCheckInterval: NodeJS.Timeout | null = null; // Interval for automatic recovery checks
+  private lastAutomaticRecovery = 0; // Timestamp of last automatic recovery (for rate limiting)
+  private automaticRecoveryCooldown = 60000; // Minimum time between automatic recoveries (60 seconds)
+  private consecutiveRecoveryAttempts = 0; // Track consecutive recovery attempts to prevent infinite loops
+  private maxConsecutiveRecoveries = 3; // Maximum consecutive recoveries before giving up (prevents infinite loops)
+  private lastRecoveryResetTime = 0; // Timestamp when consecutive recoveries were reset (after successful mining)
+  private recoveryResetWindow = 300000; // Reset consecutive count after 5 minutes of successful mining
   private hashServiceTimeoutCount = 0; // Track consecutive hash service timeouts for adaptive backoff
   private lastHashServiceTimeout = 0; // Timestamp of last hash service timeout
   private adaptiveBatchSize: number | null = null; // Dynamically reduced batch size when timeouts occur
@@ -1225,6 +1233,9 @@ class MiningOrchestrator extends EventEmitter {
     // Start technical metrics reporting
     this.startTechnicalMetricsReporting();
     
+    // CRITICAL: Start automatic recovery mechanism (detects no active workers and restarts mining)
+    this.startAutomaticRecovery(password, this.addressOffset);
+    
     // CRITICAL: Start adaptive optimizations
     this.startBatchSizeOptimization();
     this.startAdaptiveBatchSizeAdjustment(); // NEW: Start real-time adaptive batch sizing
@@ -1301,6 +1312,12 @@ class MiningOrchestrator extends EventEmitter {
       this.technicalMetricsInterval = null;
     }
     
+    // Clear automatic recovery check interval
+    if (this.automaticRecoveryCheckInterval) {
+      clearInterval(this.automaticRecoveryCheckInterval);
+      this.automaticRecoveryCheckInterval = null;
+    }
+    
     // CRITICAL FIX: Clear adaptive optimization intervals
     if (this.batchOptimizationInterval) {
       clearInterval(this.batchOptimizationInterval);
@@ -1330,6 +1347,7 @@ class MiningOrchestrator extends EventEmitter {
     this.submittingAddresses.clear();
     this.pausedAddresses.clear();
     this.addressSubmissionFailures.clear();
+    this.lastMineAttempt.clear(); // Clear blocked addresses when stopping
     this.cachedSubmissionKeys.clear();
     this.solvedAddressChallenges.clear();
     this.submittedSolutions.clear();
@@ -1711,6 +1729,51 @@ class MiningOrchestrator extends EventEmitter {
         }
 
         this.currentChallenge = challenge.challenge;
+        
+        // CRITICAL FIX: Clear blocked addresses when challenge data changes significantly
+        // This mimics what stop/start does - clears failure state so addresses can retry immediately
+        // This prevents workers from sitting idle when challenge data updates
+        if (this.currentChallenge) {
+          const challengeDataChanged = 
+            challenge.challenge.latest_submission !== this.currentChallenge.latest_submission ||
+            challenge.challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour ||
+            challenge.challenge.difficulty !== this.currentChallenge.difficulty;
+          
+          if (challengeDataChanged) {
+            // CRITICAL FIX: Clear ALL blocked state when challenge data changes
+            // This mimics what stop/start does - completely resets failure state
+            const failuresBefore = this.addressSubmissionFailures.size;
+            const blockedBefore = this.lastMineAttempt.size;
+            const pausedBefore = this.pausedAddresses.size;
+            const submittingBefore = this.submittingAddresses.size;
+            
+            // Clear failure counters for addresses that failed due to stale challenge data
+            // This is what stop() does (line 1339) - we're doing it at runtime
+            this.addressSubmissionFailures.clear();
+            
+            // Clear lastMineAttempt to unblock all addresses for immediate retry
+            // This is what startMining() does (line 2083) - we're doing it at runtime
+            this.lastMineAttempt.clear();
+            
+            // Clear paused and submitting states - these can also block addresses
+            // This ensures addresses aren't stuck in paused/submitting state with stale data
+            this.pausedAddresses.clear();
+            this.submittingAddresses.clear();
+            
+            // Reset consecutive recovery attempts since we're proactively fixing the issue
+            this.consecutiveRecoveryAttempts = 0;
+            
+            if (failuresBefore > 0 || blockedBefore > 0 || pausedBefore > 0 || submittingBefore > 0) {
+              console.log(`[Orchestrator] 🔄 Challenge data changed - cleared ${failuresBefore} failures, ${blockedBefore} blocked, ${pausedBefore} paused, ${submittingBefore} submitting (all addresses can retry immediately)`);
+              
+              // Emit event to notify UI
+              this.emit('error', {
+                type: 'error',
+                message: `Challenge data updated - ${blockedBefore + pausedBefore + submittingBefore} blocked addresses unblocked for immediate retry`,
+              } as MiningEvent);
+            }
+          }
+        }
       }
     }
   }
@@ -1761,16 +1824,18 @@ class MiningOrchestrator extends EventEmitter {
     challengeId: string,
     workerStartId: number,
     workerEndId: number,
-    addressesInProgress: Set<string>,
-    lastMineAttempt: Map<string, number>
+    addressesInProgress: Set<string>
   ): Promise<void> {
     const MAX_SUBMISSION_FAILURES = 6;
-    const MIN_RETRY_DELAY = 30000;
+    // CRITICAL FIX: Reduced retry delay from 30s to 5s
+    // The old 30s delay was causing workers to sit idle when addresses failed
+    // 5 seconds is enough to prevent retry loops while keeping workers busy
+    const MIN_RETRY_DELAY = 5000; // 5 seconds - minimal delay to prevent immediate retry loops
     const now = Date.now();
     
     // CRITICAL: Reset failure counter if we're retrying after delay OR if challenge data changed
     const submissionKey = `${addr.bech32}:${challengeId}`;
-    const lastAttempt = lastMineAttempt.get(addr.bech32);
+    const lastAttempt = this.lastMineAttempt.get(addr.bech32);
     const timeSinceLastAttempt = lastAttempt ? (now - lastAttempt) : 0;
     
     // Check if challenge data has changed since last attempt (indicates stale failures)
@@ -1879,7 +1944,7 @@ class MiningOrchestrator extends EventEmitter {
       // CRITICAL: If challenge changed, clear lastMineAttempt to allow immediate retry on new challenge
       // This prevents addresses from being stuck in retry state when challenge changes
       if (this.currentChallengeId !== challengeId) {
-        lastMineAttempt.delete(addr.bech32);
+        this.lastMineAttempt.delete(addr.bech32);
         // Also clear failure counter for old challenge
         const oldSubmissionKey = `${addr.bech32}:${challengeId}`;
         this.addressSubmissionFailures.delete(oldSubmissionKey);
@@ -1920,7 +1985,7 @@ class MiningOrchestrator extends EventEmitter {
 
     if (addressSolved) {
       console.log(`[Orchestrator] ✓ Address ${addr.index} SOLVED!`);
-      lastMineAttempt.delete(addr.bech32);
+      this.lastMineAttempt.delete(addr.bech32);
     } else {
       console.log(`[Orchestrator] ✗ Address ${addr.index} FAILED after ${MAX_SUBMISSION_FAILURES} attempts.`);
       console.log(`[Orchestrator] Will retry this address after ${MIN_RETRY_DELAY / 1000}s (challenge data may have updated)`);
@@ -1969,6 +2034,11 @@ class MiningOrchestrator extends EventEmitter {
       const submissionKey = `${addr.bech32}:${challengeId}`;
       this.submittingAddresses.delete(submissionKey);
       this.pausedAddresses.delete(submissionKey);
+      
+      // CRITICAL FIX: Set lastMineAttempt to NOW (not in finally block) so retry delay starts immediately
+      // This allows the address to be retried after MIN_RETRY_DELAY, but workers are immediately available
+      // for OTHER addresses that haven't failed yet
+      this.lastMineAttempt.set(addr.bech32, now);
       
       console.log(`[Orchestrator] Cleared worker state for address ${addr.index} - ${workerCount} workers now available for new addresses`);
     }
@@ -2031,8 +2101,10 @@ class MiningOrchestrator extends EventEmitter {
     // Track addresses that are currently being mined to avoid duplicate work
     // But allow retries after failures (don't permanently block addresses)
     const addressesInProgress = new Set<string>();
-    const lastMineAttempt = new Map<string, number>(); // Track when we last tried each address
-    const MIN_RETRY_DELAY = 30000; // Retry failed addresses after 30 seconds
+    // CRITICAL: Use class property lastMineAttempt (not local variable) so it can be cleared when challenge data changes
+    // This allows pollAndMine() to unblock addresses when challenge data updates
+    this.lastMineAttempt.clear(); // Clear any stale entries from previous mining session
+    const MIN_RETRY_DELAY = 5000; // Retry failed addresses after 5 seconds (reduced from 30s to prevent worker idling)
 
     // Mine addresses dynamically - refresh list before each iteration to pick up newly registered addresses
     // This ensures that as addresses finish registering in the background, they automatically become available for mining
@@ -2070,11 +2142,27 @@ class MiningOrchestrator extends EventEmitter {
           return false;
         }
         
-        // Allow retry if enough time has passed since last attempt
-        // CRITICAL: If challenge changed, ignore retry delay (lastMineAttempt cleared above)
-        const lastAttempt = lastMineAttempt.get(addr.bech32);
-        if (lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY) {
-          return false;
+        // CRITICAL FIX: Remove retry delay entirely - it's unnecessary and causes workers to sit idle
+        // When an address fails after 6 attempts, it's because:
+        // 1. Challenge data changed while mining (server rejects solution) - we need NEW solution with NEW data
+        // 2. Network/API errors - retrying immediately won't help, need to wait for network recovery
+        // 3. Solution already submitted - address is already solved, no retry needed
+        // 
+        // The retry delay was based on flawed logic: "wait for challenge data to update"
+        // But if challenge data updated, we need to find a NEW solution, not retry the old one
+        // And we already capture fresh challenge data at the START of each mining attempt (line 2580)
+        // So there's no need to wait - just let addresses be retried naturally when they cycle through
+        // 
+        // If we want to avoid hammering a failing address, we can use a very short delay (2-5 seconds)
+        // just to prevent immediate retry loops, but 30 seconds is way too long and causes worker idling
+        const lastAttempt = this.lastMineAttempt.get(addr.bech32);
+        if (lastAttempt) {
+          // Use a minimal delay (5 seconds) just to prevent immediate retry loops
+          // This is much shorter than the old 30s delay and won't cause worker idling
+          const MIN_RETRY_DELAY = 5000; // 5 seconds - just enough to prevent retry loops
+          if ((now - lastAttempt) < MIN_RETRY_DELAY) {
+            return false;
+          }
         }
         
         return true;
@@ -2088,7 +2176,7 @@ class MiningOrchestrator extends EventEmitter {
       for (let i = 0; i < addressesToMine.length; i++) {
         const addr = addressesToMine[i];
         if (!addressesInProgress.has(addr.bech32)) {
-          const lastAttempt = lastMineAttempt.get(addr.bech32);
+          const lastAttempt = this.lastMineAttempt.get(addr.bech32);
           if (lastAttempt && (now - lastAttempt) < MIN_RETRY_DELAY) {
             addressesWaitingRetry++;
           }
@@ -2161,7 +2249,7 @@ class MiningOrchestrator extends EventEmitter {
         }
         // If no active workers found and it's been > 1 minute, it's stuck (reduced from 2 minutes for faster recovery)
         if (!hasActiveWorker) {
-          const lastAttempt = lastMineAttempt.get(addressBech32);
+          const lastAttempt = this.lastMineAttempt.get(addressBech32);
           if (!lastAttempt || (now - lastAttempt) > 60 * 1000) { // Reduced from 2 minutes to 1 minute
             stuckAddresses.push(addressBech32);
           }
@@ -2172,7 +2260,7 @@ class MiningOrchestrator extends EventEmitter {
       for (const addressBech32 of stuckAddresses) {
         addressesInProgress.delete(addressBech32);
         // Also clear lastMineAttempt to allow immediate retry
-        lastMineAttempt.delete(addressBech32);
+        this.lastMineAttempt.delete(addressBech32);
         // Clear any paused/submitting state for this address
         const pauseKey = `${addressBech32}:${currentChallengeId}`;
         this.pausedAddresses.delete(pauseKey);
@@ -2241,8 +2329,28 @@ class MiningOrchestrator extends EventEmitter {
           continue;
         } else if (addressesWaitingRetry > 0) {
           // Some addresses are waiting for retry delay
-          const nextRetryIn = Math.min(...Array.from(lastMineAttempt.values()).map(t => Math.max(0, MIN_RETRY_DELAY - (now - t))));
-          console.log(`[Orchestrator] ⏳ ${addressesWaitingRetry} addresses waiting for retry (next retry in ${Math.ceil(nextRetryIn / 1000)}s)`);
+          // CRITICAL FIX: If many addresses are waiting retry, reduce delay to keep workers busy
+          // This prevents all workers from sitting idle when many addresses fail
+          const waitingAddresses = Array.from(this.lastMineAttempt.entries()).filter(([_, t]: [string, number]) => (now - t) < MIN_RETRY_DELAY);
+          const nextRetryIn = waitingAddresses.length > 0 
+            ? Math.min(...waitingAddresses.map(([_, t]: [string, number]) => Math.max(0, MIN_RETRY_DELAY - (now - t))))
+            : 0;
+          
+          // CRITICAL: If more than 50% of addresses are waiting retry, reduce delay to 10 seconds
+          // This ensures workers stay busy even when many addresses fail
+          const totalAvailable = addressesToMine.length;
+          const retryRatio = totalAvailable > 0 ? addressesWaitingRetry / totalAvailable : 0;
+          const effectiveRetryDelay = retryRatio > 0.5 ? 10000 : MIN_RETRY_DELAY; // 10s if >50% waiting, else 30s
+          
+          // Allow retries sooner if many addresses are waiting
+          const addressesReadyForRetry = waitingAddresses.filter(([_, t]: [string, number]) => (now - t) >= effectiveRetryDelay);
+          if (addressesReadyForRetry.length > 0) {
+            // Some addresses are ready for retry - continue loop to pick them up
+            console.log(`[Orchestrator] ⚡ ${addressesReadyForRetry.length} addresses ready for retry (${addressesWaitingRetry} total waiting)`);
+            continue; // Don't sleep - immediately continue to pick up retry addresses
+          }
+          
+          console.log(`[Orchestrator] ⏳ ${addressesWaitingRetry} addresses waiting for retry (next retry in ${Math.ceil(nextRetryIn / 1000)}s, ${(retryRatio * 100).toFixed(0)}% of addresses)`);
           await this.sleep(Math.min(5000, nextRetryIn + 1000));
           continue;
         } else if (unregisteredCount > 0) {
@@ -2319,7 +2427,8 @@ class MiningOrchestrator extends EventEmitter {
         // CRITICAL: Add to addressesInProgress BEFORE any async operations
         // This ensures cleanup happens in finally block of mineAddressWithWorkers
         addressesInProgress.add(addr.bech32);
-        lastMineAttempt.set(addr.bech32, now);
+        // CRITICAL FIX: Don't set lastMineAttempt here - it will be set in mineAddressWithWorkers
+        // when the address fails, or deleted when it succeeds. This ensures proper timing.
         
         try {
           // Calculate worker ID range for this address
@@ -2369,12 +2478,12 @@ class MiningOrchestrator extends EventEmitter {
             throw new Error(`Invalid worker range calculation: ${workerStartId}-${workerEndId} for address ${addr.index} (total workers: ${totalUserWorkers})`);
           }
           
-          return this.mineAddressWithWorkers(addr, currentChallengeId, workerStartId, workerEndId, addressesInProgress, lastMineAttempt);
+          return this.mineAddressWithWorkers(addr, currentChallengeId, workerStartId, workerEndId, addressesInProgress);
         } catch (error) {
           // CRITICAL: If mineAddressWithWorkers throws synchronously, clean up immediately
           // (This is unlikely since it's async, but defensive programming)
           addressesInProgress.delete(addr.bech32);
-          lastMineAttempt.delete(addr.bech32);
+          this.lastMineAttempt.delete(addr.bech32);
           throw error;
         }
       });
@@ -5645,6 +5754,204 @@ class MiningOrchestrator extends EventEmitter {
     } else if (this.logLevel === 'debug') {
       console.log(`[Orchestrator] ✓ Stability check complete: No issues detected`);
     }
+  }
+
+  /**
+   * CRITICAL FAILSAFE: Start automatic recovery mechanism
+   * Detects when no workers are active (same logic as UI) and automatically restarts mining
+   * This prevents the app from getting stuck in a state where all workers are idle
+   * Uses the same detection logic as the UI's "No active workers" message
+   * 
+   * @param password - Wallet password for restarting mining
+   * @param addressOffset - Address offset for restarting mining
+   */
+  private startAutomaticRecovery(password: string, addressOffset: number): void {
+    // Clear any existing recovery check
+    if (this.automaticRecoveryCheckInterval) {
+      clearInterval(this.automaticRecoveryCheckInterval);
+    }
+
+    // Track when we first detected no active workers
+    let noActiveWorkersStartTime: number | null = null;
+    const NO_ACTIVE_WORKERS_THRESHOLD = 120000; // 2 minutes of no active workers before recovery
+
+    // Check every 30 seconds for no active workers
+    this.automaticRecoveryCheckInterval = setInterval(() => {
+      if (!this.isRunning || !this.isMining) {
+        // Reset tracking if not running
+        noActiveWorkersStartTime = null;
+        this.consecutiveRecoveryAttempts = 0;
+        return;
+      }
+
+      const now = Date.now();
+
+      // CRITICAL: Use the SAME logic as the UI to detect "No active workers"
+      // The UI checks: workers.size === 0
+      // We check: workerStats with status 'mining' or 'submitting' and updated recently
+      let activeWorkerCount = 0;
+      for (const [workerId, workerData] of this.workerStats.entries()) {
+        // Worker is active if:
+        // 1. Status is 'mining' or 'submitting' (not 'idle' or 'completed')
+        // 2. Updated in the last 2 minutes (actually working, not stuck)
+        if (workerData && (workerData.status === 'mining' || workerData.status === 'submitting')) {
+          const timeSinceUpdate = now - workerData.lastUpdateTime;
+          if (timeSinceUpdate < 120000) { // Updated in last 2 minutes
+            activeWorkerCount++;
+          }
+        }
+      }
+
+      // Check if we have no active workers
+      if (activeWorkerCount === 0) {
+        // First time detecting no active workers - start tracking
+        if (noActiveWorkersStartTime === null) {
+          noActiveWorkersStartTime = now;
+          console.warn(`[Orchestrator] ⚠️  FAILSAFE: No active workers detected (0/${this.workerThreads}). Monitoring for ${NO_ACTIVE_WORKERS_THRESHOLD / 1000}s before auto-recovery...`);
+        } else {
+          // We've been in no-active-workers state for a while
+          const timeInNoWorkersState = now - noActiveWorkersStartTime;
+          
+          if (timeInNoWorkersState >= NO_ACTIVE_WORKERS_THRESHOLD) {
+            // CRITICAL: Check cooldown and consecutive recovery limits
+            const timeSinceLastRecovery = now - this.lastAutomaticRecovery;
+            if (timeSinceLastRecovery < this.automaticRecoveryCooldown) {
+              // Still in cooldown - wait
+              return;
+            }
+
+            // Check consecutive recovery attempts to prevent infinite loops
+            if (this.consecutiveRecoveryAttempts >= this.maxConsecutiveRecoveries) {
+              // Too many consecutive recoveries - something is fundamentally wrong
+              const timeSinceLastReset = now - this.lastRecoveryResetTime;
+              if (timeSinceLastReset < this.recoveryResetWindow) {
+                // Still within reset window - don't recover again
+                console.error(`[Orchestrator] ❌ FAILSAFE: Max consecutive recoveries (${this.maxConsecutiveRecoveries}) reached. Waiting ${Math.ceil((this.recoveryResetWindow - timeSinceLastReset) / 1000)}s before allowing recovery again.`);
+                this.emit('error', {
+                  type: 'error',
+                  message: `Automatic recovery disabled: ${this.maxConsecutiveRecoveries} consecutive recoveries failed. Manual intervention may be required.`,
+                } as MiningEvent);
+                return;
+              } else {
+                // Reset window passed - reset consecutive count and allow recovery
+                console.log(`[Orchestrator] 🔄 FAILSAFE: Recovery reset window passed - resetting consecutive recovery count`);
+                this.consecutiveRecoveryAttempts = 0;
+                this.lastRecoveryResetTime = now;
+              }
+            }
+
+            // Perform automatic recovery
+            console.error(`[Orchestrator] 🚨 FAILSAFE TRIGGERED: No active workers for ${Math.floor(timeInNoWorkersState / 1000)}s. Performing automatic recovery (attempt ${this.consecutiveRecoveryAttempts + 1}/${this.maxConsecutiveRecoveries})...`);
+            
+            this.consecutiveRecoveryAttempts++;
+            this.lastAutomaticRecovery = now;
+            noActiveWorkersStartTime = null; // Reset tracking
+
+            // Emit error event to notify UI
+            this.emit('error', {
+              type: 'error',
+              message: `Automatic recovery triggered: No active workers detected. Restarting mining...`,
+            } as MiningEvent);
+
+            // Perform recovery: mimic stop/start behavior
+            this.performAutomaticRecovery(password, addressOffset).catch((error: any) => {
+              console.error(`[Orchestrator] ❌ FAILSAFE: Automatic recovery failed:`, error);
+              this.emit('error', {
+                type: 'error',
+                message: `Automatic recovery failed: ${error.message}`,
+              } as MiningEvent);
+            });
+          }
+        }
+      } else {
+        // We have active workers - reset tracking
+        if (noActiveWorkersStartTime !== null) {
+          console.log(`[Orchestrator] ✓ FAILSAFE: Active workers restored (${activeWorkerCount}/${this.workerThreads}). Recovery not needed.`);
+          noActiveWorkersStartTime = null;
+          
+          // Reset consecutive recovery count after successful mining period
+          if (this.consecutiveRecoveryAttempts > 0) {
+            const timeSinceLastRecovery = now - this.lastAutomaticRecovery;
+            if (timeSinceLastRecovery >= this.recoveryResetWindow) {
+              console.log(`[Orchestrator] ✓ FAILSAFE: Successful mining for ${Math.floor(timeSinceLastRecovery / 1000)}s - resetting consecutive recovery count`);
+              this.consecutiveRecoveryAttempts = 0;
+              this.lastRecoveryResetTime = now;
+            }
+          }
+        }
+      }
+    }, 30000); // Check every 30 seconds
+
+    console.log('[Orchestrator] ✅ Automatic recovery failsafe started (checks every 30s, triggers after 2min of no active workers)');
+  }
+
+  /**
+   * Perform automatic recovery - mimics stop/start behavior
+   * Clears all blocked state and restarts mining
+   */
+  private async performAutomaticRecovery(password: string, addressOffset: number): Promise<void> {
+    console.log('[Orchestrator] 🔄 Performing automatic recovery: clearing blocked state and restarting mining...');
+
+    // CRITICAL: Clear ALL blocked state (same as stop/start does)
+    const failuresBefore = this.addressSubmissionFailures.size;
+    const blockedBefore = this.lastMineAttempt.size;
+    const pausedBefore = this.pausedAddresses.size;
+    const submittingBefore = this.submittingAddresses.size;
+    const assignmentsBefore = this.workerAddressAssignment.size;
+
+    // Clear failure counters
+    this.addressSubmissionFailures.clear();
+    
+    // Clear blocked addresses
+    this.lastMineAttempt.clear();
+    
+    // Clear paused and submitting states
+    this.pausedAddresses.clear();
+    this.submittingAddresses.clear();
+    
+    // Clear worker assignments (workers will be reassigned)
+    this.workerAddressAssignment.clear();
+    this.addressToWorkers.clear();
+    
+    // Reset all workers to idle so they can be reused
+    for (const [workerId, workerData] of this.workerStats.entries()) {
+      if (workerData) {
+        workerData.status = 'idle';
+        workerData.lastUpdateTime = Date.now();
+        workerData.addressIndex = -1;
+        workerData.address = '';
+      }
+    }
+    
+    // Clear stopped workers set
+    this.stoppedWorkers.clear();
+
+    console.log(`[Orchestrator] 🔄 Recovery: Cleared ${failuresBefore} failures, ${blockedBefore} blocked, ${pausedBefore} paused, ${submittingBefore} submitting, ${assignmentsBefore} assignments`);
+
+    // If mining is still running, the startMining loop will pick up the cleared addresses
+    // We don't need to manually restart - the existing loop will handle it
+    // But we do need to ensure isMining is true so the loop continues
+    if (!this.isMining && this.isRunning && this.currentChallengeId) {
+      console.log('[Orchestrator] 🔄 Recovery: Restarting mining loop...');
+      // Restart mining loop
+      this.startMining().catch((error: any) => {
+        console.error(`[Orchestrator] ❌ Recovery: Failed to restart mining:`, error);
+        throw error;
+      });
+    } else {
+      console.log('[Orchestrator] ✓ Recovery: State cleared. Mining loop will pick up addresses automatically.');
+    }
+
+    // Emit recovery event using system_status
+    this.emit('system_status', {
+      type: 'system_status',
+      state: 'running',
+      message: `Automatic recovery completed: ${blockedBefore + pausedBefore + submittingBefore} blocked addresses cleared`,
+      details: {
+        recoveryPerformed: true,
+        addressesUnblocked: blockedBefore + pausedBefore + submittingBefore,
+      },
+    } as MiningEvent);
   }
 
   /**
