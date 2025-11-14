@@ -394,13 +394,21 @@ async fn main() -> std::io::Result<()> {
             // Very high count: mining_workers + 10 (diminishing returns)
             mining_workers + 10
         };
-        let optimal = std::cmp::min(cpu_count, std::cmp::max(calculated, 4)); // At least 4 workers
-        info!("Mining workers detected: {}, calculating optimal Actix workers: {}", mining_workers, optimal);
+        let optimal = std::cmp::min(cpu_count, std::cmp::max(calculated, 4)); // At least 4 workers, capped at CPU count
+        info!("Mining workers detected: {}, calculating optimal Actix workers: {} (capped at CPU count: {})", mining_workers, optimal, cpu_count);
         (optimal, Some(mining_workers))
     } else {
         // Fall back to explicit WORKERS env var or CPU count
+        // CRITICAL: Always cap at CPU count to prevent oversubscription
         let workers = std::env::var("WORKERS")
-            .map(|w| w.parse::<usize>().unwrap_or(cpu_count))
+            .map(|w| {
+                let requested = w.parse::<usize>().unwrap_or(cpu_count);
+                let capped = std::cmp::min(cpu_count, requested);
+                if requested > cpu_count {
+                    warn!("WORKERS env var ({}) exceeds CPU count ({}), capping at {}", requested, cpu_count, cpu_count);
+                }
+                capped
+            })
             .unwrap_or(cpu_count);
         (workers, None)
     };

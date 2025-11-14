@@ -57,8 +57,8 @@ SETUP_COMMAND = (
 )
 
 ATTACH_DURATION = 1
-DEFAULT_WORKER_THREADS = 77
-DEFAULT_BATCH_SIZE = 500
+DEFAULT_WORKER_THREADS = 200
+DEFAULT_BATCH_SIZE = 850
 
 def stream_output(channel, timeout=None):
     start = time.time()
