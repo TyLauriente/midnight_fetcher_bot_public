@@ -168,6 +168,9 @@ class MiningOrchestrator extends EventEmitter {
   private currentChallenge: Challenge | null = null;
   private totalHashesComputed = 0;
   private lastHashRateUpdate = Date.now();
+  // CRITICAL FIX: Track recent hash counts for rolling window hash rate calculation
+  // This ensures we calculate CURRENT hash rate, not average since start
+  private recentHashCounts: Array<{ timestamp: number; hashes: number }> = []; // Track hashes computed in rolling window
   private hashRateHistory: Array<{ timestamp: number; hashRate: number }> = []; // Track hash rate over time for automatic recovery
   private hashRateMonitorInterval: NodeJS.Timeout | null = null; // Interval for monitoring hash rate
   private lastHashRateRestart: number = 0; // Timestamp of last hash rate triggered restart (for rate limiting)
@@ -668,9 +671,19 @@ class MiningOrchestrator extends EventEmitter {
    * Get current hash rate (helper method)
    */
   private getCurrentHashRate(): number {
+    // CRITICAL FIX: Use same rolling window calculation as getStats()
+    // This ensures consistency between monitoring and dashboard
     const now = Date.now();
-    const elapsedSeconds = (now - this.lastHashRateUpdate) / 1000;
-    return elapsedSeconds > 0 ? this.totalHashesComputed / elapsedSeconds : 0;
+    const WINDOW_SECONDS = 60; // Use 60-second rolling window for current hash rate
+    const windowStart = now - (WINDOW_SECONDS * 1000);
+    
+    // Clean up old entries outside the window
+    this.recentHashCounts = this.recentHashCounts.filter(h => h.timestamp >= windowStart);
+    
+    // Calculate total hashes in the window
+    const hashesInWindow = this.recentHashCounts.reduce((sum, h) => sum + h.hashes, 0);
+    const windowDurationSeconds = WINDOW_SECONDS; // Always use full window for consistent calculation
+    return windowDurationSeconds > 0 ? hashesInWindow / windowDurationSeconds : 0;
   }
   
   /**
@@ -1533,10 +1546,21 @@ class MiningOrchestrator extends EventEmitter {
    * Get current mining stats
    */
   getStats(): MiningStats {
-    // Calculate hash rate
+    // CRITICAL FIX: Calculate hash rate using rolling window (last 60 seconds)
+    // This gives us CURRENT hash rate, not average since start
+    // The old method (totalHashesComputed / elapsedSeconds) was misleading because
+    // it averaged over the entire session, including periods of low activity
     const now = Date.now();
-    const elapsedSeconds = (now - this.lastHashRateUpdate) / 1000;
-    const hashRate = elapsedSeconds > 0 ? this.totalHashesComputed / elapsedSeconds : 0;
+    const WINDOW_SECONDS = 60; // Use 60-second rolling window for current hash rate
+    const windowStart = now - (WINDOW_SECONDS * 1000);
+    
+    // Clean up old entries outside the window
+    this.recentHashCounts = this.recentHashCounts.filter(h => h.timestamp >= windowStart);
+    
+    // Calculate total hashes in the window
+    const hashesInWindow = this.recentHashCounts.reduce((sum, h) => sum + h.hashes, 0);
+    const windowDurationSeconds = WINDOW_SECONDS; // Always use full window for consistent calculation
+    const hashRate = windowDurationSeconds > 0 ? hashesInWindow / windowDurationSeconds : 0;
 
     // Update CPU usage
     this.calculateCpuUsage();
@@ -2207,6 +2231,7 @@ class MiningOrchestrator extends EventEmitter {
     // Reset hash rate tracking
     this.totalHashesComputed = 0;
     this.lastHashRateUpdate = Date.now();
+    this.recentHashCounts = []; // Reset rolling window when starting mining
 
     // CRITICAL: Don't initialize baseline here - wait for registration to complete
     // Baseline will be started in hash rate monitoring when all addresses are registered
@@ -3247,6 +3272,19 @@ class MiningOrchestrator extends EventEmitter {
         
         this.totalHashesComputed += hashesInBatch;
         hashCount += hashesInBatch;
+        
+        // CRITICAL FIX: Track hashes in rolling window for accurate current hash rate
+        // Add this batch to the rolling window
+        const now = Date.now();
+        this.recentHashCounts.push({ timestamp: now, hashes: hashesInBatch });
+        
+        // Clean up old entries (keep only last 60 seconds) - do this periodically to avoid performance issues
+        // Only clean up every 100 batches to avoid overhead
+        if (hashCount % (this.getBatchSize() * 100) === 0) {
+          const WINDOW_MS = 60 * 1000; // 60 seconds
+          const windowStart = now - WINDOW_MS;
+          this.recentHashCounts = this.recentHashCounts.filter(h => h.timestamp >= windowStart);
+        }
 
         // EXTREME OPTIMIZATION: Update worker stats extremely infrequently for maximum tick speed
         // OPTIMIZATION: Cache workerData to avoid repeated Map lookups (cache once per batch)
@@ -5448,6 +5486,7 @@ class MiningOrchestrator extends EventEmitter {
       this.submittedSolutions.clear(); // Clear submitted solutions
       this.totalHashesComputed = 0;
       this.lastHashRateUpdate = Date.now();
+      this.recentHashCounts = []; // Reset rolling window
 
       // Reset hash service timeout tracking
       this.hashServiceTimeoutCount = 0;
@@ -5541,6 +5580,7 @@ class MiningOrchestrator extends EventEmitter {
       this.pausedAddresses.clear();
       this.totalHashesComputed = 0;
       this.lastHashRateUpdate = Date.now();
+      this.recentHashCounts = []; // Reset rolling window
       this.hashRateHistory = []; // Reset history after restart
 
       // Reset hash service timeout tracking
@@ -5806,6 +5846,7 @@ class MiningOrchestrator extends EventEmitter {
       console.log(`[Orchestrator] 🔧 Stability: Resetting hash rate tracking (stale update time)`);
       this.totalHashesComputed = 0;
       this.lastHashRateUpdate = now;
+      this.recentHashCounts = []; // Reset rolling window
       repairsMade++;
     }
 
