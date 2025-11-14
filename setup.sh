@@ -261,7 +261,30 @@ echo "Starting hash server on port 9001..."
 export RUST_LOG=hash_server=info,actix_web=warn
 export HOST=127.0.0.1
 export PORT=9001
-export WORKERS=12
+
+# OPTIMIZATION: Read mining worker count from persistent config file
+# This allows the hash server to auto-scale Actix workers based on your mining configuration
+CONFIG_FILE="secure/mining-config.json"
+if [ -f "$CONFIG_FILE" ]; then
+  # Try to extract workerThreads from config file using grep/sed (works without jq)
+  WORKER_COUNT=$(grep -o '"workerThreads"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_FILE" | grep -o '[0-9]*' | head -1)
+  if [ -n "$WORKER_COUNT" ] && [ "$WORKER_COUNT" -gt 0 ] 2>/dev/null; then
+    export MINING_WORKER_COUNT="$WORKER_COUNT"
+    echo "  - Read mining worker count from config: $WORKER_COUNT"
+    echo "  - Hash server will auto-scale Actix workers based on this value"
+  else
+    echo "  - Config file exists but workerThreads not found, using defaults"
+  fi
+else
+  echo "  - Config file not found, hash server will use CPU count for workers"
+fi
+
+# OPTIMIZATION: Auto-detect CPU count for optimal worker scaling
+# For high-end servers (200+ threads), this will scale appropriately
+# The server will use MINING_WORKER_COUNT if set, otherwise defaults to CPU count
+# You can still override with WORKERS env var if needed
+# Uncomment the line below to manually set worker count (e.g., for testing)
+# export WORKERS=12
 
 nohup ./hashengine/target/release/hash-server > logs/hash-server.log 2>&1 &
 HASH_SERVER_PID=$!

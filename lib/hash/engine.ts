@@ -16,22 +16,36 @@ class HashEngine {
     // Initialize HashClient connection to external hash server
     const hashServiceUrl = process.env.HASH_SERVICE_URL || 'http://127.0.0.1:9001';
     
-    // Dynamically calculate connection pool size based on worker threads
-    // CRITICAL FIX: For low-end systems, use smaller connection pools to avoid resource exhaustion
-    // Low-end systems (< 10 workers): 20-50 connections
-    // Mid-range (10-50 workers): workers * 2
-    // High-end (50+ workers): larger pools for concurrent batches
+    // OPTIMIZATION: Calculate connection pool size based on both mining workers and Actix server workers
+    // Actix-web auto-scales to CPU count (can be 200+ on high-end servers)
+    // Each Actix worker can handle multiple concurrent requests
+    // We need enough connections to saturate all Actix workers with concurrent batches
+    // Formula: max(mining_workers, actix_workers) * concurrent_batches_per_worker
     const workerThreads = parseInt(process.env.MINING_WORKER_THREADS || '11', 10);
+    // Actix workers now auto-scale to CPU count (can be 200+ on high-end servers)
+    // Use environment variable if set, otherwise estimate based on mining workers
+    // For high-end systems, Actix will use all CPU cores, so we should match that
+    const estimatedActixWorkers = parseInt(process.env.HASH_SERVER_WORKERS || workerThreads.toString(), 10);
+    const maxConcurrentWorkers = Math.max(workerThreads, estimatedActixWorkers);
+    
+    // Each worker can send batches concurrently, and Actix can handle multiple requests per worker
+    // Optimal: enough connections to keep all Actix workers busy
+    // For high-end systems (200+ workers), we need proportionally more connections
     let maxConnections: number;
     if (workerThreads < 10) {
-      // Low-end systems: smaller connection pool
-      maxConnections = Math.max(20, workerThreads * 5);
+      // Low-end systems: smaller connection pool but still account for Actix workers
+      maxConnections = Math.max(30, maxConcurrentWorkers * 3);
     } else if (workerThreads < 50) {
-      // Mid-range: moderate connection pool
-      maxConnections = workerThreads * 2;
+      // Mid-range: account for both mining workers and Actix workers
+      maxConnections = maxConcurrentWorkers * 3; // 3x for concurrent batches
+    } else if (workerThreads < 200) {
+      // High-end: large connection pool for maximum concurrency
+      maxConnections = maxConcurrentWorkers * 4; // 4x for high concurrency
     } else {
-      // High-end: large connection pool for concurrent batches
-      maxConnections = Math.max(200, workerThreads * 2);
+      // Very high-end (200+ workers): scale connection pool appropriately
+      // For 200+ workers, we need enough connections to saturate all workers
+      // Formula: workers * 2-3 (each worker can handle 2-3 concurrent batches)
+      maxConnections = Math.max(400, maxConcurrentWorkers * 2); // 2x for very high-end (avoids excessive connections)
     }
     
     // Increase timeout for very large batches (50k hashes can take 30-60 seconds)
@@ -210,6 +224,20 @@ class HashEngine {
       no_pre_mine_first8: this.currentNoPreMine ? this.currentNoPreMine.slice(0, 8) : null,
       no_pre_mine_last8: this.currentNoPreMine ? this.currentNoPreMine.slice(-8) : null,
     };
+  }
+
+  /**
+   * Notify hash server about mining worker count
+   * This helps the server optimize its configuration
+   */
+  async notifyMiningWorkerCount(workerCount: number): Promise<void> {
+    if (!this.hashClient) return;
+    try {
+      await this.hashClient.updateMiningWorkerCount(workerCount);
+    } catch (err: any) {
+      // Don't throw - this is optional optimization
+      console.warn(`[Hash Engine] Failed to notify mining worker count: ${err.message}`);
+    }
   }
 }
 

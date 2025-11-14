@@ -230,6 +230,12 @@ class MiningOrchestrator extends EventEmitter {
       console.log(`[Orchestrator] Updating workerThreads: ${this.workerThreads} -> ${config.workerThreads}`);
       this.workerThreads = config.workerThreads;
       ConfigManager.setWorkerThreads(config.workerThreads);
+      
+      // OPTIMIZATION: Notify hash server about worker count change
+      // This helps the server optimize (though workers are set at startup)
+      hashEngine.notifyMiningWorkerCount(config.workerThreads).catch((err: any) => {
+        console.warn(`[Orchestrator] Failed to notify hash server of worker count change: ${err.message}`);
+      });
     }
     if (config.batchSize !== undefined) {
       console.log(`[Orchestrator] Updating batchSize: ${this.customBatchSize || 'default'} -> ${config.batchSize}`);
@@ -985,6 +991,12 @@ class MiningOrchestrator extends EventEmitter {
     // CRITICAL: Start adaptive optimizations
     this.startBatchSizeOptimization();
     this.startWorkerCountOptimization();
+    
+    // OPTIMIZATION: Notify hash server about mining worker count
+    // This helps the server optimize its configuration (though workers are set at startup)
+    hashEngine.notifyMiningWorkerCount(this.workerThreads).catch((err: any) => {
+      console.warn(`[Orchestrator] Failed to notify hash server of worker count: ${err.message}`);
+    });
 
     // Emit system status: running
     const registeredCount = this.addresses.filter(a => a.registered).length;
