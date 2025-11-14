@@ -40,6 +40,13 @@ interface MiningStats {
   solutionsToday: number;
   solutionsYesterday: number;
   workerThreads: number;
+  config?: {
+    workerThreads: number;
+    batchSize: number;
+    workerGroupingMode: 'auto' | 'all-on-one' | 'grouped';
+    workersPerAddress: number;
+    addressOffset: number;
+  };
 }
 
 interface LogEntry {
@@ -1204,7 +1211,7 @@ function MiningDashboardContent() {
               </div>
 
               {/* Secondary Stats Row */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                 <Card variant="bordered">
                   <CardContent className="p-4">
                     <div className="flex items-center gap-3">
@@ -1225,6 +1232,23 @@ function MiningDashboardContent() {
                         <p className="text-sm text-gray-500">Used Addresses</p>
                         <p className="text-lg font-semibold text-white">
                           {stats.addressesWithReceipts} / {stats.registeredAddresses}
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card variant="bordered">
+                  <CardContent className="p-4">
+                    <div className="flex items-center gap-3">
+                      <MapPin className="w-6 h-6 text-blue-400" />
+                      <div>
+                        <p className="text-sm text-gray-500">Address Offset</p>
+                        <p className="text-lg font-semibold text-white">
+                          {stats.config ? stats.config.addressOffset : 0}
+                          <span className="text-xs text-gray-400 ml-1">
+                            ({((stats.config ? stats.config.addressOffset : 0) * 200)}-{((stats.config ? stats.config.addressOffset : 0) * 200) + 199})
+                          </span>
                         </p>
                       </div>
                     </div>

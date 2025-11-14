@@ -31,37 +31,73 @@ export async function GET() {
     const addressData = miningOrchestrator.getAddressesData();
     const currentChallengeId = addressData?.currentChallengeId || null;
 
-    // Build address list from receipts
-    const enrichedAddresses = Array.from(addressesByIndex.entries())
-      .map(([index, data]) => {
-        // IMPORTANT: If an address has submitted solutions, it MUST be registered
-        // We can't submit solutions without being registered first
-        const hasSolutions = (solutionsByAddress.get(data.bech32) || 0) > 0;
-
-        // Check if we have orchestrator data for additional info
-        let registered = hasSolutions; // Default to true if address has solutions
-        let solvedCurrentChallenge = false;
-
-        if (addressData) {
-          const orchestratorAddr = addressData.addresses.find((a: any) => a.index === index);
-          if (orchestratorAddr) {
-            // If orchestrator says registered, trust it; if not but we have solutions, we know it's registered
-            registered = orchestratorAddr.registered || hasSolutions;
-            solvedCurrentChallenge = currentChallengeId
-              ? addressData.solvedAddressChallenges.get(data.bech32)?.has(currentChallengeId) || false
-              : false;
-          }
+    // Get all addresses from orchestrator (if mining is running) or try to load from wallet
+    let allAddresses: Array<{ index: number; bech32: string; registered: boolean }> = [];
+    
+    if (addressData && addressData.addresses) {
+      // Use addresses from orchestrator (already filtered by addressOffset)
+      allAddresses = addressData.addresses.map((addr: any) => ({
+        index: addr.index,
+        bech32: addr.bech32,
+        registered: addr.registered || false,
+      }));
+    } else {
+      // Try to load addresses from wallet file (read-only, no password needed for derived addresses)
+      try {
+        // Use same directory detection logic as wallet manager
+        const oldSecureDir = path.join(process.cwd(), 'secure');
+        const newDataDir = path.join(
+          process.env.USERPROFILE || process.env.HOME || process.cwd(),
+          'Documents',
+          'MidnightFetcherBot'
+        );
+        
+        const oldDerivedAddressesFile = path.join(oldSecureDir, 'derived-addresses.json');
+        const newDerivedAddressesFile = path.join(newDataDir, 'secure', 'derived-addresses.json');
+        
+        // Check old location first (for existing users)
+        let addressesFile: string | null = null;
+        if (fs.existsSync(oldDerivedAddressesFile)) {
+          addressesFile = oldDerivedAddressesFile;
+        } else if (fs.existsSync(newDerivedAddressesFile)) {
+          addressesFile = newDerivedAddressesFile;
         }
+        
+        if (addressesFile) {
+          const addressesData = JSON.parse(fs.readFileSync(addressesFile, 'utf8'));
+          allAddresses = addressesData.map((addr: any) => ({
+            index: addr.index,
+            bech32: addr.bech32,
+            registered: addr.registered || false,
+          }));
+        }
+      } catch (error: any) {
+        console.error('[API] Failed to load addresses from wallet file:', error.message);
+      }
+    }
 
-        return {
-          index,
-          bech32: data.bech32,
-          registered,
-          solvedCurrentChallenge,
-          totalSolutions: solutionsByAddress.get(data.bech32) || 0,
-        };
-      })
-      .sort((a, b) => a.index - b.index); // Sort by index
+    // Merge addresses: use all addresses from wallet/orchestrator, enrich with receipt data
+    const enrichedAddresses = allAddresses.map(addr => {
+      const receiptData = addressesByIndex.get(addr.index);
+      const solutionCount = solutionsByAddress.get(addr.bech32) || 0;
+      
+      // If address has solutions, it must be registered
+      const registered = addr.registered || solutionCount > 0;
+      
+      // Check if solved current challenge
+      let solvedCurrentChallenge = false;
+      if (addressData && currentChallengeId) {
+        solvedCurrentChallenge = addressData.solvedAddressChallenges.get(addr.bech32)?.has(currentChallengeId) || false;
+      }
+
+      return {
+        index: addr.index,
+        bech32: addr.bech32,
+        registered,
+        solvedCurrentChallenge,
+        totalSolutions: solutionCount,
+      };
+    }).sort((a, b) => a.index - b.index); // Sort by index
 
     // Calculate summary stats
     const summary = {

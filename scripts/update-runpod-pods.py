@@ -59,6 +59,7 @@ SETUP_COMMAND = (
     "git reset --hard origin/known_working_merged_latest && "
     "sh setup.sh"
 )
+PATH_TO_CONFIG = "~/Documents/MidnightFetcherBot/secure/mining-config.json"
 
 ATTACH_DURATION = 1
 DEFAULT_WORKER_THREADS = 200
@@ -107,11 +108,28 @@ def run_host(host, iteration):
 
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
+
+    stream_output(channel, timeout=1)
+    channel.send(
+    'if [ ! -f midnight_fetcher_bot_public/secure/mining-config.json ]; then '
+    'mkdir -p midnight_fetcher_bot_public/secure && '
+    'cat > midnight_fetcher_bot_public/secure/mining-config.json <<EOF\n'
+    '{\n'
+    f'  "addressOffset": 0,\n'
+    f'  "workerThreads": {DEFAULT_WORKER_THREADS},\n'
+    f'  "batchSize": {DEFAULT_BATCH_SIZE},\n'
+    '  "wasMiningActive": true,\n'
+    f'  "lastUpdated": "$(date -Iseconds)"\n'
+    '}\n'
+    'EOF\n'
+    'fi\n'
+    )
     stream_output(channel, timeout=1)
 
-    channel.send(f'sed -i "s/\\"addressOffset\\":[ ]*[0-9]\\+/\\"addressOffset\\": {iteration}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
-    channel.send(f'sed -i "s/\\"workerThreads\\":[ ]*[0-9]\\+/\\"workerThreads\\": {DEFAULT_WORKER_THREADS}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
-    channel.send(f'sed -i "s/\\"batchSize\\":[ ]*[0-9]\\+/\\"batchSize\\": {DEFAULT_BATCH_SIZE}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
+    channel.send(f'mv midnight_fetcher_bot_public/secure/wallet-seed.json.enc ~/Documents/MidnightFetcherBot/secure/wallet-seed.json.enc')
+    channel.send(f'sed -i "s/\\"addressOffset\\":[ ]*[0-9]\\+/\\"addressOffset\\": {1}/" {PATH_TO_CONFIG}\n')
+    channel.send(f'sed -i "s/\\"workerThreads\\":[ ]*[0-9]\\+/\\"workerThreads\\": {DEFAULT_WORKER_THREADS}/" {PATH_TO_CONFIG}\n')
+    channel.send(f'sed -i "s/\\"batchSize\\":[ ]*[0-9]\\+/\\"batchSize\\": {DEFAULT_BATCH_SIZE}/" {PATH_TO_CONFIG}\n')
     stream_output(channel, timeout=1)
 
     channel.send(SETUP_COMMAND + "\n")

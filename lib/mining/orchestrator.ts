@@ -260,20 +260,52 @@ class MiningOrchestrator extends EventEmitter {
       return; // Just return without error if already running
     }
 
-    // Load wallet
+    // Reload config to ensure we have the latest addressOffset (important for auto-start)
+    const latestConfig = configManager.loadConfig();
+    this.addressOffset = latestConfig.addressOffset;
+    console.log(`[Orchestrator] Loaded addressOffset from config: ${this.addressOffset}`);
+
+    // Load wallet manager
     this.walletManager = new WalletManager();
-    const allAddresses = await this.walletManager.loadWallet(password);
 
     // Use addressOffset from config to determine address range
     // addressOffset 0 = addresses 0-199, 1 = 200-399, etc.
     this.addressesPerInstance = parseInt(process.env.MINING_ADDRESSES_PER_INSTANCE || '200', 10);
     const startIndex = this.addressOffset * this.addressesPerInstance;
     const endIndex = startIndex + this.addressesPerInstance;
+    const requiredAddressCount = endIndex; // We need all addresses from 0 to endIndex-1
+
+    console.log(`[Orchestrator] Using addressOffset: ${this.addressOffset} (will use addresses ${startIndex}-${endIndex - 1})`);
+    console.log(`[Orchestrator] Ensuring all addresses up to index ${requiredAddressCount - 1} are generated...`);
+
+    // First, load wallet to check current address count
+    let allAddresses = await this.walletManager.loadWallet(password);
+    const currentAddressCount = allAddresses.length;
+
+    // Check if we need to generate more addresses
+    if (currentAddressCount < requiredAddressCount) {
+      console.log(`[Orchestrator] Current address count: ${currentAddressCount}, required: ${requiredAddressCount}`);
+      console.log(`[Orchestrator] Generating missing addresses (this may take a moment)...`);
+      
+      // Generate all missing addresses up to the required count
+      const finalCount = await this.walletManager.fillMissingAddresses(password, requiredAddressCount);
+      console.log(`[Orchestrator] ✓ Generated addresses up to index ${finalCount - 1}`);
+      
+      // Reload wallet to get all addresses
+      allAddresses = await this.walletManager.loadWallet(password);
+    } else {
+      console.log(`[Orchestrator] ✓ All required addresses already exist (${currentAddressCount} addresses)`);
+    }
+
+    // Filter addresses to the correct range based on addressOffset
     this.addresses = allAddresses.filter(addr => addr.index >= startIndex && addr.index < endIndex);
 
-    console.log(`[Orchestrator] Using addressOffset: ${this.addressOffset} (using addresses ${startIndex}-${endIndex - 1})`);
     console.log(`[Orchestrator] Loaded wallet with ${allAddresses.length} total addresses`);
     console.log(`[Orchestrator] Using ${this.addresses.length} addresses for this instance (indices ${startIndex}-${endIndex - 1})`);
+    
+    if (this.addresses.length < this.addressesPerInstance) {
+      console.warn(`[Orchestrator] ⚠️  Warning: Only ${this.addresses.length} addresses available for range ${startIndex}-${endIndex - 1}, expected ${this.addressesPerInstance}`);
+    }
     
     if (this.addressOffset > 0) {
       console.log(`[Orchestrator] ✓ Multi-computer setup detected - this machine will use a unique address range`);
