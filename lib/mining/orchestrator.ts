@@ -52,6 +52,8 @@ class MiningOrchestrator extends EventEmitter {
   private workerThreads = 11; // Number of parallel mining threads
   private submittedSolutions = new Set<string>(); // Track submitted solution hashes to avoid duplicates
   private solvedAddressChallenges = new Map<string, Set<string>>(); // Map: address -> Set of solved challenge_ids
+  private addressAttemptCounts = new Map<string, number>(); // Track how many times each address has been attempted for current challenge
+  private readonly MAX_ADDRESS_ATTEMPTS = 5; // Maximum attempts per address per challenge before skipping
   private userSolutionsCount = 0; // Track non-dev-fee solutions for dev fee trigger
   private submittingAddresses = new Set<string>(); // Track addresses currently submitting solutions (address+challenge key)
   private pausedAddresses = new Set<string>(); // Track addresses that are paused while submission is in progress
@@ -670,6 +672,7 @@ class MiningOrchestrator extends EventEmitter {
           this.addressesProcessedCurrentChallenge.clear();
           this.pausedAddresses.clear();
           this.submittingAddresses.clear();
+          this.addressAttemptCounts.clear(); // Reset attempt counts for new challenge
           console.log('[Orchestrator] ✓ State reset complete');
 
           // Wait a bit for workers to fully stop
@@ -799,6 +802,9 @@ class MiningOrchestrator extends EventEmitter {
     this.totalHashesComputed = 0;
     this.lastHashRateUpdate = Date.now();
 
+    // Reset attempt counts for new challenge (in case startMining is called multiple times)
+    this.addressAttemptCounts.clear();
+
     // Track which addresses we've already attempted to mine for this challenge
     // This prevents infinite loops if all addresses fail
     const attemptedAddresses = new Set<string>();
@@ -864,14 +870,38 @@ class MiningOrchestrator extends EventEmitter {
     let currentAddressPointer = 0; // Points to actual address in addressesToMine, not filtered array
 
     while (this.isRunning && this.isMining && this.currentChallengeId === currentChallengeId) {
-      // Refilter addresses to exclude newly solved ones
+      // Refilter addresses to exclude newly solved ones and those that exceeded max attempts
       const unsolved = addressesToMine.filter(addr => {
         const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
-        return !solvedChallenges || !solvedChallenges.has(currentChallengeId!);
+        const isSolved = solvedChallenges && solvedChallenges.has(currentChallengeId!);
+        if (isSolved) return false;
+        
+        // Check if address has exceeded max attempts
+        const attemptCount = this.addressAttemptCounts.get(addr.bech32) || 0;
+        if (attemptCount >= this.MAX_ADDRESS_ATTEMPTS) {
+          return false; // Skip addresses that exceeded max attempts
+        }
+        
+        return true;
       });
 
       if (unsolved.length === 0) {
-        console.log(`[Orchestrator] ✓ All ${addressesToMine.length} addresses solved for challenge ${currentChallengeId}`);
+        // Check if all addresses are solved or if they all exceeded max attempts
+        const allSolved = addressesToMine.every(addr => {
+          const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
+          return solvedChallenges && solvedChallenges.has(currentChallengeId!);
+        });
+        
+        if (allSolved) {
+          console.log(`[Orchestrator] ✓ All ${addressesToMine.length} addresses solved for challenge ${currentChallengeId}`);
+        } else {
+          const exceededCount = addressesToMine.filter(addr => {
+            const attemptCount = this.addressAttemptCounts.get(addr.bech32) || 0;
+            return attemptCount >= this.MAX_ADDRESS_ATTEMPTS;
+          }).length;
+          console.log(`[Orchestrator] ⚠️  All remaining addresses exceeded max attempts (${exceededCount} addresses)`);
+          console.log(`[Orchestrator] Stopping mining for this challenge to prevent infinite loop`);
+        }
         console.log(`[Orchestrator] Waiting for new challenge...`);
         this.isMining = false;
         return;
@@ -901,8 +931,9 @@ class MiningOrchestrator extends EventEmitter {
         const addr = addressesToMine[i];
         const solvedChallenges = this.solvedAddressChallenges.get(addr.bech32);
         const isSolved = solvedChallenges && solvedChallenges.has(currentChallengeId!);
+        const attemptCount = this.addressAttemptCounts.get(addr.bech32) || 0;
 
-        if (!isSolved) {
+        if (!isSolved && attemptCount < this.MAX_ADDRESS_ATTEMPTS) {
           batchAddresses.push(addr);
         }
         checked++;
@@ -970,9 +1001,19 @@ class MiningOrchestrator extends EventEmitter {
         if (addressSolved) {
           const prefix = isDevFee ? '[DEV FEE]' : '';
           console.log(`[Orchestrator] ${prefix} ✓ Address ${group.address.index} SOLVED!`);
+          // Reset attempt count for solved address
+          this.addressAttemptCounts.delete(group.address.bech32);
         } else {
           const prefix = isDevFee ? '[DEV FEE]' : '';
-          console.log(`[Orchestrator] ${prefix} ✗ Address ${group.address.index} FAILED after max attempts`);
+          // Increment attempt count for failed address
+          const currentAttempts = this.addressAttemptCounts.get(group.address.bech32) || 0;
+          this.addressAttemptCounts.set(group.address.bech32, currentAttempts + 1);
+          const newAttempts = currentAttempts + 1;
+          if (newAttempts >= this.MAX_ADDRESS_ATTEMPTS) {
+            console.log(`[Orchestrator] ${prefix} ✗ Address ${group.address.index} FAILED after ${newAttempts} attempts (max: ${this.MAX_ADDRESS_ATTEMPTS}) - skipping for this challenge`);
+          } else {
+            console.log(`[Orchestrator] ${prefix} ✗ Address ${group.address.index} FAILED (attempt ${newAttempts}/${this.MAX_ADDRESS_ATTEMPTS})`);
+          }
         }
 
         // Reset dev fee mining flag if this was a dev fee address
