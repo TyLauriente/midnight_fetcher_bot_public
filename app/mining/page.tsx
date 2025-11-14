@@ -1289,23 +1289,24 @@ function MiningDashboardContent() {
         </div>
         {fillMissingError && <Alert variant="error" className="mt-2">{fillMissingError}</Alert>}
 
-        {/* Tab Navigation */}
-        <div className="flex gap-2 border-b border-gray-700">
-          <button
-            onClick={() => setActiveTab('dashboard')}
-            className={cn(
-              'px-6 py-3 font-medium transition-colors relative',
-              activeTab === 'dashboard'
-                ? 'text-blue-400'
-                : 'text-gray-400 hover:text-gray-300'
-            )}
-          >
-            <Activity className="w-4 h-4 inline mr-2" />
-            Dashboard
-            {activeTab === 'dashboard' && (
-              <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-400" />
-            )}
-          </button>
+        {/* Tab Navigation with Persistent Hashrate Counter */}
+        <div className="flex items-center justify-between border-b border-gray-700">
+          <div className="flex gap-2">
+            <button
+              onClick={() => setActiveTab('dashboard')}
+              className={cn(
+                'px-6 py-3 font-medium transition-colors relative',
+                activeTab === 'dashboard'
+                  ? 'text-blue-400'
+                  : 'text-gray-400 hover:text-gray-300'
+              )}
+            >
+              <Activity className="w-4 h-4 inline mr-2" />
+              Dashboard
+              {activeTab === 'dashboard' && (
+                <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-400" />
+              )}
+            </button>
           <button
             onClick={() => setActiveTab('history')}
             className={cn(
@@ -1411,6 +1412,20 @@ function MiningDashboardContent() {
               <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-400" />
             )}
           </button>
+          </div>
+          
+          {/* Persistent Hashrate Counter - Visible in All Tabs */}
+          {stats && (
+            <div className="flex items-center gap-2 px-4 py-2 bg-gray-800/50 rounded-lg border border-gray-700/50 mr-4">
+              <Hash className="w-4 h-4 text-purple-400" />
+              <div className="flex items-baseline gap-1">
+                <span className="text-sm font-semibold text-white tabular-nums">
+                  {stats.hashRate > 0 ? stats.hashRate.toFixed(0) : '---'}
+                </span>
+                <span className="text-xs text-gray-400">H/s</span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Error Display */}

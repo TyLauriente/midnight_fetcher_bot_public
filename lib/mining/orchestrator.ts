@@ -199,6 +199,7 @@ class MiningOrchestrator extends EventEmitter {
   private workerHashesSinceLastUpdate = new Map<number, number>(); // Track hashes since last hash rate update per worker
   private addressToWorkers = new Map<string, Set<number>>(); // Reverse map: address -> Set of workerIds (for fast worker stopping)
   private hexByteLookup = new Map<string, number>(); // Lookup table for hex byte -> number (0-255) to avoid parseInt in hot path
+  private staticPreimageCache = new Map<string, string>(); // Cache static preimage suffix per address+challenge (key: address:challengeId)
   private hourlyRestartTimer: NodeJS.Timeout | null = null; // Timer for hourly restart
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
@@ -1105,6 +1106,7 @@ class MiningOrchestrator extends EventEmitter {
     this.workerAssignmentLock.clear();
     this.workerHashesSinceLastUpdate.clear();
     this.addressToWorkers.clear();
+    this.staticPreimageCache.clear();
 
     this.emit('status', {
       type: 'status',
@@ -1355,8 +1357,9 @@ class MiningOrchestrator extends EventEmitter {
         this.addressSubmissionFailures.clear();
         
         // Clear worker address assignments for new challenge
-        this.workerAddressAssignment.clear();
-        this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
+    this.workerAddressAssignment.clear();
+    this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
+    this.staticPreimageCache.clear(); // Clear preimage cache on challenge change
         
         // Reset hash service timeout tracking for new challenge
         this.hashServiceTimeoutCount = 0;
@@ -2546,18 +2549,24 @@ class MiningOrchestrator extends EventEmitter {
       }
       const batchData: Array<{ nonce: string; preimage: string }> = new Array(batchSize);
       
-      // Pre-build static parts of preimage (address, challenge data) to avoid repeated string operations
-      const addressPart = addr.bech32;
-      const challengeIdPart = challenge.challenge_id.startsWith('**') ? challenge.challenge_id : `**${challenge.challenge_id}`;
-      const staticPreimageParts = [
-        addressPart,
-        challengeIdPart,
-        challenge.difficulty,
-        challenge.no_pre_mine,
-        challenge.latest_submission,
-        challenge.no_pre_mine_hour
-      ];
-      const staticPreimageSuffix = staticPreimageParts.join('');
+      // OPTIMIZATION: Cache static preimage suffix per address+challenge to avoid repeated string operations
+      const preimageCacheKey = `${addr.bech32}:${challengeId}`;
+      let staticPreimageSuffix = this.staticPreimageCache.get(preimageCacheKey);
+      if (!staticPreimageSuffix) {
+        // Build static parts only once per address+challenge combination
+        const addressPart = addr.bech32;
+        const challengeIdPart = challenge.challenge_id.startsWith('**') ? challenge.challenge_id : `**${challenge.challenge_id}`;
+        const staticPreimageParts = [
+          addressPart,
+          challengeIdPart,
+          challenge.difficulty,
+          challenge.no_pre_mine,
+          challenge.latest_submission,
+          challenge.no_pre_mine_hour
+        ];
+        staticPreimageSuffix = staticPreimageParts.join('');
+        this.staticPreimageCache.set(preimageCacheKey, staticPreimageSuffix);
+      }
       
       let actualBatchSize = batchSize;
         for (let i = 0; i < batchSize; i++) {
@@ -2675,8 +2684,9 @@ class MiningOrchestrator extends EventEmitter {
         hashCount += hashesInBatch;
 
         // EXTREME OPTIMIZATION: Update worker stats extremely infrequently for maximum tick speed
-        // OPTIMIZATION: Cache workerData to avoid repeated Map lookups
-        const workerData = this.workerStats.get(workerId);
+        // OPTIMIZATION: Cache workerData to avoid repeated Map lookups (cache once per batch)
+        // CRITICAL: Cache workerData at start of batch processing to avoid repeated lookups
+        let workerData = this.workerStats.get(workerId);
         if (workerData) {
           // EXTREME: Only check assignment every 1000 batches (assignment rarely changes)
           if (batchCounter % 1000 === 0) {
@@ -2685,32 +2695,38 @@ class MiningOrchestrator extends EventEmitter {
               // Worker was reassigned - no logging in hot path
               continue; // Skip this batch
             }
+            // Refresh workerData cache after assignment check (in case it changed)
+            workerData = this.workerStats.get(workerId);
           }
           
           // BUG FIX: Always accumulate hashes, but only calculate hash rate periodically
           // This fixes the issue where hashes weren't being counted correctly
-          workerData.hashesComputed += hashesInBatch;
+          if (workerData) {
+            workerData.hashesComputed += hashesInBatch;
+          }
           
           // EXTREME: Update stats only every 100 batches (20x reduction)
           if (batchCounter % 100 === 0) {
             const now = Date.now();
-            workerData.lastUpdateTime = now;
-            
-            // Update hash rate every 100 batches (20x reduction from before)
-            const lastUpdateTime = workerData.lastHashRateUpdateTime || workerData.startTime;
-            const timeSinceLastUpdate = (now - lastUpdateTime) / 1000;
-            if (timeSinceLastUpdate > 0) {
-              // BUG FIX: Use accumulated hashes correctly - they're already accumulated in the else branch
-              const accumulatedHashes = this.workerHashesSinceLastUpdate.get(workerId) || 0;
-              const instantaneousHashRate = accumulatedHashes / timeSinceLastUpdate;
-              const alpha = 0.3;
-              if (workerData.hashRate === 0) {
-                workerData.hashRate = instantaneousHashRate;
-              } else {
-                workerData.hashRate = alpha * instantaneousHashRate + (1 - alpha) * workerData.hashRate;
+            if (workerData) {
+              workerData.lastUpdateTime = now;
+              
+              // Update hash rate every 100 batches (20x reduction from before)
+              const lastUpdateTime = workerData.lastHashRateUpdateTime || workerData.startTime;
+              const timeSinceLastUpdate = (now - lastUpdateTime) / 1000;
+              if (timeSinceLastUpdate > 0) {
+                // BUG FIX: Use accumulated hashes correctly - they're already accumulated in the else branch
+                const accumulatedHashes = this.workerHashesSinceLastUpdate.get(workerId) || 0;
+                const instantaneousHashRate = accumulatedHashes / timeSinceLastUpdate;
+                const alpha = 0.3;
+                if (workerData.hashRate === 0) {
+                  workerData.hashRate = instantaneousHashRate;
+                } else {
+                  workerData.hashRate = alpha * instantaneousHashRate + (1 - alpha) * workerData.hashRate;
+                }
+                workerData.lastHashRateUpdateTime = now;
+                this.workerHashesSinceLastUpdate.set(workerId, 0);
               }
-              workerData.lastHashRateUpdateTime = now;
-              this.workerHashesSinceLastUpdate.set(workerId, 0);
             }
           } else {
             // Accumulate hashes for next hash rate calculation (no Date.now() call)
@@ -2731,8 +2747,10 @@ class MiningOrchestrator extends EventEmitter {
 
           // OPTIMIZED: Fast inline difficulty check using pre-calculated parameters
           // This is faster than calling matchesDifficulty() for every hash
+          // EXTREME OPTIMIZATION: Cache hash prefix substring to avoid repeated substring calls
           // OPTIMIZATION: parseInt is optimized for hex parsing in modern engines
-          const hashPrefixBE = parseInt(hash.substring(0, 8), 16) >>> 0;
+          const hashPrefix = hash.substring(0, 8);
+          const hashPrefixBE = parseInt(hashPrefix, 16) >>> 0;
           
           // Fast check 1: ShadowHarvester (most restrictive, check first - fastest rejection)
           const shadowHarvesterPass = ((hashPrefixBE | difficultyMask) >>> 0) === difficultyMask;
@@ -2740,25 +2758,27 @@ class MiningOrchestrator extends EventEmitter {
           
           // Fast check 2: Heist Engine (zero bits) - only check if ShadowHarvester passed
           // CRITICAL OPTIMIZATION: Pre-compute zero check string for faster comparison
+          // EXTREME OPTIMIZATION: Reuse hashPrefix for zero byte checking when possible
           let heistEnginePass = true;
           if (fullZeroBytes > 0) {
             // OPTIMIZATION: Use direct string comparison with pre-computed zero string
             // This is faster than character-by-character checking
-            const zeroCheckLength = fullZeroBytes * 2;
-            // OPTIMIZATION: Check if hash starts with required zero bytes using substring
-            // For common cases (1-2 zero bytes), use direct comparison
+            // EXTREME OPTIMIZATION: For 1-2 zero bytes, check hashPrefix directly (already extracted)
             if (fullZeroBytes <= 2) {
-              // Fast path for 1-2 zero bytes (most common)
+              // Fast path for 1-2 zero bytes (most common) - reuse hashPrefix
               if (fullZeroBytes === 1) {
-                heistEnginePass = hash.substring(0, 2) === '00';
+                heistEnginePass = hashPrefix.substring(0, 2) === '00';
               } else {
-                heistEnginePass = hash.substring(0, 4) === '0000';
+                heistEnginePass = hashPrefix === '00000000' || hashPrefix.substring(0, 4) === '0000';
               }
             } else {
               // Slower path for >2 zero bytes - check character by character
-              const maxCheck = Math.min(zeroCheckLength, hash.length);
+              // OPTIMIZATION: Use hashPrefix when possible, fall back to full hash
+              const zeroCheckLength = fullZeroBytes * 2;
+              const checkString = zeroCheckLength <= 8 ? hashPrefix : hash;
+              const maxCheck = Math.min(zeroCheckLength, checkString.length);
               for (let j = 0; j < maxCheck; j += 2) {
-                if (hash.substring(j, j + 2) !== '00') {
+                if (checkString.substring(j, j + 2) !== '00') {
                   heistEnginePass = false;
                   break;
                 }
@@ -2768,8 +2788,9 @@ class MiningOrchestrator extends EventEmitter {
           if (heistEnginePass && remainingZeroBits > 0 && fullZeroBytes * 2 < hash.length) {
             // OPTIMIZATION: Use substring instead of slice, cache the position
             // OPTIMIZATION: Use hexByteLookup instead of parseInt for faster conversion
+            // EXTREME OPTIMIZATION: Reuse hashPrefix if bytePos is within it (0-8 chars)
             const bytePos = fullZeroBytes * 2;
-            const byteHex = hash.substring(bytePos, bytePos + 2);
+            const byteHex = bytePos < 8 ? hashPrefix.substring(bytePos, bytePos + 2) : hash.substring(bytePos, bytePos + 2);
             const byte = this.hexByteLookup.get(byteHex) ?? parseInt(byteHex, 16);
             heistEnginePass = (byte & remainingBitsMask) === 0;
           }
@@ -4756,8 +4777,9 @@ class MiningOrchestrator extends EventEmitter {
       console.log('[Orchestrator] Step 2: Clearing all worker and address state...');
       this.workerStats.clear();
       this.stoppedWorkers.clear();
-      this.workerAddressAssignment.clear();
-      this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
+    this.workerAddressAssignment.clear();
+    this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
+    this.staticPreimageCache.clear(); // Clear preimage cache on challenge change
       this.addressSubmissionFailures.clear();
       this.submittingAddresses.clear();
       this.pausedAddresses.clear();
@@ -4851,8 +4873,9 @@ class MiningOrchestrator extends EventEmitter {
       // Clear worker state
       this.workerStats.clear();
       this.stoppedWorkers.clear();
-      this.workerAddressAssignment.clear();
-      this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
+    this.workerAddressAssignment.clear();
+    this.addressToWorkers.clear(); // Clear reverse map when clearing assignments
+    this.staticPreimageCache.clear(); // Clear preimage cache on challenge change
       this.addressSubmissionFailures.clear();
       this.submittingAddresses.clear();
       this.pausedAddresses.clear();
