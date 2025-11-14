@@ -1415,7 +1415,7 @@ function MiningDashboardContent() {
           </div>
           
           {/* Persistent Hashrate Counter - Visible in All Tabs */}
-          {stats && (
+          {stats && stats.hashRate !== undefined && (
             <div className="flex items-center gap-2 px-4 py-2 bg-gray-800/50 rounded-lg border border-gray-700/50 mr-4">
               <Hash className="w-4 h-4 text-purple-400" />
               <div className="flex items-baseline gap-1">
@@ -1517,7 +1517,7 @@ function MiningDashboardContent() {
                       <div>
                         <p className="text-sm text-gray-400 font-medium">Hash Rate</p>
                         <p className="text-2xl font-bold text-white mt-1">
-                          {stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
+                          {stats.hashRate && stats.hashRate > 0 ? `${stats.hashRate.toFixed(0)}` : '---'}
                           <span className="text-lg text-gray-400 ml-1">H/s</span>
                         </p>
                       </div>
