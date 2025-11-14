@@ -102,29 +102,15 @@ else
     NEXTJS_PID=$!
     echo "   ✓ Next.js server started (PID: $NEXTJS_PID)"
 
-    # Wait for Next.js to be ready with timeout
+    # Wait for Next.js to be ready
     echo "   Waiting for Next.js to initialize..."
-    MAX_RETRIES=15
-    RETRY_COUNT=0
-    NEXTJS_READY=false
+    sleep 8
 
-    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-        sleep 2
-        if curl -s http://localhost:3001 > /dev/null 2>&1; then
-            echo "   ✓ Next.js server is ready!"
-            NEXTJS_READY=true
-            break
-        fi
-        RETRY_COUNT=$((RETRY_COUNT + 1))
-        if [ $((RETRY_COUNT % 3)) -eq 0 ]; then
-            echo "   Still waiting... (${RETRY_COUNT}/${MAX_RETRIES})"
-        fi
-    done
-
-    if [ "$NEXTJS_READY" = false ]; then
-        echo "   ⚠️  Next.js may still be starting or encountered an error"
-        echo "   Check logs/nextjs.log if issues persist"
-        echo "   The server may continue starting in the background"
+    # Check if it's responding
+    if curl -s http://localhost:3001 > /dev/null 2>&1; then
+        echo "   ✓ Next.js server is ready!"
+    else
+        echo "   ⚠️  Next.js may still be starting. Check logs/nextjs.log if issues persist."
     fi
     echo ""
 fi
