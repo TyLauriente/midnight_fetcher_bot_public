@@ -208,6 +208,9 @@ class MiningOrchestrator extends EventEmitter {
   private hourlyRestartTimer: NodeJS.Timeout | null = null; // Timer for hourly restart
   private delayedWorkerResetTimer: NodeJS.Timeout | null = null; // Timer for delayed worker reset after new challenge
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
+  private lastChallengeChangeTime = 0; // Track when challenge last changed (for failure monitoring)
+  private failureCountSinceChallengeChange = 0; // Track failures after challenge change
+  private lastFailureRestartTime = 0; // Track when we last restarted due to failures
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
   private addressSubmissionFailures = new Map<string, number>(); // Track submission failures per address (address+challenge key)
   private lastMineAttempt = new Map<string, number>(); // Track when we last tried each address (CRITICAL: Must be class property to allow clearing on challenge changes)
@@ -1510,6 +1513,192 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
+   * Full restart mining (equivalent to stop + start) without requiring password/addressOffset
+   * This is used when a new challenge is detected to ensure complete clean state
+   * CRITICAL: This does everything that stop() + start() does, but reuses stored password and addressOffset
+   */
+  private async fullRestartMining(): Promise<void> {
+    console.log('[Orchestrator] ========================================');
+    console.log('[Orchestrator] FULL RESTART (Stop + Start equivalent)');
+    console.log('[Orchestrator] ========================================');
+
+    // Get stored password and address offset
+    const password = (this as any).currentPassword || '';
+    if (!password) {
+      console.error('[Orchestrator] Cannot restart - no password stored');
+      return;
+    }
+
+    const addressOffset = this.addressOffset;
+
+    // CRITICAL: Do full stop() equivalent
+    const wasRunning = this.isRunning;
+    this.isRunning = false;
+    this.isMining = false;
+
+    // Clear all timers
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    if (this.hourlyRestartTimer) {
+      clearTimeout(this.hourlyRestartTimer);
+      this.hourlyRestartTimer = null;
+    }
+    if (this.delayedWorkerResetTimer) {
+      clearTimeout(this.delayedWorkerResetTimer);
+      this.delayedWorkerResetTimer = null;
+    }
+    if (this.hashRateMonitorInterval) {
+      clearInterval(this.hashRateMonitorInterval);
+      this.hashRateMonitorInterval = null;
+    }
+    if (this.stabilityCheckInterval) {
+      clearInterval(this.stabilityCheckInterval);
+      this.stabilityCheckInterval = null;
+    }
+    if (this.technicalMetricsInterval) {
+      clearInterval(this.technicalMetricsInterval);
+      this.technicalMetricsInterval = null;
+    }
+    if (this.automaticRecoveryCheckInterval) {
+      clearInterval(this.automaticRecoveryCheckInterval);
+      this.automaticRecoveryCheckInterval = null;
+    }
+    if (this.batchOptimizationInterval) {
+      clearInterval(this.batchOptimizationInterval);
+      this.batchOptimizationInterval = null;
+    }
+    if (this.workerOptimizationInterval) {
+      clearInterval(this.workerOptimizationInterval);
+      this.workerOptimizationInterval = null;
+    }
+    if (this.adaptiveBatchSizeAdjustmentInterval) {
+      clearInterval(this.adaptiveBatchSizeAdjustmentInterval);
+      this.adaptiveBatchSizeAdjustmentInterval = null;
+    }
+
+    // CRITICAL: Destroy hash client connection pool (like stop() does)
+    try {
+      const hashClient = (hashEngine as any).hashClient;
+      if (hashClient && typeof hashClient.destroy === 'function') {
+        hashClient.destroy();
+        console.log('[Orchestrator] Hash client connection pool destroyed');
+      }
+    } catch (error) {
+      console.warn('[Orchestrator] Error destroying hash client:', error);
+    }
+
+    // CRITICAL: Kill all workers (like resetAllWorkers() but also destroys hash client)
+    try {
+      await hashEngine.killWorkers();
+      console.log('[Orchestrator] ✓ All workers killed');
+    } catch (error: any) {
+      console.error('[Orchestrator] Failed to kill workers:', error.message);
+    }
+
+    // CRITICAL: Clear ALL state (like stop() does)
+    this.workerStats.clear();
+    this.workerAddressAssignment.clear();
+    this.stoppedWorkers.clear();
+    this.submittingAddresses.clear();
+    this.pausedAddresses.clear();
+    this.addressSubmissionFailures.clear();
+    this.lastMineAttempt.clear();
+    this.cachedSubmissionKeys.clear();
+    this.solvedAddressChallenges.clear();
+    this.submittedSolutions.clear();
+    this.addressesProcessedCurrentChallenge.clear();
+    this.workerAssignmentLock.clear();
+    this.workerHashesSinceLastUpdate.clear();
+    this.addressToWorkers.clear();
+    this.staticPreimageCache.clear();
+    this.batchPerformanceHistory = [];
+    this.recentBatchMetrics = [];
+    this.batchSizeChangeHistory = [];
+    this.workerPerformanceHistory = [];
+    this.optimalBatchSize = null;
+    this.currentBatchSizeTarget = null;
+    this.optimalWorkerCount = null;
+    this.hashRateHistory = [];
+    this.lastHashRateRestart = 0;
+
+    // Reset adaptive state
+    this.hashServiceTimeoutCount = 0;
+    this.lastHashServiceTimeout = 0;
+    this.adaptiveBatchSize = null;
+    this.consecutiveRecoveryAttempts = 0;
+
+    // Invalidate caches
+    this.cachedRegisteredAddresses = null;
+    this.lastRegisteredAddressesUpdate = 0;
+    this.cachedReceiptCount = null;
+    this.lastReceiptCountUpdate = 0;
+
+    console.log('[Orchestrator] ✓ Full stop complete - all state cleared');
+
+    // Wait a moment for cleanup
+    await this.sleep(500);
+
+    // CRITICAL: Now do start() equivalent - but only if we were running
+    if (wasRunning && this.currentChallenge && this.currentChallengeId) {
+      console.log('[Orchestrator] Restarting mining with fresh state...');
+
+      // Initialize ROM (like start() does when challenge is detected)
+      const noPreMine = this.currentChallenge.no_pre_mine;
+      console.log('[Orchestrator] Initializing ROM for restart...');
+      await hashEngine.initRom(noPreMine);
+
+      const maxWait = 60000;
+      const startWait = Date.now();
+      while (!hashEngine.isRomReady() && (Date.now() - startWait) < maxWait) {
+        await this.sleep(500);
+      }
+
+      if (!hashEngine.isRomReady()) {
+        console.error('[Orchestrator] ROM initialization timeout during restart');
+        return;
+      }
+
+      console.log('[Orchestrator] ✓ ROM ready');
+
+      // CRITICAL: Notify hash server about worker count (like start() does)
+      hashEngine.notifyMiningWorkerCount(this.workerThreads).catch((err: any) => {
+        console.warn(`[Orchestrator] Failed to notify hash server of worker count: ${err.message}`);
+      });
+
+      // Restart all the intervals and monitoring (like start() does)
+      this.isRunning = true;
+      this.startTime = this.startTime || Date.now(); // Keep original start time
+      this.solutionsFound = 0;
+
+      // Restart polling
+      this.pollLoop();
+
+      // Restart all monitoring and optimization
+      this.scheduleHourlyRestart(password, addressOffset);
+      this.startHashRateMonitoring(password, addressOffset);
+      this.startStabilityChecks();
+      this.startTechnicalMetricsReporting();
+      this.startAutomaticRecovery(password, addressOffset);
+      this.startBatchSizeOptimization();
+      this.startAdaptiveBatchSizeAdjustment();
+      this.startWorkerCountOptimization();
+
+      // Start mining
+      if (!this.isMining) {
+        this.startMining();
+      }
+
+      console.log('[Orchestrator] ========================================');
+      console.log('[Orchestrator] FULL RESTART COMPLETE');
+      console.log('[Orchestrator] ========================================');
+    } else {
+      console.log('[Orchestrator] Not restarting - was not running or no challenge');
+    }
+  }
+
+  /**
    * Calculate CPU usage percentage
    */
   private calculateCpuUsage(): number {
@@ -1746,87 +1935,29 @@ class MiningOrchestrator extends EventEmitter {
         console.log('[Orchestrator] Challenge data:', JSON.stringify(challenge.challenge, null, 2));
         console.log('[Orchestrator] ========================================');
 
-        // IMPORTANT: Stop any ongoing mining first to prevent ROM errors
-        if (this.isMining) {
-          console.log('[Orchestrator] Stopping current mining for new challenge...');
-          this.isMining = false;
-          // Wait a bit for workers to finish their current batch
-          await this.sleep(1000);
-        }
-
         // CRITICAL: Save old challenge ID before updating (needed for cleanup)
         const oldChallengeId = this.currentChallengeId;
 
-        // CRITICAL: Completely reset all workers to initial state (like first launch)
-        // This ensures workers are in a clean state for the new challenge
-        await this.resetAllWorkers();
-
-        // Reset challenge progress tracking
-        this.addressesProcessedCurrentChallenge.clear();
-        this.submittedSolutions.clear(); // Clear submitted solutions for new challenge
-        
-        // Reset hash service timeout tracking for new challenge
-        this.hashServiceTimeoutCount = 0;
-        this.lastHashServiceTimeout = 0;
-        this.adaptiveBatchSize = null; // Reset adaptive batch size on new challenge
-        
-        // CRITICAL: Clean up all stale state for old challenge
-        // This prevents addresses/workers from getting stuck in old challenge states
-        this.cleanupStaleChallengeState(oldChallengeId);
-        
-        // CRITICAL FIX: Clean up solvedAddressChallenges for old challenges
-        // Remove old challenge IDs from all addresses to prevent unbounded growth
-        let cleanedSolvedChallenges = 0;
-        for (const [address, solvedChallenges] of this.solvedAddressChallenges.entries()) {
-          // Keep only the current challenge (if address has solved it)
-          // This prevents the Set from growing unbounded with old challenge IDs
-          if (challengeId && solvedChallenges.has(challengeId)) {
-            // Address has solved current challenge - keep only current challenge
-            const oldSize = solvedChallenges.size;
-            solvedChallenges.clear();
-            solvedChallenges.add(challengeId);
-            cleanedSolvedChallenges += oldSize - 1;
-          } else {
-            // Address hasn't solved current challenge - clear all old challenges
-            const oldSize = solvedChallenges.size;
-            solvedChallenges.clear();
-            cleanedSolvedChallenges += oldSize;
-          }
-        }
-        if (cleanedSolvedChallenges > 0) {
-          console.log(`[Orchestrator] Cleaned ${cleanedSolvedChallenges} old solved challenge IDs (prevented memory leak)`);
-        }
-        
-        // OPTIMIZATION: Invalidate registered addresses cache to force refresh
-        this.cachedRegisteredAddresses = null;
-        this.lastRegisteredAddressesUpdate = 0;
-        
-        // OPTIMIZATION: Clear submission key cache on challenge change (keys are challenge-specific)
-        this.cachedSubmissionKeys.clear();
-        
-        console.log(`[Orchestrator] Cleared all address failure counters for new challenge`);
-
-        // Initialize ROM
-        const noPreMine = challenge.challenge.no_pre_mine;
-        console.log('[Orchestrator] Initializing ROM for new challenge...');
-        await hashEngine.initRom(noPreMine);
-
-        // Wait for ROM to be ready
-        const maxWait = 60000;
-        const startWait = Date.now();
-
-        while (!hashEngine.isRomReady() && (Date.now() - startWait) < maxWait) {
-          await this.sleep(500);
-        }
-
-        if (!hashEngine.isRomReady()) {
-          throw new Error('ROM initialization timeout');
-        }
-
-        console.log('[Orchestrator] ROM ready');
-
+        // CRITICAL: Update challenge data FIRST before full restart
+        // This ensures fullRestartMining() has the new challenge data
         this.currentChallengeId = challengeId;
         this.currentChallenge = challenge.challenge;
+
+        // CRITICAL: Track when challenge changed for failure monitoring
+        this.lastChallengeChangeTime = Date.now();
+        this.failureCountSinceChallengeChange = 0;
+        this.lastFailureRestartTime = 0;
+
+        // CRITICAL: Do FULL RESTART (equivalent to Stop + Start) immediately with no delay
+        // This ensures complete clean state like pressing Stop then Start buttons
+        console.log('[Orchestrator] Performing FULL RESTART (Stop + Start equivalent) for new challenge...');
+        try {
+          await this.fullRestartMining();
+          console.log('[Orchestrator] ✓ Full restart complete for new challenge');
+        } catch (restartError: any) {
+          console.error('[Orchestrator] ❌ Full restart failed for new challenge:', restartError.message);
+          // Try to continue anyway - the delayed reset will catch it
+        }
 
         // CRITICAL: Clear all failure counters for old challenge - they're no longer relevant
         // New challenge means fresh start for all addresses
@@ -1838,15 +1969,15 @@ class MiningOrchestrator extends EventEmitter {
           oldChallengeFailures.forEach(key => this.addressSubmissionFailures.delete(key));
         }
 
-        // CRITICAL: Schedule delayed worker reset 30 seconds after new challenge
-        // This catches any stragglers that might still be processing old challenge data
+        // CRITICAL: Schedule delayed check 30 seconds after new challenge (backup safety net)
+        // Since we do full restart immediately, this is just a verification check
         // Clear any existing delayed reset timer first
         if (this.delayedWorkerResetTimer) {
           clearTimeout(this.delayedWorkerResetTimer);
           this.delayedWorkerResetTimer = null;
         }
         
-        console.log('[Orchestrator] Scheduling delayed worker reset in 30 seconds...');
+        console.log('[Orchestrator] Scheduling delayed verification check in 30 seconds (backup safety net)...');
         this.delayedWorkerResetTimer = setTimeout(async () => {
           if (!this.isRunning || this.currentChallengeId !== challengeId) {
             // Challenge changed again or mining stopped, skip reset
@@ -1855,248 +1986,30 @@ class MiningOrchestrator extends EventEmitter {
             return;
           }
           
-          console.log('[Orchestrator] ========================================');
-          console.log('[Orchestrator] DELAYED WORKER RESET (30s after new challenge)');
-          console.log('[Orchestrator] ========================================');
+          // CRITICAL: Backup verification check - verify mining is running properly
+          // Since we do full restart immediately, this is just a safety check
+          if (!this.isRunning || this.currentChallengeId !== challengeId) {
+            console.log('[Orchestrator] Skipping delayed verification - conditions changed');
+            this.delayedWorkerResetTimer = null;
+            return;
+          }
           
-          // Track recovery state
-          let resetSuccessful = false;
-          let romInitialized = false;
-          let miningRestarted = false;
+          // Check if mining is active and workers are working
+          const activeWorkers = Array.from(this.workerStats.values()).filter(w => 
+            w.status === 'mining' || w.status === 'submitting'
+          ).length;
           
-          try {
-            // CRITICAL: Check conditions before starting reset
-            if (!this.isRunning || this.currentChallengeId !== challengeId) {
-              console.log('[Orchestrator] Skipping delayed worker reset - conditions changed before reset started');
-              this.delayedWorkerResetTimer = null;
-              return;
-            }
-            
-            // Stop mining temporarily
-            const wasMining = this.isMining;
-            this.isMining = false;
-            
-            // Give workers time to finish current batch
-            await this.sleep(1000);
-            
-            // CRITICAL: Check conditions again after sleep
-            if (!this.isRunning || this.currentChallengeId !== challengeId) {
-              console.log('[Orchestrator] Skipping delayed worker reset - conditions changed during reset');
-              this.delayedWorkerResetTimer = null;
-              // Try to resume mining if it was running
-              if (wasMining && this.isRunning && this.currentChallenge && this.currentChallengeId) {
-                this.isMining = false;
-                this.startMining().catch(err => {
-                  console.error('[Orchestrator] Failed to resume mining after condition change:', err.message);
-                });
-              }
-              return;
-            }
-            
-            // Reset all workers to initial state
+          if (!this.isMining || activeWorkers === 0) {
+            console.log('[Orchestrator] ⚠️ Delayed verification: Mining not active or no workers, performing backup restart...');
+            // Do backup full restart
             try {
-              await this.resetAllWorkers();
-              resetSuccessful = true;
-              console.log('[Orchestrator] ✓ Workers reset successfully');
-            } catch (resetError: any) {
-              console.error('[Orchestrator] ❌ Failed to reset workers:', resetError.message);
-              // Continue anyway - try to recover
+              await this.fullRestartMining();
+              console.log('[Orchestrator] ✓ Backup restart complete');
+            } catch (backupError: any) {
+              console.error('[Orchestrator] ❌ Backup restart failed:', backupError.message);
             }
-            
-            // CRITICAL: Reinitialize ROM to ensure it's ready for mining
-            // This is necessary because resetAllWorkers() might have cleared ROM state
-            if (this.currentChallenge && this.isRunning && this.currentChallengeId === challengeId) {
-              console.log('[Orchestrator] Reinitializing ROM after delayed worker reset...');
-              const noPreMine = this.currentChallenge.no_pre_mine;
-              
-              try {
-                // Try ROM initialization with retry logic
-                let romInitAttempts = 0;
-                const maxRomAttempts = 3;
-                let romInitSuccess = false;
-                
-                while (romInitAttempts < maxRomAttempts && !romInitSuccess && this.isRunning && this.currentChallengeId === challengeId) {
-                  romInitAttempts++;
-                  try {
-                    await hashEngine.initRom(noPreMine);
-                    
-                    // Wait for ROM to be ready with timeout
-                    const maxWait = 60000;
-                    const startWait = Date.now();
-                    while (!hashEngine.isRomReady() && (Date.now() - startWait) < maxWait) {
-                      // Check if conditions changed during wait
-                      if (!this.isRunning || this.currentChallengeId !== challengeId) {
-                        console.log('[Orchestrator] Conditions changed during ROM initialization wait');
-                        break;
-                      }
-                      await this.sleep(500);
-                    }
-                    
-                    if (hashEngine.isRomReady()) {
-                      romInitSuccess = true;
-                      romInitialized = true;
-                      console.log('[Orchestrator] ✓ ROM reinitialized successfully');
-                    } else if (romInitAttempts < maxRomAttempts) {
-                      console.warn(`[Orchestrator] ⚠️ ROM not ready after attempt ${romInitAttempts}/${maxRomAttempts}, retrying...`);
-                      await this.sleep(2000); // Wait before retry
-                    }
-                  } catch (romError: any) {
-                    console.error(`[Orchestrator] ❌ ROM initialization attempt ${romInitAttempts} failed:`, romError.message);
-                    if (romInitAttempts < maxRomAttempts) {
-                      await this.sleep(2000); // Wait before retry
-                    }
-                  }
-                }
-                
-                if (!romInitialized) {
-                  console.error('[Orchestrator] ❌ ROM initialization failed after all retry attempts');
-                  // Check if ROM is already ready (maybe from previous initialization)
-                  if (hashEngine.isRomReady()) {
-                    console.log('[Orchestrator] ✓ ROM was already ready, continuing...');
-                    romInitialized = true;
-                  }
-                }
-              } catch (romInitError: any) {
-                console.error('[Orchestrator] ❌ ROM initialization error:', romInitError.message);
-                // Check if ROM is already ready as fallback
-                if (hashEngine.isRomReady()) {
-                  console.log('[Orchestrator] ✓ ROM was already ready (fallback), continuing...');
-                  romInitialized = true;
-                }
-              }
-            }
-            
-            // Wait a bit before restarting to ensure everything is ready
-            await this.sleep(1000);
-            
-            // CRITICAL: Restart mining if it was running
-            // Double-check all conditions before restarting
-            if (wasMining && this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
-              // Try to restart mining even if ROM initialization had issues
-              // The mining loop will handle ROM readiness checks
-              if (!romInitialized && !hashEngine.isRomReady()) {
-                console.warn('[Orchestrator] ⚠️ ROM not ready, but attempting to restart mining anyway (mining loop will handle ROM)');
-              }
-              
-              console.log('[Orchestrator] Resuming mining after delayed worker reset...');
-              // CRITICAL: Ensure isMining is false before calling startMining (it sets it to true)
-              this.isMining = false;
-              
-              try {
-                await this.startMining();
-                // Verify mining actually started
-                if (this.isMining) {
-                  miningRestarted = true;
-                  console.log('[Orchestrator] ✓ Mining resumed successfully');
-                } else {
-                  console.error('[Orchestrator] ❌ Mining failed to start after delayed reset - isMining is still false');
-                  // Try one more time after a short delay
-                  await this.sleep(2000);
-                  if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
-                    this.isMining = false;
-                    await this.startMining();
-                    if (this.isMining) {
-                      miningRestarted = true;
-                      console.log('[Orchestrator] ✓ Mining resumed successfully on retry');
-                    }
-                  }
-                }
-              } catch (startError: any) {
-                console.error('[Orchestrator] ❌ Failed to start mining after delayed reset:', startError.message);
-                console.error('[Orchestrator] Stack:', startError.stack);
-                // Try one more time after a delay
-                await this.sleep(3000);
-                if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
-                  try {
-                    this.isMining = false;
-                    await this.startMining();
-                    if (this.isMining) {
-                      miningRestarted = true;
-                      console.log('[Orchestrator] ✓ Mining resumed successfully on error recovery');
-                    }
-                  } catch (retryError: any) {
-                    console.error('[Orchestrator] ❌ Mining retry after error also failed:', retryError.message);
-                  }
-                }
-              }
-            } else {
-              console.warn('[Orchestrator] ⚠️ Cannot resume mining after delayed reset:', {
-                wasMining,
-                isRunning: this.isRunning,
-                hasChallenge: !!this.currentChallenge,
-                challengeIdMatch: this.currentChallengeId === challengeId,
-                romReady: hashEngine.isRomReady()
-              });
-            }
-            
-            // Final status report
-            console.log('[Orchestrator] ========================================');
-            console.log('[Orchestrator] DELAYED WORKER RESET COMPLETE');
-            console.log('[Orchestrator] Status:', {
-              resetSuccessful,
-              romInitialized,
-              miningRestarted,
-              isMining: this.isMining,
-              isRunning: this.isRunning,
-              hasChallenge: !!this.currentChallenge,
-              challengeId: this.currentChallengeId
-            });
-            console.log('[Orchestrator] ========================================');
-            
-            // CRITICAL: If mining didn't restart, try one final recovery attempt
-            if (wasMining && !miningRestarted && this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
-              console.warn('[Orchestrator] ⚠️ Mining did not restart, attempting final recovery...');
-              await this.sleep(5000);
-              if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
-                try {
-                  this.isMining = false;
-                  await this.startMining();
-                  if (this.isMining) {
-                    console.log('[Orchestrator] ✓ Mining resumed successfully on final recovery attempt');
-                  } else {
-                    console.error('[Orchestrator] ❌ Final recovery attempt failed - mining may need manual restart');
-                    // Emit error event so UI can notify user
-                    this.emit('error', {
-                      type: 'error',
-                      message: 'Mining failed to restart after delayed worker reset. Please check logs and restart manually if needed.',
-                    } as MiningEvent);
-                  }
-                } catch (finalError: any) {
-                  console.error('[Orchestrator] ❌ Final recovery attempt failed:', finalError.message);
-                  this.emit('error', {
-                    type: 'error',
-                    message: `Mining failed to restart after delayed worker reset: ${finalError.message}`,
-                  } as MiningEvent);
-                }
-              }
-            }
-          } catch (error: any) {
-            console.error('[Orchestrator] ❌ Delayed worker reset failed with unexpected error:', error.message);
-            console.error('[Orchestrator] Stack:', error.stack);
-            
-            // CRITICAL: Try to resume mining anyway if conditions are met
-            if (this.isRunning && this.currentChallenge && this.currentChallengeId === challengeId) {
-              console.log('[Orchestrator] Attempting emergency recovery - resuming mining after error...');
-              try {
-                this.isMining = false;
-                await this.startMining();
-                if (this.isMining) {
-                  console.log('[Orchestrator] ✓ Emergency recovery successful - mining resumed');
-                } else {
-                  console.error('[Orchestrator] ❌ Emergency recovery failed - mining did not start');
-                  this.emit('error', {
-                    type: 'error',
-                    message: 'Emergency recovery after delayed worker reset failed. Mining may need manual restart.',
-                  } as MiningEvent);
-                }
-              } catch (recoveryError: any) {
-                console.error('[Orchestrator] ❌ Emergency recovery failed:', recoveryError.message);
-                this.emit('error', {
-                  type: 'error',
-                  message: `Emergency recovery failed: ${recoveryError.message}. Mining may need manual restart.`,
-                } as MiningEvent);
-              }
-            }
+          } else {
+            console.log('[Orchestrator] ✓ Delayed verification: Mining active with', activeWorkers, 'workers');
           }
           
           this.delayedWorkerResetTimer = null;
@@ -2444,10 +2357,42 @@ class MiningOrchestrator extends EventEmitter {
       console.log(`[Orchestrator] ✗ Address ${addr.index} FAILED after ${MAX_SUBMISSION_FAILURES} attempts.`);
       console.log(`[Orchestrator] Will retry this address after ${MIN_RETRY_DELAY / 1000}s (challenge data may have updated)`);
       
+      // CRITICAL: Track failures after challenge change for automatic restart
+      const now = Date.now();
+      const timeSinceChallengeChange = this.lastChallengeChangeTime > 0 ? (now - this.lastChallengeChangeTime) : Infinity;
+      const FAILURE_MONITORING_WINDOW = 60000; // 1 minute after challenge change
+      
+      if (timeSinceChallengeChange < FAILURE_MONITORING_WINDOW) {
+        this.failureCountSinceChallengeChange++;
+        console.log(`[Orchestrator] ⚠️ Failure ${this.failureCountSinceChallengeChange} after challenge change (${Math.floor(timeSinceChallengeChange / 1000)}s ago)`);
+        
+        // CRITICAL: If we see 3+ failures within 1 minute of challenge change, do another full restart
+        // This handles cases where the initial restart didn't fully clear state
+        if (this.failureCountSinceChallengeChange >= 3) {
+          const timeSinceLastRestart = now - this.lastFailureRestartTime;
+          const RESTART_COOLDOWN = 10000; // 10 seconds between restart attempts
+          
+          if (timeSinceLastRestart > RESTART_COOLDOWN) {
+            console.log('[Orchestrator] ========================================');
+            console.log('[Orchestrator] MULTIPLE FAILURES DETECTED after challenge change');
+            console.log(`[Orchestrator] ${this.failureCountSinceChallengeChange} failures within ${Math.floor(timeSinceChallengeChange / 1000)}s of challenge change`);
+            console.log('[Orchestrator] Performing additional FULL RESTART to clear state...');
+            console.log('[Orchestrator] ========================================');
+            
+            this.lastFailureRestartTime = now;
+            this.failureCountSinceChallengeChange = 0; // Reset counter
+            
+            // Do full restart in background (don't block)
+            this.fullRestartMining().catch((restartError: any) => {
+              console.error('[Orchestrator] Additional restart after failures failed:', restartError.message);
+            });
+          }
+        }
+      }
+      
       // CRITICAL FIX: Clear worker state for this address and ensure workers are immediately available for reuse
       // This ensures workers are available for other addresses and don't remain in a failed state
       const workerCount = workerEndId - workerStartId;
-      const now = Date.now();
       for (let i = 0; i < workerCount; i++) {
         const workerId = workerStartId + i;
         // Clear worker assignment so worker can be assigned to new address
