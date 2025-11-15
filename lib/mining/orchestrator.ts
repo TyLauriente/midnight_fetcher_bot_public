@@ -205,7 +205,6 @@ class MiningOrchestrator extends EventEmitter {
   private addressToWorkers = new Map<string, Set<number>>(); // Reverse map: address -> Set of workerIds (for fast worker stopping)
   private hexByteLookup = new Map<string, number>(); // Lookup table for hex byte -> number (0-255) to avoid parseInt in hot path
   private staticPreimageCache = new Map<string, string>(); // Cache static preimage suffix per address+challenge (key: address:challengeId)
-  private hourlyRestartTimer: NodeJS.Timeout | null = null; // Timer for hourly restart
   private delayedWorkerResetTimer: NodeJS.Timeout | null = null; // Timer for delayed worker reset after new challenge
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
   private lastChallengeChangeTime = 0; // Track when challenge last changed (for failure monitoring)
@@ -1309,9 +1308,6 @@ class MiningOrchestrator extends EventEmitter {
     // Start polling
     this.pollLoop();
 
-    // Schedule hourly restart to clean workers and reset state
-    this.scheduleHourlyRestart(password, this.addressOffset);
-
     // Start hash rate monitoring for automatic recovery
     this.startHashRateMonitoring(password, this.addressOffset);
 
@@ -1377,12 +1373,6 @@ class MiningOrchestrator extends EventEmitter {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
-    }
-
-    // Clear hourly restart timer
-    if (this.hourlyRestartTimer) {
-      clearTimeout(this.hourlyRestartTimer);
-      this.hourlyRestartTimer = null;
     }
 
     // Clear delayed worker reset timer
@@ -1541,10 +1531,6 @@ class MiningOrchestrator extends EventEmitter {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
-    if (this.hourlyRestartTimer) {
-      clearTimeout(this.hourlyRestartTimer);
-      this.hourlyRestartTimer = null;
-    }
     if (this.delayedWorkerResetTimer) {
       clearTimeout(this.delayedWorkerResetTimer);
       this.delayedWorkerResetTimer = null;
@@ -1676,7 +1662,6 @@ class MiningOrchestrator extends EventEmitter {
       this.pollLoop();
 
       // Restart all monitoring and optimization
-      this.scheduleHourlyRestart(password, addressOffset);
       this.startHashRateMonitoring(password, addressOffset);
       this.startStabilityChecks();
       this.startTechnicalMetricsReporting();
@@ -2059,38 +2044,8 @@ class MiningOrchestrator extends EventEmitter {
           challenge.challenge.difficulty !== this.currentChallenge.difficulty
         );
         
-        // CRITICAL FIX: If no_pre_mine_hour changed (hour boundary), we MUST stop workers
-        // Workers are using stale challenge data and generating invalid preimages
-        const noPreMineHourChanged = this.currentChallenge && 
-          challenge.challenge.no_pre_mine_hour !== this.currentChallenge.no_pre_mine_hour;
-        
-        if (noPreMineHourChanged && this.currentChallenge) {
-          console.log(`[Orchestrator] ⚠️  HOUR BOUNDARY DETECTED: no_pre_mine_hour changed from ${this.currentChallenge.no_pre_mine_hour} to ${challenge.challenge.no_pre_mine_hour}`);
-          console.log(`[Orchestrator] Resetting all workers to initial state for hour boundary...`);
-          
-          // CRITICAL: Stop mining loop and completely reset all workers (like first launch)
-          const wasMining = this.isMining;
-          this.isMining = false; // Stop mining loop
-          
-          // Give workers time to finish current operations
-          await this.sleep(1000);
-          
-          // CRITICAL: Completely reset all workers to initial state
-          await this.resetAllWorkers();
-          
-          // CRITICAL: Restart mining loop with fresh challenge data
-          if (wasMining && this.isRunning && this.currentChallengeId) {
-            console.log(`[Orchestrator] 🔄 Restarting mining loop with fresh challenge data...`);
-            this.startMining(); // Restart mining - workers will capture fresh challenge data
-          }
-          
-          // Emit status event to notify UI of challenge data update
-          this.emit('status', {
-            type: 'status',
-            active: this.isRunning,
-            challengeId: this.currentChallengeId,
-          } as MiningEvent);
-        }
+        // Note: no_pre_mine_hour changes are handled by challenge change detection above
+        // No need for separate hour boundary handling - challenge changes trigger full restart
         
         // Update currentChallenge AFTER handling the change
         this.currentChallenge = challenge.challenge;
@@ -5236,91 +5191,6 @@ class MiningOrchestrator extends EventEmitter {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Schedule hourly restart to clean workers and prepare for new challenges
-   */
-  private scheduleHourlyRestart(password: string, addressOffset: number): void {
-    // Calculate milliseconds until the end of the current hour
-    const now = new Date();
-    const nextHour = new Date(now);
-    nextHour.setHours(now.getHours() + 1, 0, 0, 0); // Set to next hour at :00:00
-    const msUntilNextHour = nextHour.getTime() - now.getTime();
-
-    console.log(`[Orchestrator] Hourly restart scheduled in ${Math.round(msUntilNextHour / 1000 / 60)} minutes (at ${nextHour.toLocaleTimeString()})`);
-
-    // Clear any existing timer
-    if (this.hourlyRestartTimer) {
-      clearTimeout(this.hourlyRestartTimer);
-    }
-
-    // Schedule the restart
-    this.hourlyRestartTimer = setTimeout(async () => {
-      if (!this.isRunning) {
-        console.log('[Orchestrator] Hourly restart skipped - mining not active');
-        return;
-      }
-
-      console.log('[Orchestrator] ========================================');
-      console.log('[Orchestrator] HOURLY RESTART - Cleaning workers and state');
-      console.log('[Orchestrator] ========================================');
-
-      try {
-        // Stop current mining
-        console.log('[Orchestrator] Stopping mining for hourly cleanup...');
-        this.isMining = false;
-
-        // Give workers time to finish current batch
-        await this.sleep(2000);
-
-        // CRITICAL: Completely reset all workers to initial state (like first launch)
-        await this.resetAllWorkers();
-
-        // Wait a bit before restarting
-        await this.sleep(1000);
-
-        // Reinitialize ROM if we have a challenge
-        if (this.currentChallenge) {
-          console.log('[Orchestrator] Reinitializing ROM...');
-          const noPreMine = this.currentChallenge.no_pre_mine;
-          await hashEngine.initRom(noPreMine);
-
-          const maxWait = 60000;
-          const startWait = Date.now();
-          while (!hashEngine.isRomReady() && (Date.now() - startWait) < maxWait) {
-            await this.sleep(500);
-          }
-
-          if (hashEngine.isRomReady()) {
-            console.log('[Orchestrator] ✓ ROM reinitialized successfully');
-          } else {
-            console.error('[Orchestrator] ROM initialization timeout after hourly restart');
-          }
-        }
-
-        console.log('[Orchestrator] ========================================');
-        console.log('[Orchestrator] HOURLY RESTART COMPLETE - Resuming mining');
-        console.log('[Orchestrator] ========================================');
-
-        // Resume mining if still running
-        if (this.isRunning && this.currentChallenge && this.currentChallengeId) {
-          this.startMining();
-        }
-
-        // Schedule next hourly restart
-        this.scheduleHourlyRestart(password, addressOffset);
-
-      } catch (error: any) {
-        console.error('[Orchestrator] Hourly restart failed:', error.message);
-        // Try to resume mining anyway
-        if (this.isRunning && this.currentChallenge && this.currentChallengeId) {
-          this.startMining();
-        }
-        // Still schedule next restart
-        this.scheduleHourlyRestart(password, addressOffset);
-      }
-    }, msUntilNextHour);
   }
 
   /**
