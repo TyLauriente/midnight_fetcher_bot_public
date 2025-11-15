@@ -680,6 +680,8 @@ function MiningDashboardContent() {
   }, [stats?.active]);
 
   // CRITICAL FIX: Cleanup on page unload/refresh to prevent memory leaks
+  // Note: We don't close on visibilitychange (tab switching) - connection stays alive
+  // Connection is only closed on actual page unload/refresh or when replaced by new connection
   useEffect(() => {
     const handleBeforeUnload = () => {
       console.log('[Mining Dashboard] Page unloading, closing EventSource');
@@ -689,28 +691,16 @@ function MiningDashboardContent() {
       }
     };
 
-    const handleVisibilityChange = () => {
-      // Close connection when tab becomes hidden (user switches tabs)
-      // This helps prevent connection buildup
-      if (document.hidden && eventSourceRef.current) {
-        console.log('[Mining Dashboard] Tab hidden, closing EventSource');
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
-    };
-
-    // Add event listeners for cleanup
+    // Add event listeners for cleanup on actual page close/refresh
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('unload', handleBeforeUnload);
-    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     // Cleanup listeners
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('unload', handleBeforeUnload);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
       
-      // Final cleanup of EventSource
+      // Final cleanup of EventSource (only on component unmount, not tab switch)
       if (eventSourceRef.current) {
         console.log('[Mining Dashboard] Final cleanup - closing EventSource');
         eventSourceRef.current.close();
