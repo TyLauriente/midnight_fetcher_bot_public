@@ -161,6 +161,8 @@ class MiningOrchestrator extends EventEmitter {
   private addressesPerRange: number = 200; // Number of addresses per range
   private cachedRegisteredAddresses: DerivedAddress[] | null = null; // Cache registered addresses to avoid filtering every iteration
   private lastRegisteredAddressesUpdate = 0; // Timestamp of last cache update
+  private cachedReceiptCount: number | null = null; // Cache receipt count to avoid reading all receipts every time
+  private lastReceiptCountUpdate = 0; // Timestamp of last receipt count cache update
   private hasLoggedFullWorkerRestore = false; // Track if we've logged the transition to full worker count after registration
   private solutionsFound = 0;
   private startTime: number | null = null;
@@ -1617,10 +1619,42 @@ class MiningOrchestrator extends EventEmitter {
     const timePeriodSolutions = this.calculateTimePeriodSolutions();
     
     // CRITICAL FIX: Calculate solutions found from receipts for accuracy
-    // This ensures the count is accurate even after restarts
-    const allReceipts = receiptsLogger.readReceipts();
-    const userReceipts = allReceipts.filter(r => !r.isDevFee);
-    const totalSolutionsFound = userReceipts.length;
+    // OPTIMIZATION: Cache receipt count to avoid reading all receipts every time (prevents memory issues)
+    // Only refresh cache every 10 seconds to reduce file I/O
+    const nowForReceipts = Date.now();
+    const receiptCacheAge = nowForReceipts - (this.lastReceiptCountUpdate || 0);
+    if (!this.cachedReceiptCount || receiptCacheAge > 10000) {
+      try {
+        // CRITICAL: Only read receipts if cache is stale, and limit processing
+        // Use getRecentReceipts with a reasonable limit to avoid memory issues
+        const MAX_RECEIPTS_TO_READ = 10000; // Limit to prevent memory issues
+        const recentReceipts = receiptsLogger.getRecentReceipts(MAX_RECEIPTS_TO_READ);
+        const userReceipts = recentReceipts.filter(r => !r.isDevFee);
+        this.cachedReceiptCount = userReceipts.length;
+        
+        // If we got the max, there might be more - add estimate
+        if (recentReceipts.length >= MAX_RECEIPTS_TO_READ) {
+          // Try to get total count without loading all receipts
+          try {
+            const allReceipts = receiptsLogger.readReceipts();
+            const allUserReceipts = allReceipts.filter(r => !r.isDevFee);
+            this.cachedReceiptCount = allUserReceipts.length;
+          } catch (error: any) {
+            // If reading all receipts fails (memory issue), use cached count
+            console.warn('[Orchestrator] Could not read all receipts, using cached count:', error.message);
+          }
+        }
+        
+        this.lastReceiptCountUpdate = nowForReceipts;
+      } catch (error: any) {
+        console.error('[Orchestrator] Error reading receipts for stats:', error.message);
+        // Use cached count if available, otherwise 0
+        if (!this.cachedReceiptCount) {
+          this.cachedReceiptCount = 0;
+        }
+      }
+    }
+    const totalSolutionsFound = this.cachedReceiptCount || 0;
 
     // OPTIMIZATION: Use cached registered addresses count
     const nowForStats = Date.now();
@@ -4358,6 +4392,9 @@ class MiningOrchestrator extends EventEmitter {
       }
 
       this.solutionsFound++;
+      // CRITICAL: Invalidate receipt count cache when new solution is found
+      this.cachedReceiptCount = null;
+      this.lastReceiptCountUpdate = 0;
 
       // Track user solutions vs dev fee solutions
       if (isDevFee) {

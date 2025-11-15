@@ -51,7 +51,22 @@ export async function GET() {
       // Send initial stats
       try {
         const initialStats = miningOrchestrator.getStats();
-        const data = `data: ${JSON.stringify({ type: 'stats', stats: initialStats })}\n\n`;
+        // CRITICAL FIX: Add error handling for JSON.stringify to prevent crashes on large objects
+        let data: string;
+        try {
+          data = `data: ${JSON.stringify({ type: 'stats', stats: initialStats })}\n\n`;
+        } catch (jsonError: any) {
+          console.error('[Stream] JSON.stringify failed for initial stats:', jsonError.message);
+          // Send minimal stats if serialization fails
+          data = `data: ${JSON.stringify({ 
+            type: 'stats', 
+            stats: { 
+              active: initialStats.active,
+              challengeId: initialStats.challengeId,
+              error: 'Stats serialization failed - object too large'
+            } 
+          })}\n\n`;
+        }
         controller.enqueue(encoder.encode(data));
       } catch (error) {
         console.error('Error sending initial stats:', error);
@@ -62,7 +77,15 @@ export async function GET() {
       const onEvent = (event: MiningEvent) => {
         if (isClosed) return;
         try {
-          const data = `data: ${JSON.stringify(event)}\n\n`;
+          // CRITICAL FIX: Add error handling for JSON.stringify to prevent crashes on large objects
+          let data: string;
+          try {
+            data = `data: ${JSON.stringify(event)}\n\n`;
+          } catch (jsonError: any) {
+            console.error('[Stream] JSON.stringify failed for event:', jsonError.message, 'Event type:', event.type);
+            // Skip this event if serialization fails (object too large)
+            return;
+          }
           controller.enqueue(encoder.encode(data));
         } catch (error) {
           console.error('Error sending event:', error);
@@ -93,7 +116,22 @@ export async function GET() {
         if (isClosed) return;
         try {
           const stats = miningOrchestrator.getStats();
-          const data = `data: ${JSON.stringify({ type: 'stats', stats })}\n\n`;
+          // CRITICAL FIX: Add error handling for JSON.stringify to prevent crashes on large objects
+          let data: string;
+          try {
+            data = `data: ${JSON.stringify({ type: 'stats', stats })}\n\n`;
+          } catch (jsonError: any) {
+            console.error('[Stream] JSON.stringify failed for periodic stats:', jsonError.message);
+            // Send minimal stats if serialization fails
+            data = `data: ${JSON.stringify({ 
+              type: 'stats', 
+              stats: { 
+                active: stats.active,
+                challengeId: stats.challengeId,
+                error: 'Stats serialization failed - object too large'
+              } 
+            })}\n\n`;
+          }
           controller.enqueue(encoder.encode(data));
         } catch (error) {
           console.error('Error sending periodic stats:', error);
