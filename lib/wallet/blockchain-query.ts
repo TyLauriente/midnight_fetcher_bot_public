@@ -21,10 +21,6 @@
 
 import { WalletManager, DerivedAddress } from './manager';
 import { StakeKeyQuery } from './stake-key-query';
-import { MidnightApiQuery } from './midnight-api-query';
-import axios from 'axios';
-
-const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
 
 export interface AddressRegistrationInfo {
   address: string;
@@ -57,22 +53,8 @@ export class BlockchainQuery {
    * The registration endpoint behavior can indicate if address is registered
    */
   private static async checkAddressRegistration(address: string): Promise<boolean> {
-    try {
-      // Try to get T&C for this address - if it's registered, this should work
-      // Note: This is a heuristic - the actual registration check might need a different endpoint
-      const response = await axios.get(`${MINING_API_BASE}/TandC`, {
-        timeout: 10000,
-        validateStatus: () => true, // Don't throw on any status
-      });
-      
-      // If we get a 200, the address might be registered
-      // If we get 404/400, it's likely not registered
-      // This is a heuristic - actual implementation depends on API behavior
-      return response.status === 200;
-    } catch (error: any) {
-      // Network errors or timeouts suggest address might not be registered
-      return false;
-    }
+    console.warn('[BlockchainQuery] Midnight HTTP API is retired; registration checks via API are skipped.');
+    return false;
   }
 
   /**
@@ -84,30 +66,8 @@ export class BlockchainQuery {
     lastSubmission?: string;
     challenges: string[];
   }> {
-    try {
-      // Try to query submissions for this address
-      // NOTE: This endpoint may not exist - depends on API design
-      const response = await axios.get(`${MINING_API_BASE}/address/${address}/submissions`, {
-        timeout: 10000,
-        validateStatus: () => true,
-      });
-
-      if (response.status === 200 && response.data) {
-        return {
-          count: response.data.count || 0,
-          lastSubmission: response.data.lastSubmission,
-          challenges: response.data.challenges || [],
-        };
-      }
-    } catch (error: any) {
-      // Endpoint might not exist - that's okay
-    }
-
-    // Fallback: return empty if endpoint doesn't exist
-    return {
-      count: 0,
-      challenges: [],
-    };
+    console.warn(`[BlockchainQuery] Midnight submission API disabled; skipping submission lookup for ${address}.`);
+    return { count: 0, challenges: [] };
   }
 
   /**
@@ -139,65 +99,7 @@ export class BlockchainQuery {
   ): Promise<WalletMiningStats> {
     console.log(`[BlockchainQuery] Starting query for registered addresses...`);
     
-    // METHOD 0: Query Midnight API using signature verification (OPTIMAL - most reliable!)
-    // Uses the actual registration signature process to detect registered addresses
-    // - Signs T&C message with each address's private key
-    // - Attempts registration
-    // - If "already registered" error, address is registered!
-    try {
-      console.log(`[BlockchainQuery] Attempting Midnight API query with signature verification (OPTIMAL)...`);
-      console.log(`[BlockchainQuery] This uses the actual registration process to detect registered addresses!`);
-      console.log(`[BlockchainQuery] Signs T&C message and attempts registration to detect which addresses are registered.`);
-      
-      const midnightAddresses = await MidnightApiQuery.queryRegisteredAddresses(
-        mnemonic,
-        maxCount,
-        batchSize, // Use smaller batch size for registration endpoint
-        progressCallback,
-        false // Don't actually register new addresses, just detect
-      );
-      
-      if (midnightAddresses.length > 0) {
-        console.log(`[BlockchainQuery] ✅ Midnight API query found ${midnightAddresses.length} registered addresses!`);
-        
-        // Convert to WalletMiningStats format
-        const registeredAddresses: AddressRegistrationInfo[] = midnightAddresses.map(addr => ({
-          address: addr.address,
-          addressIndex: addr.addressIndex,
-          isRegistered: addr.isRegistered,
-          registrationChecked: true,
-        }));
-        
-        const addressesWithSubmissions: AddressSubmissionInfo[] = midnightAddresses
-          .filter(addr => addr.hasSubmissions)
-          .map(addr => ({
-            address: addr.address,
-            addressIndex: addr.addressIndex,
-            submissionCount: addr.submissionCount || 0,
-            lastSubmissionTime: addr.lastSubmissionTime,
-            challenges: [], // Would need to query separately or from receipts
-          }));
-        
-        const totalSubmissions = addressesWithSubmissions.reduce((sum, addr) => sum + addr.submissionCount, 0);
-        const uniqueChallenges = new Set<string>();
-        
-        return {
-          totalAddressesChecked: maxCount, // We checked up to maxCount addresses
-          registeredAddresses,
-          addressesWithSubmissions,
-          totalSubmissions,
-          uniqueChallenges: Array.from(uniqueChallenges),
-        };
-      } else {
-        console.log(`[BlockchainQuery] Midnight API query returned no registered addresses.`);
-        console.log(`[BlockchainQuery] This might mean endpoints don't exist or addresses aren't registered yet.`);
-        console.log(`[BlockchainQuery] Falling back to address generation + individual checks...`);
-      }
-    } catch (error: any) {
-      console.warn(`[BlockchainQuery] Midnight API query failed: ${error.message}`);
-      console.warn(`[BlockchainQuery] Falling back to address generation + individual checks...`);
-      console.warn(`[BlockchainQuery] Note: This might mean the Midnight API doesn't expose these endpoints.`);
-    }
+    console.warn('[BlockchainQuery] Midnight HTTP API has been retired; skipping direct API-based registration discovery.');
 
     let allAddresses: DerivedAddress[] = [];
     let addressesToCheck: string[] = [];

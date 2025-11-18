@@ -24,8 +24,6 @@ import { Lucid } from 'lucid-cardano';
 import axios from 'axios';
 import { WalletManager } from './manager';
 
-const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
-
 // Cardano blockchain explorer APIs (try multiple for reliability)
 const BLOCKFROST_API = 'https://cardano-mainnet.blockfrost.io/api/v0';
 const KOIOS_API = 'https://api.koios.rest/api/v0';
@@ -358,55 +356,7 @@ export class StakeKeyQuery {
     const registeredAddresses: RegisteredAddressInfo[] = [];
 
     if (checkMiningApi) {
-      console.log('[StakeKeyQuery] Checking which addresses are registered with mining API...');
-      
-      // Batch check addresses (check 10 at a time)
-      const batchSize = 10;
-      for (let i = 0; i < blockchainAddresses.length; i += batchSize) {
-        const batch = blockchainAddresses.slice(i, i + batchSize);
-        const batchPromises = batch.map(async (address, idx) => {
-          const globalIndex = i + idx;
-          try {
-            // Check if address is registered by trying to get T&C
-            // If registered, this should work
-            const response = await axios.get(`${MINING_API_BASE}/TandC`, {
-              timeout: 5000,
-              validateStatus: () => true,
-            });
-
-            // Heuristic: If we get a response, address might be registered
-            // Actual implementation depends on API behavior
-            const isRegistered = response.status === 200;
-
-            return {
-              address,
-              addressIndex: globalIndex,
-              isRegistered,
-              hasSubmissions: false, // Would need to query separately
-            } as RegisteredAddressInfo;
-          } catch (error) {
-            return {
-              address,
-              addressIndex: globalIndex,
-              isRegistered: false,
-              hasSubmissions: false,
-            } as RegisteredAddressInfo;
-          }
-        });
-
-        const results = await Promise.all(batchPromises);
-        registeredAddresses.push(...results.filter(r => r.isRegistered));
-
-        // Rate limiting
-        if (i + batchSize < blockchainAddresses.length) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-
-        // Progress logging
-        if (i % 100 === 0) {
-          console.log(`[StakeKeyQuery] Checked ${i}/${blockchainAddresses.length} addresses, found ${registeredAddresses.length} registered`);
-        }
-      }
+      console.warn('[StakeKeyQuery] Midnight HTTP API has been retired; skipping mining API registration checks.');
     } else {
       // Just return all addresses from blockchain
       blockchainAddresses.forEach((address, index) => {

@@ -3,8 +3,8 @@
  * Handles submission of mining solutions with dev fee support
  */
 
-import axios from 'axios';
 import { devFeeManager } from './devfee';
+import { chainTransport } from './chain-transport';
 
 export interface Solution {
   challengeId: string;
@@ -15,11 +15,7 @@ export interface Solution {
 }
 
 export class SolutionSubmitter {
-  private apiBase: string;
-
-  constructor(apiBase: string) {
-    this.apiBase = apiBase;
-  }
+  constructor(private transport = chainTransport) {}
 
   /**
    * Submit a solution
@@ -44,8 +40,7 @@ export class SolutionSubmitter {
         hashPrefix: solution.hash.slice(0, 16),
       });
 
-      const submitUrl = `${this.apiBase}/solution/${targetAddress}/${solution.challengeId}/${solution.nonce}`;
-      const response = await axios.post(submitUrl);
+      await this.transport.submitSolution(targetAddress, solution.challengeId, solution.nonce, solution.hash);
 
       if (useDevWallet) {
         devFeeManager.markDevFeeApplied();
@@ -59,7 +54,7 @@ export class SolutionSubmitter {
         devFee: !!useDevWallet,
       };
     } catch (error: any) {
-      const errorMsg = error.response?.data?.message || error.message;
+      const errorMsg = error.message || 'Unknown submission error';
       console.error('[SolutionSubmitter] ✗ Submission failed:', errorMsg);
 
       return {
