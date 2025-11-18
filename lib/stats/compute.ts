@@ -4,7 +4,7 @@
  */
 
 import 'server-only';
-import axios from 'axios';
+import { chainTransport } from '@/lib/mining/chain-transport';
 import { ReceiptEntry } from '../storage/receipts-logger';
 
 export interface DayStats {
@@ -49,17 +49,14 @@ export interface GlobalStats {
 }
 
 /**
- * Fetch STAR rates from the API
+ * Fetch STAR rates without the HTTP API
  * Returns array where rates[0] is day 1, rates[1] is day 2, etc.
  */
-export async function fetchRates(apiBase: string): Promise<number[]> {
+export async function fetchRates(): Promise<number[]> {
   try {
-    const response = await axios.get(`${apiBase}/work_to_star_rate`, {
-      timeout: 5000,
-    });
-    return response.data;
+    return await chainTransport.fetchWorkRates();
   } catch (err: any) {
-    console.error('[Stats] Failed to fetch work_to_star_rate:', err.message);
+    console.error('[Stats] Failed to fetch work_to_star_rate via transport:', err.message);
     return [];
   }
 }

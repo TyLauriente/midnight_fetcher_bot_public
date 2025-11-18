@@ -1,5 +1,7 @@
 # Address Query & Limits FAQ
 
+> **API shutdown notice**: The Midnight HTTP API paths referenced below are being removed. The miner now relies on on-chain/`cardano-cli` commands (see `docs/API_DEPRECATION_NOTES.md`).
+
 ## 1. Can we determine mined addresses WITHOUT cache files?
 
 **YES!** There are multiple methods, and I've implemented an **OPTIMIZED** approach using Cardano stake keys!
