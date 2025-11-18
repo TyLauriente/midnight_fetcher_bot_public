@@ -7,45 +7,6 @@ import concurrent.futures
 MAX_WORKERS = 15
 
 HOSTS = [
-    "hwo8ofj0qw7ees-64410b38@ssh.runpod.io",
-    "hmkwc7uijg30yh-64410b38@ssh.runpod.io",
-    "4u0hqt04vdbsgz-64410b2f@ssh.runpod.io",
-    "1eblzyiodqi9y3-64410b5b@ssh.runpod.io",
-    "n4c2wt1nzdwu6u-64410b05@ssh.runpod.io",
-    "38c15qumr609fy-64410ffb@ssh.runpod.io",
-    "3w2yvbzn5t9e22-64410b38@ssh.runpod.io",
-    "el3wtriqlctdbf-64410bdd@ssh.runpod.io",
-    "9m8psrhia6vfl4-64410b42@ssh.runpod.io",
-    "zpvtnxvj63g00m-64410bf0@ssh.runpod.io",
-    "0dx22qrxw98kfo-64410b18@ssh.runpod.io",
-    "fajlsj4hbhshlt-64410b5b@ssh.runpod.io",
-    "7001dkz2sfh2ao-64410b42@ssh.runpod.io",
-    "hftlhxxre0aa1l-64410b5b@ssh.runpod.io",
-    "ubcp8yl1xwrthx-64410b43@ssh.runpod.io",
-    "athq1ymdk0l5e5-64411dd3@ssh.runpod.io",
-    "tmtq8j36lkjon6-64410b5b@ssh.runpod.io",
-    "tge7002n8y1g88-64410b5b@ssh.runpod.io",
-    "1lummya06f31w4-64410b42@ssh.runpod.io",
-    "yabdly6hafwghy-64410b82@ssh.runpod.io",
-    "n3zemki8vqt3q9-64410bdd@ssh.runpod.io",
-    "sksvxa5agenajc-64411dd3@ssh.runpod.io",
-    "e4y12rltm8u9fl-64410bd1@ssh.runpod.io",
-    "0ihhjh1zn56nrb-64410b32@ssh.runpod.io",
-    "q52f2ost29yitx-64410bca@ssh.runpod.io",
-    "koi7kov1iwei1a-64410b32@ssh.runpod.io",
-    "dbthr1k3ygvz8f-64410b38@ssh.runpod.io",
-    "n5kh02ks9lixqn-64410b05@ssh.runpod.io",
-    "55kegmdv7yan4a-64410b42@ssh.runpod.io",
-    "xt6rxtpsb3opk8-64410bc4@ssh.runpod.io",
-    "mdnsglsn068wft-64410b43@ssh.runpod.io",
-    "2k9qobmofl61e2-64410b05@ssh.runpod.io",
-    "mwfquebi4f3ej3-64410b31@ssh.runpod.io",
-    "mijddlbm555emz-64410bc4@ssh.runpod.io",
-    "usmu9guowxvvus-64410bdc@ssh.runpod.io",
-    "v58tsgxl46wtlr-64410b32@ssh.runpod.io",
-    "5fz9kof1skpwkg-64411cc3@ssh.runpod.io",
-    "g3lw5wox6r2znu-64410b38@ssh.runpod.io",
-    "jfzelyj0yi934e-64410bdc@ssh.runpod.io",
     "rgdycqvymzixii-64410b91@ssh.runpod.io",
     "7f52svaavqpika-64410b89@ssh.runpod.io",
     "13z3omod32xofy-64410b8f@ssh.runpod.io",
@@ -235,9 +196,9 @@ JOSH_HOSTS = [
 
 
 
-UPDATE_ALL = True
+UPDATE_ALL = False
 ACTIVE_HOSTS = [
-    "38c15qumr609fy-64410ffb@ssh.runpod.io",
+    "38c15qumr609fy-64410ffb@ssh.runpod.io"
 ]
 
 SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
@@ -312,7 +273,7 @@ def run_host(host, iteration):
 
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
     channel.send(f"tmux send-keys -t {SESSION_NAME} C-c\n")
-    stream_output(channel, timeout=2)
+    stream_output(channel, timeout=1)
 
     channel.send(f'sed -i "s/\\"addressOffset\\":[ ]*[0-9]\\+/\\"addressOffset\\": {iteration}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
     channel.send(f'sed -i "s/\\"workerThreads\\":[ ]*[0-9]\\+/\\"workerThreads\\": {DEFAULT_WORKER_THREADS}/" {"midnight_fetcher_bot_public/secure/mining-config.json"}\n')
@@ -320,7 +281,7 @@ def run_host(host, iteration):
     stream_output(channel, timeout=1)
 
     channel.send(SETUP_COMMAND + "\n")
-    stream_output(channel, timeout=7)
+    stream_output(channel, timeout=10)
 
     print(f"--- Finished with {host} ---\n")
     client.close()
@@ -338,9 +299,9 @@ def main():
             iteration += 1
 
         iteration = 0
-        for host in JOSH_HOSTS:
-            tasks.append(executor.submit(run_host, host, iteration))
-            iteration += 1
+        #for host in JOSH_HOSTS:
+        #    tasks.append(executor.submit(run_host, host, iteration))
+        #    iteration += 1
 
         for t in tasks:
             t.result()
