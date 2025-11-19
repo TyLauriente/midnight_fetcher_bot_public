@@ -167,6 +167,42 @@ npm install --save-dev @types/react @types/react-dom
 echo "Dependencies installed!"
 echo ""
 
+# Install Playwright browsers (required for web scraping)
+echo "Installing Playwright browser binaries..."
+if npx playwright install chromium 2>&1; then
+    echo "✓ Playwright browsers installed successfully!"
+else
+    echo ""
+    echo "WARNING: Failed to install Playwright browsers automatically."
+    echo "Attempting to install system dependencies..."
+    
+    # Try to install system dependencies for Playwright (Linux)
+    if command -v apt-get > /dev/null 2>&1; then
+        echo "Installing Playwright system dependencies (apt)..."
+        npx playwright install-deps chromium 2>&1 || echo "Could not install system dependencies automatically"
+    elif command -v dnf > /dev/null 2>&1; then
+        echo "Installing Playwright system dependencies (dnf)..."
+        npx playwright install-deps chromium 2>&1 || echo "Could not install system dependencies automatically"
+    elif command -v yum > /dev/null 2>&1; then
+        echo "Installing Playwright system dependencies (yum)..."
+        npx playwright install-deps chromium 2>&1 || echo "Could not install system dependencies automatically"
+    fi
+    
+    # Retry browser installation after system deps
+    echo "Retrying browser installation..."
+    if npx playwright install chromium 2>&1; then
+        echo "✓ Playwright browsers installed successfully after system dependencies!"
+    else
+        echo ""
+        echo "ERROR: Could not install Playwright browsers automatically."
+        echo "Please run manually: npx playwright install chromium"
+        echo "Or for system dependencies: npx playwright install-deps chromium"
+        echo ""
+        echo "Continuing anyway, but mining may not work until browsers are installed."
+    fi
+fi
+echo ""
+
 # ============================================================================
 # Create required directories
 # ============================================================================

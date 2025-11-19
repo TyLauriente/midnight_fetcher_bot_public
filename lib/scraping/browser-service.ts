@@ -129,19 +129,102 @@ class BrowserService {
    * Navigate to URL and wait for load
    */
   async navigateTo(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle', timeout?: number }): Promise<Page> {
-    const page = await this.getPage(url);
+    const browser = await this.getBrowser();
+    
+    if (!this.context) {
+      throw new Error('Browser context not initialized');
+    }
+
+    // Check if we have a page for this URL
+    let page: Page | null = null;
+    if (this.pages.has(url)) {
+      page = this.pages.get(url)!;
+      if (page.isClosed()) {
+        // Page was closed, remove it and create new one
+        this.pages.delete(url);
+        page = null;
+      }
+    }
+
+    // Create new page if needed
+    if (!page) {
+      page = await this.context.newPage();
+      this.pages.set(url, page);
+    }
     
     try {
+      // Check if browser/context is still valid
+      if (!browser.isConnected() || !page) {
+        throw new Error('Browser or page has been closed');
+      }
+
       await page.goto(url, {
         waitUntil: options?.waitUntil || 'networkidle',
         timeout: options?.timeout || 60000,
       });
       return page;
     } catch (error: any) {
+      // Handle ERR_ABORTED - navigation was interrupted, but page might still be usable
+      if (error.message?.includes('ERR_ABORTED') || error.message?.includes('net::ERR_ABORTED')) {
+        console.warn(`[BrowserService] Navigation to ${url} was aborted, but page may still be usable`);
+        // Wait a bit and check if page is still valid
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        if (page && !page.isClosed() && browser.isConnected()) {
+          try {
+            // Check current URL - might have navigated partially
+            const currentUrl = page.url();
+            if (currentUrl && currentUrl.includes('midnight.gd')) {
+              // Page is on the right domain, might be usable
+              console.log(`[BrowserService] Page is at ${currentUrl}, continuing...`);
+              return page;
+            }
+          } catch (e) {
+            // Page is not usable, continue to create new page
+          }
+        }
+        
+        // Page is not usable, create a new one
+        if (page && !page.isClosed()) {
+          try {
+            await page.close();
+          } catch (e) {
+            // Ignore
+          }
+        }
+        this.pages.delete(url);
+        
+        // Retry with new page
+        try {
+          page = await this.context.newPage();
+          this.pages.set(url, page);
+          await page.goto(url, {
+            waitUntil: options?.waitUntil || 'networkidle',
+            timeout: options?.timeout || 60000,
+          });
+          return page;
+        } catch (retryError: any) {
+          console.error(`[BrowserService] Retry navigation to ${url} failed:`, retryError.message);
+          if (page && !page.isClosed()) {
+            try {
+              await page.close();
+            } catch (e) {
+              // Ignore
+            }
+          }
+          this.pages.delete(url);
+          throw retryError;
+        }
+      }
+      
+      // Other errors - close page and throw
       console.error(`[BrowserService] Failed to navigate to ${url}:`, error.message);
-      // Close failed page
-      if (!page.isClosed()) {
-        await page.close();
+      if (page && !page.isClosed()) {
+        try {
+          await page.close();
+        } catch (e) {
+          // Ignore
+        }
       }
       this.pages.delete(url);
       throw error;
