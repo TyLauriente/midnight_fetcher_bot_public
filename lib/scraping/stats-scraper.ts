@@ -125,7 +125,7 @@ export async function getAddressSubmissions(address: string): Promise<{
     await page.waitForTimeout(2000);
 
     // Try to extract address-specific data from the page
-    const submissions = await page.evaluate((addr) => {
+    const submissions = await page.evaluate((addr: string) => {
       const bodyText = document.body.innerText || '';
 
       // Look for address-specific submission count

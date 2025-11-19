@@ -81,7 +81,7 @@ export async function submitSolution(
     // The website might use JavaScript to submit solutions
     if (!submitted) {
       try {
-        const submissionResult = await page.evaluate((nonce, challengeId, address) => {
+        const submissionResult = await page.evaluate(({ nonce, challengeId, address }: { nonce: string; challengeId: string; address: string }) => {
           // Look for solution submission function in window
           const win = window as any;
 
@@ -116,7 +116,7 @@ export async function submitSolution(
           }
 
           return { error: 'No submission method found' };
-        }, nonce, challengeId, address);
+        }, { nonce, challengeId, address });
 
         if (submissionResult && !(submissionResult as any).error) {
           submitted = true;
