@@ -4335,7 +4335,6 @@ class MiningOrchestrator extends EventEmitter {
         challenge_id: challengeId, // Use the captured challengeId
         nonce: nonce,
         hash: hash,
-        crypto_receipt: response.data?.crypto_receipt,
         isDevFee: isDevFee, // Mark dev fee solutions
       });
 
@@ -4361,7 +4360,6 @@ class MiningOrchestrator extends EventEmitter {
         address: addr.bech32,
         challengeId: this.currentChallengeId,
         nonce: nonce,
-        receipt: response.data?.crypto_receipt,
       });
     } catch (error: any) {
       console.error('[Orchestrator] ✗ Solution submission FAILED:', {
