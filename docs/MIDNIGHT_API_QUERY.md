@@ -1,5 +1,7 @@
 # Midnight API Query - The Optimal Method
 
+> **API shutdown notice**: The hosted Midnight API is being retired. The miner now uses an on-chain/`cardano-cli` transport (see `docs/API_DEPRECATION_NOTES.md`). This document is kept for historical reference only.
+
 ## Key Insight: Query the Midnight API Directly!
 
 **Registration is stored on the Midnight mining API**, not on the Cardano blockchain. Therefore, we should query the Midnight API directly to find registered addresses!

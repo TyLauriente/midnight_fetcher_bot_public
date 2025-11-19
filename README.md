@@ -183,19 +183,38 @@ increase or decrease these based on your hardware
 
 ## Advanced Configuration
 
-Create `config.json` in the project root (optional):
+### Post-API shutdown: automatic website mirror (CLI optional)
+
+The miner no longer calls the Midnight HTTP API and will now self-configure using the same website endpoints the browser
+relies on. By default it:
+
+- pulls the current challenge, terms, and work/star rates directly from the public website and caches them under
+  `storage/midnight-website-cache`
+- records submissions locally when no CLI submission command is configured so workers keep flowing even without a
+  transaction builder
+- stores any attempted registrations in `storage/midnight-website-cache/registrations.jsonl` when no registration
+  command exists
+
+If you prefer to wire your own CLI scripts (for true on-chain submission) you can still override the commands via
+environment variables or `config.json`:
 
 ```json
 {
-  "apiBase": "https://scavenger.prod.gd.midnighttge.io",
   "pollIntervalMs": 30000,
   "cpuThreads": 8,
-  "walletAutogen": {
-    "count": 50,
-    "destinationIndexForDonation": 0
+  "chainTransport": {
+    "challengeCommand": "./scripts/fetch-challenge.sh",
+    "submitCommand": "./scripts/submit-solution.sh",
+    "tandcCommand": "./scripts/tandc.sh",
+    "registerCommand": "./scripts/register-address.sh",
+    "workRateCommand": "./scripts/work-rate.sh",
+    "fallbackDir": "./fixtures/midnight"
   }
 }
 ```
+
+Each command should print the same JSON/text payloads the legacy API returned. If you skip them, the built-in website
+mirror and local receipt logger keep the miner running with no extra setup.
 
 ## Development
 
@@ -255,8 +274,8 @@ A: You'll need your 24-word seed phrase to recover. Without it, the wallet is un
 **Q: Can I change the number of addresses?**
 A: Yes, modify `count` in the wallet creation request (default: 200, max: 500).
 
-**Q: Is my seed phrase sent to the server?**
-A: No. All wallet operations are local. Only public addresses and signatures are sent to the mining API.
+**Q: Is my seed phrase sent anywhere?**
+A: No. All wallet operations are local. The CLI flow only signs and submits transactions; it never transmits your seed.
 
 ### Logs
 

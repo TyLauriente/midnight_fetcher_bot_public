@@ -3,7 +3,6 @@
  * Manages mining process, challenge polling, and worker coordination
  */
 
-import axios from 'axios';
 import { EventEmitter } from 'events';
 import { ChallengeResponse, MiningStats, MiningEvent, Challenge, WorkerStats } from './types';
 import { hashEngine } from '@/lib/hash/engine';
@@ -20,6 +19,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync } from 'child_process';
+import { chainTransport } from './chain-transport';
 
 interface SolutionTimestamp {
   timestamp: number;
@@ -28,7 +28,7 @@ interface SolutionTimestamp {
 class MiningOrchestrator extends EventEmitter {
   private isRunning = false;
   private currentChallengeId: string | null = null;
-  private apiBase: string = 'https://scavenger.prod.gd.midnighttge.io';
+  private transport = chainTransport;
   
   /**
    * Detect CPU thread count (logical cores) for limiting max workers
@@ -4246,50 +4246,21 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
-   * Submit solution to API
-   * API format: POST /solution/{address}/{challenge_id}/{nonce}
+   * Submit solution via on-chain transport
    */
   private async submitSolution(addr: DerivedAddress, challengeId: string, nonce: string, hash: string, preimage: string, isDevFee: boolean = false, workerId: number = 0): Promise<void> {
     if (!this.walletManager) return;
 
     try {
-      // Correct API endpoint: /solution/{address}/{challenge_id}/{nonce}
-      // CRITICAL: Use the challengeId parameter (captured when hash was computed) not this.currentChallengeId
-      const submitUrl = `${this.apiBase}/solution/${addr.bech32}/${challengeId}/${nonce}`;
       const logPrefix = isDevFee ? '[DEV FEE]' : '';
       console.log(`[Orchestrator] ${logPrefix} Worker ${workerId} submitting solution:`, {
-        url: submitUrl,
         nonce,
         hash,
         preimageLength: preimage.length,
       });
 
-      console.log(`[Orchestrator] ${logPrefix} Making POST request...`);
-      const response = await axios.post(submitUrl, {}, {
-        timeout: 30000, // 30 second timeout
-        validateStatus: (status) => status < 500, // Don't throw on 4xx errors
-      });
-
-      console.log(`[Orchestrator] ${logPrefix} Response received!`, {
-        statusCode: response.status,
-        statusText: response.statusText,
-      });
-
-      if (response.status >= 200 && response.status < 300) {
-        console.log(`[Orchestrator] ${logPrefix} ✓ Solution ACCEPTED by server! Worker ${workerId}`, {
-          statusCode: response.status,
-          statusText: response.statusText,
-          responseData: response.data,
-          cryptoReceipt: response.data?.crypto_receipt,
-        });
-      } else {
-        console.log(`[Orchestrator] ${logPrefix} ✗ Solution REJECTED by server:`, {
-          statusCode: response.status,
-          statusText: response.statusText,
-          responseData: response.data,
-        });
-        throw new Error(`Server rejected solution: ${response.status} ${response.statusText}`);
-      }
+      await this.transport.submitSolution(addr.bech32, challengeId, nonce, preimage);
+      console.log(`[Orchestrator] ${logPrefix} ✓ Solution submission command completed for worker ${workerId}`);
 
       this.solutionsFound++;
       // CRITICAL: Invalidate receipt count cache when new solution is found
@@ -4364,7 +4335,6 @@ class MiningOrchestrator extends EventEmitter {
         challenge_id: challengeId, // Use the captured challengeId
         nonce: nonce,
         hash: hash,
-        crypto_receipt: response.data?.crypto_receipt,
         isDevFee: isDevFee, // Mark dev fee solutions
       });
 
@@ -4390,7 +4360,6 @@ class MiningOrchestrator extends EventEmitter {
         address: addr.bech32,
         challengeId: this.currentChallengeId,
         nonce: nonce,
-        receipt: response.data?.crypto_receipt,
       });
     } catch (error: any) {
       console.error('[Orchestrator] ✗ Solution submission FAILED:', {
@@ -4569,11 +4538,10 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
-   * Fetch current challenge from API
+   * Fetch current challenge using the CLI transport (website-compatible)
    */
   private async fetchChallenge(): Promise<ChallengeResponse> {
-    const response = await axios.get(`${this.apiBase}/challenge`);
-    return response.data;
+    return this.transport.fetchChallenge();
   }
 
   /**
@@ -5083,16 +5051,14 @@ class MiningOrchestrator extends EventEmitter {
     }
 
     try {
-    // Get T&C message
-    const tandcResp = await axios.get(`${this.apiBase}/TandC`);
-    const message = tandcResp.data.message;
+    // Get T&C message via CLI transport
+    const message = await this.transport.fetchTermsAndConditions();
 
     // Sign message
     const signature = await this.walletManager.signMessage(addr.index, message);
 
     // Register
-    const registerUrl = `${this.apiBase}/register/${addr.bech32}/${signature}/${addr.publicKeyHex}`;
-    await axios.post(registerUrl, {});
+    await this.transport.registerAddress(addr.bech32, signature, addr.publicKeyHex);
 
       // Mark as registered and save to disk
     this.walletManager.markAddressRegistered(addr.index);
