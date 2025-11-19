@@ -79,6 +79,19 @@ class BrowserService {
       console.log('[BrowserService] Browser initialized successfully');
     } catch (error: any) {
       console.error('[BrowserService] Failed to initialize browser:', error.message);
+      
+      // Check if error is due to missing browser binaries
+      if (error.message && (error.message.includes('Executable doesn\'t exist') || error.message.includes('browserType.launch'))) {
+        const installError = new Error(
+          'Playwright browser binaries are not installed. Please run: npx playwright install chromium\n' +
+          'Or for all browsers: npx playwright install'
+        );
+        installError.name = 'BrowserNotInstalledError';
+        this.browser = null;
+        this.context = null;
+        throw installError;
+      }
+      
       this.browser = null;
       this.context = null;
       throw error;

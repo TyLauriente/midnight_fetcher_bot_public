@@ -125,6 +125,15 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
+
+REM Install Playwright browsers (required for web scraping)
+echo Installing Playwright browser binaries...
+call npx playwright install chromium
+if errorlevel 1 (
+    echo WARNING: Failed to install Playwright browsers automatically.
+    echo You may need to run 'npx playwright install chromium' manually.
+)
+echo.
 echo Dependencies installed!
 echo.
 
