@@ -7,11 +7,14 @@
  * This is the OPTIMAL method for finding mining addresses - queries the source of truth.
  */
 
-import axios from 'axios';
 import { WalletManager } from './manager';
 import { Lucid, toHex } from 'lucid-cardano';
+import { fetchTandCMessageWithRetry } from '@/lib/scraping/tandc-scraper';
+import { registerAddressWithRetry } from '@/lib/scraping/registration-scraper';
+import { getAddressSubmissions } from '@/lib/scraping/stats-scraper';
 
-const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
+// API base no longer used - all API calls replaced with web scraping
+// const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
 
 export interface MidnightAddressInfo {
   address: string;
@@ -41,17 +44,15 @@ export class MidnightApiQuery {
       // Get T&C message and sign it, then attempt registration
       // If "already registered", we know it's registered!
       
-      // Get T&C message (use cached version if available)
+      // Get T&C message from website (use cached version if available)
       if (!this.tandcMessage || !this.tandcMessageFetched) {
-        const tandcResponse = await axios.get(`${MINING_API_BASE}/TandC`, {
-          timeout: 5000,
-        });
+        const tandcResponse = await fetchTandCMessageWithRetry();
         
-        if (!tandcResponse.data || !tandcResponse.data.message) {
+        if (!tandcResponse || !tandcResponse.message) {
           throw new Error('T&C message not found');
         }
         
-        this.tandcMessage = tandcResponse.data.message;
+        this.tandcMessage = tandcResponse.message;
         this.tandcMessageFetched = true;
       }
       
@@ -79,33 +80,23 @@ export class MidnightApiQuery {
         throw new Error(`Failed to extract public key for address ${addressIndex}`);
       }
       
-      // Attempt to register - if "already registered", address is registered!
+      // Attempt to register through website UI - if "already registered", address is registered!
       try {
-        const registerUrl = `${MINING_API_BASE}/register/${address}/${signature}/${pubKeyHex}`;
-        const response = await axios.post(registerUrl, {}, {
-          timeout: 5000,
-          validateStatus: () => true, // Don't throw on any status
-        });
+        const registrationResult = await registerAddressWithRetry(address, signature, pubKeyHex);
         
         // Check for "already registered" errors
-        const errorMessage = response.data?.message || response.statusText || '';
-        const statusCode = response.status;
-        
-        const isAlreadyRegistered =
-          statusCode === 400 ||
-          statusCode === 409 ||
-          errorMessage.toLowerCase().includes('already registered') ||
-          errorMessage.toLowerCase().includes('already exists') ||
-          errorMessage.toLowerCase().includes('duplicate') ||
-          errorMessage.toLowerCase().includes('registered');
+        const isAlreadyRegistered = registrationResult.alreadyRegistered ||
+          registrationResult.message?.toLowerCase().includes('already registered') ||
+          registrationResult.message?.toLowerCase().includes('already exists') ||
+          registrationResult.message?.toLowerCase().includes('duplicate');
         
         if (isAlreadyRegistered) {
           return { isRegistered: true, wasNewlyRegistered: false }; // Address was already registered!
         }
         
-        // If we get 200/201, registration succeeded (address wasn't registered)
+        // If registration succeeded, address wasn't registered before
         // NOTE: This means we just registered a new address!
-        if (response.status >= 200 && response.status < 300) {
+        if (registrationResult.success) {
           if (!allowNewRegistration) {
             console.warn(`[MidnightApiQuery] ⚠️  Address ${address} was NOT registered, but we just registered it!`);
             console.warn(`[MidnightApiQuery] Set allowNewRegistration=true if you want to register addresses.`);
@@ -119,7 +110,7 @@ export class MidnightApiQuery {
         return { isRegistered: false, wasNewlyRegistered: false };
       } catch (error: any) {
         // Check error message for "already registered"
-        const errorMessage = error?.response?.data?.message || error?.message || '';
+        const errorMessage = error?.message || '';
         if (
           errorMessage.toLowerCase().includes('already registered') ||
           errorMessage.toLowerCase().includes('already exists') ||
@@ -132,22 +123,15 @@ export class MidnightApiQuery {
     } catch (error: any) {
       console.warn(`[MidnightApiQuery] Error checking registration for ${address}:`, error.message);
       
-      // Fallback: Try to query endpoint (if it exists)
+      // Fallback: Try to get address submissions (if available)
       try {
-        const response = await axios.get(`${MINING_API_BASE}/address/${address}`, {
-          timeout: 5000,
-          validateStatus: () => true,
-        });
-        
-        if (response.status === 200) {
-          const data = response.data;
-          if (data?.registered !== undefined) {
-            return { isRegistered: data.registered === true, wasNewlyRegistered: false };
-          }
-          return { isRegistered: true, wasNewlyRegistered: false }; // Assume registered if we get data
+        const submissions = await getAddressSubmissions(address);
+        // If we have submissions, address is likely registered
+        if (submissions.count > 0) {
+          return { isRegistered: true, wasNewlyRegistered: false };
         }
       } catch (e) {
-        // Endpoint doesn't exist
+        // Couldn't check submissions
       }
       
       return { isRegistered: false, wasNewlyRegistered: false };
@@ -180,52 +164,17 @@ export class MidnightApiQuery {
     lastSubmission?: string;
     challenges: string[];
   }> {
-    const possibleEndpoints = [
-      `${MINING_API_BASE}/address/${address}/submissions`,
-      `${MINING_API_BASE}/address/${address}/solutions`,
-      `${MINING_API_BASE}/solutions/${address}`,
-      `${MINING_API_BASE}/address/${address}/history`,
-    ];
-
-    for (const endpoint of possibleEndpoints) {
-      try {
-        const response = await axios.get(endpoint, {
-          timeout: 10000,
-          validateStatus: () => true,
-        });
-
-        if (response.status === 200 && response.data) {
-          const data = response.data;
-          
-          // Handle different response formats
-          if (Array.isArray(data)) {
-            return {
-              count: data.length,
-              lastSubmission: data.length > 0 ? data[data.length - 1]?.timestamp : undefined,
-              challenges: [...new Set(data.map((s: any) => s.challenge_id || s.challengeId).filter(Boolean))],
-            };
-          }
-
-          if (data.count !== undefined || data.submissions !== undefined || data.solutions !== undefined) {
-            const submissions = data.submissions || data.solutions || [];
-            return {
-              count: data.count || submissions.length,
-              lastSubmission: data.lastSubmission || (submissions.length > 0 ? submissions[submissions.length - 1]?.timestamp : undefined),
-              challenges: data.challenges || [...new Set(submissions.map((s: any) => s.challenge_id || s.challengeId).filter(Boolean))],
-            };
-          }
-        }
-      } catch (error) {
-        // Endpoint doesn't exist, try next one
-        continue;
-      }
+    // Use scraping to get address submissions
+    try {
+      const submissions = await getAddressSubmissions(address);
+      return submissions;
+    } catch (error) {
+      // Couldn't get submissions
+      return {
+        count: 0,
+        challenges: [],
+      };
     }
-
-    // No endpoint found
-    return {
-      count: 0,
-      challenges: [],
-    };
   }
 
   /**
@@ -263,17 +212,15 @@ export class MidnightApiQuery {
     console.log(`[MidnightApiQuery] Generated ${allAddresses.length} addresses from seed phrase`);
     console.log(`[MidnightApiQuery] Checking registration using signature verification...`);
 
-    // Get T&C message once (same for all addresses)
+    // Get T&C message once from website (same for all addresses)
     // Cache it to avoid fetching multiple times
     if (!this.tandcMessage || !this.tandcMessageFetched) {
       try {
-        const tandcResponse = await axios.get(`${MINING_API_BASE}/TandC`, {
-          timeout: 10000,
-        });
-        if (!tandcResponse.data || !tandcResponse.data.message) {
+        const tandcResponse = await fetchTandCMessageWithRetry();
+        if (!tandcResponse || !tandcResponse.message) {
           throw new Error('T&C message not found in response');
         }
-        this.tandcMessage = tandcResponse.data.message;
+        this.tandcMessage = tandcResponse.message;
         this.tandcMessageFetched = true;
         if (this.tandcMessage) {
           console.log(`[MidnightApiQuery] Got T&C message: "${this.tandcMessage.substring(0, 50)}..."`);
@@ -316,7 +263,7 @@ export class MidnightApiQuery {
           }
           
           if (isRegistered || wasNewlyRegistered) {
-            // Get submission data for registered addresses
+            // Get submission data for registered addresses (via scraping)
             const submissionData = await this.getAddressSubmissions(addr.bech32);
             
             registeredAddresses.push({
@@ -404,22 +351,10 @@ export class MidnightApiQuery {
       '/api/registered',
     ];
 
-    for (const path of commonPaths) {
-      try {
-        const response = await axios.get(`${MINING_API_BASE}${path}`, {
-          timeout: 5000,
-          validateStatus: () => true,
-        });
-
-        if (response.status === 200 || response.status === 401 || response.status === 403) {
-          // 200 = exists, 401/403 = exists but requires auth
-          discoveredEndpoints.push(path);
-          console.log(`[MidnightApiQuery] Found endpoint: ${path} (status: ${response.status})`);
-        }
-      } catch (error) {
-        // Endpoint doesn't exist
-      }
-    }
+    // Endpoint discovery no longer applicable - API is disabled
+    // This method kept for compatibility but returns empty array
+    console.log('[MidnightApiQuery] Endpoint discovery not available - API disabled, using web scraping');
+    return [];
 
     return discoveredEndpoints;
   }

@@ -14,11 +14,13 @@
  * This is more efficient than guessing, and uses the actual registration proof.
  */
 
-import axios from 'axios';
 import { WalletManager, DerivedAddress } from './manager';
 import { Lucid, toHex } from 'lucid-cardano';
+import { fetchTandCMessageWithRetry } from '@/lib/scraping/tandc-scraper';
+import { registerAddressWithRetry } from '@/lib/scraping/registration-scraper';
 
-const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
+// API base no longer used - all API calls replaced with web scraping
+// const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
 
 export interface SignatureVerificationResult {
   address: string;
@@ -42,12 +44,10 @@ export class SignatureVerificationQuery {
     }
 
     try {
-      const response = await axios.get(`${MINING_API_BASE}/TandC`, {
-        timeout: 10000,
-      });
+      const response = await fetchTandCMessageWithRetry();
 
-      if (response.data && response.data.message) {
-        const message = response.data.message;
+      if (response && response.message) {
+        const message = response.message;
         this.tandcMessage = message;
         this.tandcMessageFetched = true;
         console.log(`[SignatureVerification] Fetched T&C message (${message.length} chars)`);
@@ -108,25 +108,18 @@ export class SignatureVerificationQuery {
     publicKeyHex: string
   ): Promise<boolean> {
     try {
-      const registerUrl = `${MINING_API_BASE}/register/${address}/${signature}/${publicKeyHex}`;
-      const response = await axios.post(registerUrl, {}, {
-        timeout: 10000,
-        validateStatus: () => true, // Don't throw on any status
-      });
+      // Register through website UI (web scraping)
+      const registrationResult = await registerAddressWithRetry(address, signature, publicKeyHex);
 
-      // If we get 200/201, registration succeeded (address wasn't registered)
-      if (response.status >= 200 && response.status < 300) {
+      // If registration succeeded, address wasn't registered before
+      if (registrationResult.success) {
         console.log(`[SignatureVerification] Address ${address} was NOT registered (registration succeeded)`);
         return false; // Not registered before, but we just registered it
       }
 
       // Check for "already registered" errors
-      const errorMessage = response.data?.message || response.statusText || '';
-      const statusCode = response.status;
-
-      const isAlreadyRegistered =
-        statusCode === 400 ||
-        statusCode === 409 ||
+      const errorMessage = registrationResult.message || '';
+      const isAlreadyRegistered = registrationResult.alreadyRegistered ||
         errorMessage.toLowerCase().includes('already registered') ||
         errorMessage.toLowerCase().includes('already exists') ||
         errorMessage.toLowerCase().includes('duplicate') ||
@@ -138,7 +131,7 @@ export class SignatureVerificationQuery {
       }
 
       // Other errors - we don't know
-      console.warn(`[SignatureVerification] Unknown response for ${address}: ${statusCode} - ${errorMessage}`);
+      console.warn(`[SignatureVerification] Unknown response for ${address}: ${errorMessage}`);
       return false;
     } catch (error: any) {
       // Network errors or timeouts

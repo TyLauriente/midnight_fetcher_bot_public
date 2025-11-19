@@ -3,8 +3,8 @@
  * Handles submission of mining solutions with dev fee support
  */
 
-import axios from 'axios';
 import { devFeeManager } from './devfee';
+import { submitSolutionWithRetry } from '@/lib/scraping/solution-submitter-scraper';
 
 export interface Solution {
   challengeId: string;
@@ -15,14 +15,16 @@ export interface Solution {
 }
 
 export class SolutionSubmitter {
-  private apiBase: string;
+  // API base no longer used - all submissions go through web scraping
+  // private apiBase: string;
 
   constructor(apiBase: string) {
-    this.apiBase = apiBase;
+    // API base parameter kept for compatibility but not used
+    // this.apiBase = apiBase;
   }
 
   /**
-   * Submit a solution
+   * Submit a solution through website UI (web scraping)
    * Automatically applies dev fee if applicable
    */
   async submitSolution(
@@ -44,22 +46,26 @@ export class SolutionSubmitter {
         hashPrefix: solution.hash.slice(0, 16),
       });
 
-      const submitUrl = `${this.apiBase}/solution/${targetAddress}/${solution.challengeId}/${solution.nonce}`;
-      const response = await axios.post(submitUrl);
+      // Submit through website UI (web scraping)
+      const result = await submitSolutionWithRetry(targetAddress, solution.challengeId, solution.nonce);
 
-      if (useDevWallet) {
-        devFeeManager.markDevFeeApplied();
-        console.log('[SolutionSubmitter] ✓ Dev fee solution submitted successfully');
+      if (result.success) {
+        if (useDevWallet) {
+          devFeeManager.markDevFeeApplied();
+          console.log('[SolutionSubmitter] ✓ Dev fee solution submitted successfully');
+        } else {
+          console.log('[SolutionSubmitter] ✓ Solution submitted successfully');
+        }
+
+        return {
+          success: true,
+          devFee: !!useDevWallet,
+        };
       } else {
-        console.log('[SolutionSubmitter] ✓ Solution submitted successfully');
+        throw new Error(result.message || 'Submission failed');
       }
-
-      return {
-        success: true,
-        devFee: !!useDevWallet,
-      };
     } catch (error: any) {
-      const errorMsg = error.response?.data?.message || error.message;
+      const errorMsg = error?.message || 'Unknown error';
       console.error('[SolutionSubmitter] ✗ Submission failed:', errorMsg);
 
       return {

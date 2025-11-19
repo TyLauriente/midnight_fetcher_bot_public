@@ -23,8 +23,10 @@
 import { Lucid } from 'lucid-cardano';
 import axios from 'axios';
 import { WalletManager } from './manager';
+import { fetchTandCMessageWithRetry } from '@/lib/scraping/tandc-scraper';
 
-const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
+// API base no longer used - all API calls replaced with web scraping
+// const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
 
 // Cardano blockchain explorer APIs (try multiple for reliability)
 const BLOCKFROST_API = 'https://cardano-mainnet.blockfrost.io/api/v0';
@@ -367,16 +369,13 @@ export class StakeKeyQuery {
         const batchPromises = batch.map(async (address, idx) => {
           const globalIndex = i + idx;
           try {
-            // Check if address is registered by trying to get T&C
+            // Check if address is registered by trying to get T&C from website
             // If registered, this should work
-            const response = await axios.get(`${MINING_API_BASE}/TandC`, {
-              timeout: 5000,
-              validateStatus: () => true,
-            });
+            const tandcResponse = await fetchTandCMessageWithRetry();
 
             // Heuristic: If we get a response, address might be registered
-            // Actual implementation depends on API behavior
-            const isRegistered = response.status === 200;
+            // Actual implementation depends on website behavior
+            const isRegistered = tandcResponse && tandcResponse.message ? true : false;
 
             return {
               address,

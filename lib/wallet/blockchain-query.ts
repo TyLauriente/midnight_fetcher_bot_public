@@ -22,9 +22,11 @@
 import { WalletManager, DerivedAddress } from './manager';
 import { StakeKeyQuery } from './stake-key-query';
 import { MidnightApiQuery } from './midnight-api-query';
-import axios from 'axios';
+import { fetchTandCMessageWithRetry } from '@/lib/scraping/tandc-scraper';
+import { getAddressSubmissions } from '@/lib/scraping/stats-scraper';
 
-const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
+// API base no longer used - all API calls replaced with web scraping
+// const MINING_API_BASE = 'https://scavenger.prod.gd.midnighttge.io';
 
 export interface AddressRegistrationInfo {
   address: string;
@@ -58,17 +60,13 @@ export class BlockchainQuery {
    */
   private static async checkAddressRegistration(address: string): Promise<boolean> {
     try {
-      // Try to get T&C for this address - if it's registered, this should work
-      // Note: This is a heuristic - the actual registration check might need a different endpoint
-      const response = await axios.get(`${MINING_API_BASE}/TandC`, {
-        timeout: 10000,
-        validateStatus: () => true, // Don't throw on any status
-      });
+      // Try to get T&C message from website - if successful, might indicate registration
+      // Note: This is a heuristic - actual registration check uses registration attempt
+      const tandcResponse = await fetchTandCMessageWithRetry();
       
-      // If we get a 200, the address might be registered
-      // If we get 404/400, it's likely not registered
-      // This is a heuristic - actual implementation depends on API behavior
-      return response.status === 200;
+      // If we can get T&C message, address might be registered
+      // This is a basic heuristic - better to use MidnightApiQuery for accurate check
+      return tandcResponse && tandcResponse.message ? true : false;
     } catch (error: any) {
       // Network errors or timeouts suggest address might not be registered
       return false;
@@ -85,20 +83,9 @@ export class BlockchainQuery {
     challenges: string[];
   }> {
     try {
-      // Try to query submissions for this address
-      // NOTE: This endpoint may not exist - depends on API design
-      const response = await axios.get(`${MINING_API_BASE}/address/${address}/submissions`, {
-        timeout: 10000,
-        validateStatus: () => true,
-      });
-
-      if (response.status === 200 && response.data) {
-        return {
-          count: response.data.count || 0,
-          lastSubmission: response.data.lastSubmission,
-          challenges: response.data.challenges || [],
-        };
-      }
+      // Use scraping to get address submissions
+      const submissions = await getAddressSubmissions(address);
+      return submissions;
     } catch (error: any) {
       // Endpoint might not exist - that's okay
     }

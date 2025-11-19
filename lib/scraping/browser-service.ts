@@ -1,0 +1,204 @@
+/**
+ * Browser Service
+ * Manages browser instances for web scraping
+ * Uses singleton pattern to reuse browser instances
+ */
+
+import { chromium, Browser, Page, BrowserContext } from 'playwright';
+
+class BrowserService {
+  private static instance: BrowserService | null = null;
+  private browser: Browser | null = null;
+  private context: BrowserContext | null = null;
+  private pages: Map<string, Page> = new Map();
+  private isInitializing = false;
+  private initPromise: Promise<void> | null = null;
+
+  private constructor() {}
+
+  static getInstance(): BrowserService {
+    if (!BrowserService.instance) {
+      BrowserService.instance = new BrowserService();
+    }
+    return BrowserService.instance;
+  }
+
+  /**
+   * Get or create browser instance
+   */
+  async getBrowser(): Promise<Browser> {
+    if (this.browser && this.browser.isConnected()) {
+      return this.browser;
+    }
+
+    // If already initializing, wait for it
+    if (this.isInitializing && this.initPromise) {
+      await this.initPromise;
+      if (this.browser && this.browser.isConnected()) {
+        return this.browser;
+      }
+    }
+
+    // Start initialization
+    this.isInitializing = true;
+    this.initPromise = this.initializeBrowser();
+
+    try {
+      await this.initPromise;
+      if (this.browser && this.browser.isConnected()) {
+        return this.browser;
+      }
+      throw new Error('Failed to initialize browser');
+    } finally {
+      this.isInitializing = false;
+      this.initPromise = null;
+    }
+  }
+
+  private async initializeBrowser(): Promise<void> {
+    try {
+      console.log('[BrowserService] Initializing browser...');
+      this.browser = await chromium.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu',
+        ],
+      });
+
+      this.context = await this.browser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      });
+
+      console.log('[BrowserService] Browser initialized successfully');
+    } catch (error: any) {
+      console.error('[BrowserService] Failed to initialize browser:', error.message);
+      this.browser = null;
+      this.context = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Get or create a page for a specific URL
+   * Reuses existing page if available
+   */
+  async getPage(url: string): Promise<Page> {
+    const browser = await this.getBrowser();
+    
+    if (!this.context) {
+      throw new Error('Browser context not initialized');
+    }
+
+    // Check if we have a page for this URL
+    if (this.pages.has(url)) {
+      const page = this.pages.get(url)!;
+      if (!page.isClosed()) {
+        return page;
+      }
+      // Page was closed, remove it
+      this.pages.delete(url);
+    }
+
+    // Create new page
+    const page = await this.context.newPage();
+    this.pages.set(url, page);
+    return page;
+  }
+
+  /**
+   * Navigate to URL and wait for load
+   */
+  async navigateTo(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle', timeout?: number }): Promise<Page> {
+    const page = await this.getPage(url);
+    
+    try {
+      await page.goto(url, {
+        waitUntil: options?.waitUntil || 'networkidle',
+        timeout: options?.timeout || 60000,
+      });
+      return page;
+    } catch (error: any) {
+      console.error(`[BrowserService] Failed to navigate to ${url}:`, error.message);
+      // Close failed page
+      if (!page.isClosed()) {
+        await page.close();
+      }
+      this.pages.delete(url);
+      throw error;
+    }
+  }
+
+  /**
+   * Close a specific page
+   */
+  async closePage(url: string): Promise<void> {
+    if (this.pages.has(url)) {
+      const page = this.pages.get(url)!;
+      if (!page.isClosed()) {
+        await page.close();
+      }
+      this.pages.delete(url);
+    }
+  }
+
+  /**
+   * Close all pages
+   */
+  async closeAllPages(): Promise<void> {
+    const closePromises = Array.from(this.pages.values()).map(async (page) => {
+      if (!page.isClosed()) {
+        await page.close();
+      }
+    });
+    await Promise.all(closePromises);
+    this.pages.clear();
+  }
+
+  /**
+   * Close browser and cleanup
+   */
+  async closeBrowser(): Promise<void> {
+    await this.closeAllPages();
+
+    if (this.context) {
+      await this.context.close();
+      this.context = null;
+    }
+
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+    }
+
+    console.log('[BrowserService] Browser closed');
+  }
+
+  /**
+   * Cleanup on process exit
+   */
+  async cleanup(): Promise<void> {
+    await this.closeBrowser();
+  }
+}
+
+// Export singleton instance
+export const browserService = BrowserService.getInstance();
+
+// Handle process exit
+process.on('SIGINT', async () => {
+  await browserService.cleanup();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await browserService.cleanup();
+  process.exit(0);
+});
+

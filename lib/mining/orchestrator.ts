@@ -20,6 +20,10 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync } from 'child_process';
+import { fetchChallengeWithRetry } from '@/lib/scraping/challenge-scraper';
+import { fetchTandCMessageWithRetry } from '@/lib/scraping/tandc-scraper';
+import { registerAddressWithRetry } from '@/lib/scraping/registration-scraper';
+import { submitSolutionWithRetry } from '@/lib/scraping/solution-submitter-scraper';
 
 interface SolutionTimestamp {
   timestamp: number;
@@ -28,7 +32,8 @@ interface SolutionTimestamp {
 class MiningOrchestrator extends EventEmitter {
   private isRunning = false;
   private currentChallengeId: string | null = null;
-  private apiBase: string = 'https://scavenger.prod.gd.midnighttge.io';
+  // API base no longer used - all API calls replaced with web scraping
+  // private apiBase: string = 'https://scavenger.prod.gd.midnighttge.io';
   
   /**
    * Detect CPU thread count (logical cores) for limiting max workers
@@ -4253,43 +4258,40 @@ class MiningOrchestrator extends EventEmitter {
     if (!this.walletManager) return;
 
     try {
-      // Correct API endpoint: /solution/{address}/{challenge_id}/{nonce}
+      // Submit solution through website UI (web scraping)
       // CRITICAL: Use the challengeId parameter (captured when hash was computed) not this.currentChallengeId
-      const submitUrl = `${this.apiBase}/solution/${addr.bech32}/${challengeId}/${nonce}`;
       const logPrefix = isDevFee ? '[DEV FEE]' : '';
       console.log(`[Orchestrator] ${logPrefix} Worker ${workerId} submitting solution:`, {
-        url: submitUrl,
+        address: addr.bech32,
+        challengeId,
         nonce,
         hash,
         preimageLength: preimage.length,
       });
 
-      console.log(`[Orchestrator] ${logPrefix} Making POST request...`);
-      const response = await axios.post(submitUrl, {}, {
-        timeout: 30000, // 30 second timeout
-        validateStatus: (status) => status < 500, // Don't throw on 4xx errors
+      console.log(`[Orchestrator] ${logPrefix} Submitting via website UI...`);
+      const result = await submitSolutionWithRetry(addr.bech32, challengeId, nonce);
+
+      console.log(`[Orchestrator] ${logPrefix} Submission result:`, {
+        success: result.success,
+        message: result.message,
+        cryptoReceipt: result.cryptoReceipt,
       });
 
-      console.log(`[Orchestrator] ${logPrefix} Response received!`, {
-        statusCode: response.status,
-        statusText: response.statusText,
-      });
-
-      if (response.status >= 200 && response.status < 300) {
-        console.log(`[Orchestrator] ${logPrefix} ✓ Solution ACCEPTED by server! Worker ${workerId}`, {
-          statusCode: response.status,
-          statusText: response.statusText,
-          responseData: response.data,
-          cryptoReceipt: response.data?.crypto_receipt,
+      if (result.success) {
+        console.log(`[Orchestrator] ${logPrefix} ✓ Solution ACCEPTED! Worker ${workerId}`, {
+          message: result.message,
+          cryptoReceipt: result.cryptoReceipt,
         });
       } else {
-        console.log(`[Orchestrator] ${logPrefix} ✗ Solution REJECTED by server:`, {
-          statusCode: response.status,
-          statusText: response.statusText,
-          responseData: response.data,
+        console.log(`[Orchestrator] ${logPrefix} ✗ Solution REJECTED:`, {
+          message: result.message,
         });
-        throw new Error(`Server rejected solution: ${response.status} ${response.statusText}`);
+        throw new Error(`Server rejected solution: ${result.message || 'Unknown error'}`);
       }
+
+      // Store crypto receipt from result for later use
+      const cryptoReceipt = result.cryptoReceipt;
 
       this.solutionsFound++;
       // CRITICAL: Invalidate receipt count cache when new solution is found
@@ -4364,7 +4366,7 @@ class MiningOrchestrator extends EventEmitter {
         challenge_id: challengeId, // Use the captured challengeId
         nonce: nonce,
         hash: hash,
-        crypto_receipt: response.data?.crypto_receipt,
+        crypto_receipt: cryptoReceipt,
         isDevFee: isDevFee, // Mark dev fee solutions
       });
 
@@ -4390,18 +4392,14 @@ class MiningOrchestrator extends EventEmitter {
         address: addr.bech32,
         challengeId: this.currentChallengeId,
         nonce: nonce,
-        receipt: response.data?.crypto_receipt,
+        receipt: cryptoReceipt,
       });
     } catch (error: any) {
       console.error('[Orchestrator] ✗ Solution submission FAILED:', {
         errorMessage: error.message,
         errorCode: error.code,
-        statusCode: error.response?.status,
-        statusText: error.response?.statusText,
-        responseData: error.response?.data,
         nonce,
         hash: hash.slice(0, 32) + '...',
-        isTimeout: error.code === 'ECONNABORTED',
       });
 
       // Log error to file
@@ -4412,8 +4410,8 @@ class MiningOrchestrator extends EventEmitter {
         challenge_id: challengeId, // Use the captured challengeId
         nonce: nonce,
         hash: hash,
-        error: error.response?.data?.message || error.message,
-        response: error.response?.data,
+        error: error.message || 'Unknown error',
+        response: undefined,
       });
 
       Logger.error('mining', 'Solution submission failed', {
@@ -4423,13 +4421,11 @@ class MiningOrchestrator extends EventEmitter {
         nonce: nonce,
         hash: hash,
         preimage: preimage.slice(0, 200),
-        response: error.response?.data,
+        response: undefined,
       });
 
       // Emit solution result event with more details
-      const statusCode = error.response?.status || 'N/A';
-      const responseData = error.response?.data ? JSON.stringify(error.response.data) : 'N/A';
-      const detailedMessage = `${error.response?.data?.message || error.message} [Status: ${statusCode}, Response: ${responseData}]`;
+      const detailedMessage = error.message || 'Unknown error';
 
       this.emit('solution_result', {
         type: 'solution_result',
@@ -4569,11 +4565,11 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
-   * Fetch current challenge from API
+   * Fetch current challenge from website (web scraping)
+   * Replaces API call with browser automation
    */
   private async fetchChallenge(): Promise<ChallengeResponse> {
-    const response = await axios.get(`${this.apiBase}/challenge`);
-    return response.data;
+    return await fetchChallengeWithRetry();
   }
 
   /**
@@ -5083,16 +5079,28 @@ class MiningOrchestrator extends EventEmitter {
     }
 
     try {
-    // Get T&C message
-    const tandcResp = await axios.get(`${this.apiBase}/TandC`);
-    const message = tandcResp.data.message;
+    // Get T&C message from website (web scraping)
+    const tandcResp = await fetchTandCMessageWithRetry();
+    const message = tandcResp.message;
 
     // Sign message
     const signature = await this.walletManager.signMessage(addr.index, message);
 
-    // Register
-    const registerUrl = `${this.apiBase}/register/${addr.bech32}/${signature}/${addr.publicKeyHex}`;
-    await axios.post(registerUrl, {});
+    // Register through website UI (web scraping)
+    const registrationResult = await registerAddressWithRetry(addr.bech32, signature, addr.publicKeyHex);
+    
+    // Check registration result
+    if (!registrationResult.success) {
+      if (registrationResult.alreadyRegistered) {
+        // Address is already registered - this is OK
+        console.log(`[Orchestrator] Address ${addr.index} already registered (likely from another computer) - marking as registered locally`);
+        this.walletManager.markAddressRegistered(addr.index);
+        addr.registered = true;
+        return;
+      }
+      // Registration failed
+      throw new Error(registrationResult.message || 'Registration failed');
+    }
 
       // Mark as registered and save to disk
     this.walletManager.markAddressRegistered(addr.index);
@@ -5113,13 +5121,10 @@ class MiningOrchestrator extends EventEmitter {
       }
     } catch (error: any) {
       // Check if address is already registered (common in multi-computer setups)
-      const errorMessage = error?.response?.data?.message || error?.message || '';
-      const statusCode = error?.response?.status;
+      const errorMessage = error?.message || '';
       
       // Handle "already registered" cases gracefully
       if (
-        statusCode === 400 || 
-        statusCode === 409 || 
         errorMessage.toLowerCase().includes('already registered') ||
         errorMessage.toLowerCase().includes('already exists') ||
         errorMessage.toLowerCase().includes('duplicate')
