@@ -126,13 +126,94 @@ class BrowserService {
   }
 
   /**
-   * Navigate to URL and wait for load
+   * Get a fresh page with cleared session data
+   * Useful for registration where each address needs a clean session
    */
-  async navigateTo(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle', timeout?: number }): Promise<Page> {
+  async getFreshPage(): Promise<Page> {
     const browser = await this.getBrowser();
     
     if (!this.context) {
       throw new Error('Browser context not initialized');
+    }
+
+    // Clear all cookies from context first
+    try {
+      await this.context.clearCookies();
+    } catch (e) {
+      // Ignore errors
+    }
+
+    // Create a new page
+    const page = await this.context.newPage();
+    
+    // Clear localStorage and sessionStorage via JavaScript after page loads
+    page.addInitScript(() => {
+      // This runs before page scripts, clearing storage early
+      if (typeof Storage !== 'undefined') {
+        try {
+          localStorage.clear();
+          sessionStorage.clear();
+        } catch (e) {
+          // Ignore
+        }
+      }
+    });
+    
+    return page;
+  }
+
+  /**
+   * Navigate to URL and wait for load
+   * @param freshSession - If true, creates a fresh page with cleared session data
+   */
+  async navigateTo(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle', timeout?: number, freshSession?: boolean }): Promise<Page> {
+    const browser = await this.getBrowser();
+    
+    if (!this.context) {
+      throw new Error('Browser context not initialized');
+    }
+
+    // If fresh session is requested, always create a new page
+    if (options?.freshSession) {
+      const page = await this.getFreshPage();
+      
+      try {
+        // Check if browser/context is still valid
+        if (!browser.isConnected() || !page) {
+          throw new Error('Browser or page has been closed');
+        }
+
+        await page.goto(url, {
+          waitUntil: options?.waitUntil || 'networkidle',
+          timeout: options?.timeout || 60000,
+        });
+        
+        // Clear cookies and storage again after navigation to ensure clean state
+        try {
+          await this.context.clearCookies();
+          await page.evaluate(() => {
+            try {
+              localStorage.clear();
+              sessionStorage.clear();
+            } catch (e) {
+              // Ignore
+            }
+          });
+        } catch (e) {
+          // Ignore errors - page should still be usable
+        }
+        
+        return page;
+      } catch (error: any) {
+        if (!page.isClosed()) {
+          try {
+            await page.close();
+          } catch (e) {
+            // Ignore
+          }
+        }
+        throw error;
+      }
     }
 
     // Check if we have a page for this URL

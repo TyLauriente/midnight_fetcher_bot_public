@@ -5063,20 +5063,17 @@ class MiningOrchestrator extends EventEmitter {
   /**
    * Register a single address
    * Handles "already registered" errors gracefully (for multi-computer setups)
-   * CRITICAL: Always checks persistent storage first before attempting registration
+   * NOTE: Always re-registers addresses through the UI even if cached, as the website requires
+   * going through the registration flow for each address
    */
   private async registerAddress(addr: DerivedAddress): Promise<void> {
     if (!this.walletManager) {
       throw new Error('Wallet manager not initialized');
     }
 
-    // CRITICAL FIX: Check persistent storage FIRST before attempting registration
-    // This prevents unnecessary registration attempts and rate limit errors
-    if (this.walletManager.isAddressRegistered(addr.index)) {
-      console.log(`[Orchestrator] Address ${addr.index} is already registered in persistent storage, skipping registration`);
-      addr.registered = true;
-      return; // Address is already registered, no need to attempt registration
-    }
+    // NOTE: We always re-register addresses through the UI even if they're cached
+    // The website requires going through the registration flow for each address
+    // This ensures we can register addresses that were registered on other instances
 
     try {
     // Get T&C message from website (web scraping)

@@ -39,10 +39,11 @@ export async function registerAddress(
   let page = null;
   
   try {
-    // Step 1: Navigate to wallet selection page
-    console.log('[RegistrationScraper] Step 1: Navigating to wallet selection page...');
+    // Step 1: Navigate to wallet selection page with fresh session
+    // Each registration needs a clean session to avoid cookie/session conflicts
+    console.log('[RegistrationScraper] Step 1: Navigating to wallet selection page with fresh session...');
     const walletUrl = `${BASE_URL}/wizard/wallet`;
-    page = await browserService.navigateTo(walletUrl);
+    page = await browserService.navigateTo(walletUrl, { freshSession: true });
     await page.waitForTimeout(2000);
 
     // Check if we're already past step 1 (address already selected)
@@ -61,26 +62,98 @@ export async function registerAddress(
       // Step 2: Click "Enter an address manually" button
       console.log('[RegistrationScraper] Step 2: Clicking "Enter an address manually"...');
       try {
+        // Wait for page to fully load
+        await page.waitForLoadState('domcontentloaded');
+        await page.waitForTimeout(1000);
+        
         const enterAddressButton = page.locator('text=Enter an address manually').first();
         if (await enterAddressButton.isVisible({ timeout: 5000 })) {
           await enterAddressButton.click();
+          // Wait for the page to transition to address entry view
           await page.waitForTimeout(2000);
+          await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
         } else {
-          // Maybe already on address entry page
-          console.log('[RegistrationScraper] Enter address button not visible, may already be on address entry page');
+          // Check if we're already on address entry page
+          const pageText = await page.textContent('body') || '';
+          const url = page.url();
+          if (pageText.includes('Enter a Cardano address') || url.includes('/wizard/wallet')) {
+            console.log('[RegistrationScraper] Already on address entry page');
+          } else {
+            console.log('[RegistrationScraper] Enter address button not visible, checking page state...');
+          }
         }
       } catch (e: any) {
         // Button might not be visible if we're already on the address entry page
-        console.log('[RegistrationScraper] Enter address button not found, continuing...');
+        console.log('[RegistrationScraper] Enter address button not found or clickable, checking page state...');
+        await page.waitForTimeout(1000);
       }
 
       // Step 3: Enter address in the input field
       console.log('[RegistrationScraper] Step 3: Entering address...');
       try {
-        // Wait for address input field
-        const addressInput = page.locator('input[placeholder*="address" i], input[placeholder*="Cardano address" i], input[type="text"]').first();
+        // Wait for page to be ready
+        await page.waitForLoadState('domcontentloaded');
+        await page.waitForTimeout(1000);
         
-        if (await addressInput.isVisible({ timeout: 5000 })) {
+        // Try multiple selectors to find address input
+        const addressInputSelectors = [
+          'input[placeholder*="Cardano address" i]',
+          'input[placeholder*="address" i]',
+          'input[type="text"]',
+          'textarea',
+        ];
+        
+        let addressInput = null;
+        for (const selector of addressInputSelectors) {
+          try {
+            const inputs = await page.locator(selector).all();
+            for (const input of inputs) {
+              if (await input.isVisible({ timeout: 2000 })) {
+                const placeholder = await input.getAttribute('placeholder') || '';
+                const inputType = await input.getAttribute('type') || '';
+                // Skip buttons and non-text inputs
+                if (inputType === 'button' || inputType === 'submit') {
+                  continue;
+                }
+                // Prefer inputs with address-related placeholders
+                if (placeholder.toLowerCase().includes('address') || selector.includes('address')) {
+                  addressInput = input;
+                  break;
+                } else if (!addressInput) {
+                  // Fallback to first visible text input
+                  addressInput = input;
+                }
+              }
+            }
+            if (addressInput) break;
+          } catch (e) {
+            continue;
+          }
+        }
+        
+        if (!addressInput) {
+          // Debug: log page state
+          const pageText = await page.textContent('body') || '';
+          const url = page.url();
+          console.error('[RegistrationScraper] Debug: Could not find address input');
+          console.error(`[RegistrationScraper] Debug: Current URL: ${url}`);
+          console.error(`[RegistrationScraper] Debug: Page text sample: ${pageText.substring(0, 300)}`);
+          
+          // Check if address is already set on the page
+          if (pageText.includes(address.slice(0, 20))) {
+            console.log('[RegistrationScraper] Address appears to be already entered');
+            // Try to click Next/Continue anyway
+            const continueButton = page.locator('button:has-text("Continue"), button:has-text("Next")').first();
+            if (await continueButton.isVisible({ timeout: 5000 }) && !(await continueButton.isDisabled())) {
+              await continueButton.click();
+              await page.waitForTimeout(3000);
+            } else {
+              throw new Error('Address input field not found and Continue button not available');
+            }
+          } else {
+            throw new Error('Address input field not found - page may be in unexpected state');
+          }
+        } else {
           // Clear any existing value
           await addressInput.clear();
           await addressInput.fill(address);
@@ -95,22 +168,10 @@ export async function registerAddress(
           if (await continueButton.isVisible({ timeout: 5000 }) && !(await continueButton.isDisabled())) {
             await continueButton.click();
             await page.waitForTimeout(3000);
+            // Wait for redirect
+            await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
           } else {
             throw new Error('Continue button not found or disabled');
-          }
-        } else {
-          // Check if address is already set on the page
-          const pageText = await page.textContent('body') || '';
-          if (pageText.includes(address.slice(0, 20))) {
-            console.log('[RegistrationScraper] Address appears to be already entered');
-            // Try to click Next/Continue anyway
-            const continueButton = page.locator('button:has-text("Continue"), button:has-text("Next")').first();
-            if (await continueButton.isVisible({ timeout: 5000 }) && !(await continueButton.isDisabled())) {
-              await continueButton.click();
-              await page.waitForTimeout(3000);
-            }
-          } else {
-            throw new Error('Address input field not found');
           }
         }
       } catch (e: any) {
@@ -421,6 +482,15 @@ export async function registerAddress(
     const finalUrl = page.url();
     const finalPageText = await page.textContent('body') || '';
 
+    // Close the page to free resources since we used a fresh session
+    try {
+      if (page && !page.isClosed()) {
+        await page.close();
+      }
+    } catch (e) {
+      // Ignore close errors
+    }
+
     // Check for success (mining page)
     if (finalUrl.includes('/wizard/mine')) {
       console.log('[RegistrationScraper] ✓ Registration successful - on mining page');
@@ -470,6 +540,15 @@ export async function registerAddress(
 
   } catch (error: any) {
     console.error('[RegistrationScraper] Error registering address:', error.message);
+    
+    // Close page on error
+    try {
+      if (page && !page.isClosed()) {
+        await page.close();
+      }
+    } catch (e) {
+      // Ignore close errors
+    }
     
     // Check if error indicates already registered
     if (error.message?.toLowerCase().includes('already registered') ||
