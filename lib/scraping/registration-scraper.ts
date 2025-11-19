@@ -220,14 +220,41 @@ export async function registerAddress(
     console.log('[RegistrationScraper] Step 6: Waiting for Terms and Conditions page to load...');
     try {
       // Wait for the page to be on /wizard/t-c
-      if (!page.url().includes('/wizard/t-c')) {
-        await page.waitForURL(/\/wizard\/t-c/, { timeout: 10000 });
+      const currentUrl = page.url();
+      if (!currentUrl.includes('/wizard/t-c')) {
+        console.log(`[RegistrationScraper] Currently on ${currentUrl}, waiting for redirect to /wizard/t-c...`);
+        try {
+          await page.waitForURL(/\/wizard\/t-c/, { timeout: 15000 });
+          console.log('[RegistrationScraper] Successfully redirected to /wizard/t-c');
+        } catch (e) {
+          // Check if we're on a different page
+          const newUrl = page.url();
+          console.warn(`[RegistrationScraper] Did not redirect to /wizard/t-c, current URL: ${newUrl}`);
+          if (!newUrl.includes('/wizard/t-c')) {
+            throw new Error(`Expected redirect to /wizard/t-c but page is at ${newUrl}`);
+          }
+        }
       }
+      
+      // Verify we're on the terms page
+      const finalUrl = page.url();
+      if (!finalUrl.includes('/wizard/t-c')) {
+        throw new Error(`Not on terms page. Current URL: ${finalUrl}`);
+      }
+      
+      // Wait for page to fully load
       await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
       await page.waitForTimeout(2000);
-    } catch (e) {
-      // Page might already be loaded or still loading
-      await page.waitForTimeout(2000);
+      
+      // Verify page has loaded by checking for terms-related content
+      const pageText = await page.textContent('body') || '';
+      if (!pageText.toLowerCase().includes('terms') && !pageText.toLowerCase().includes('signature')) {
+        console.warn('[RegistrationScraper] Page may not be fully loaded, waiting longer...');
+        await page.waitForTimeout(3000);
+      }
+    } catch (e: any) {
+      const currentUrl = page.url();
+      throw new Error(`Failed to reach Terms and Conditions page: ${e.message}. Current URL: ${currentUrl}`);
     }
 
     // Step 7: Extract the T&C message from the page (for verification)
@@ -287,6 +314,7 @@ export async function registerAddress(
 
     // Step 8: Scroll down and check the approval checkbox
     console.log('[RegistrationScraper] Step 8: Checking approval checkbox...');
+    let checkboxChecked = false;
     try {
       // Scroll to bottom to ensure checkbox is visible
       await page.evaluate(() => {
@@ -302,7 +330,6 @@ export async function registerAddress(
         'input[aria-label*="accept" i]',
       ];
 
-      let checkboxChecked = false;
       for (const selector of checkboxSelectors) {
         try {
           const checkboxes = await page.locator(selector).all();
@@ -311,7 +338,7 @@ export async function registerAddress(
               const isChecked = await checkbox.isChecked();
               if (!isChecked) {
                 await checkbox.check();
-                await page.waitForTimeout(500);
+                await page.waitForTimeout(1000); // Wait longer for state to update
                 checkboxChecked = true;
                 console.log('[RegistrationScraper] Checked approval checkbox');
                 break;
@@ -335,22 +362,69 @@ export async function registerAddress(
       console.warn('[RegistrationScraper] Could not check approval checkbox:', (e as Error).message);
     }
 
-    // Step 9: Click "Accept and sign" button (if present, before signature entry)
+    // Step 9: Click "Accept and sign" button (this reveals the signature fields)
     console.log('[RegistrationScraper] Step 9: Clicking Accept and sign...');
+    let acceptButtonClicked = false;
     try {
+      // Wait for Accept and sign button to be available (may be disabled until checkbox is checked)
       const acceptButton = page.locator('button:has-text("Accept and sign"), button:has-text("Accept"), button:has-text("Agree")').first();
-      if (await acceptButton.isVisible({ timeout: 3000 }) && !(await acceptButton.isDisabled())) {
-        await acceptButton.click();
-        await page.waitForTimeout(2000);
+      
+      // Wait for button to be visible and enabled
+      if (await acceptButton.isVisible({ timeout: 5000 })) {
+        // Wait for button to be enabled (may take a moment after checkbox is checked)
+        let attempts = 0;
+        while (attempts < 5) {
+          const isDisabled = await acceptButton.isDisabled();
+          if (!isDisabled) {
+            await acceptButton.click();
+            acceptButtonClicked = true;
+            console.log('[RegistrationScraper] Clicked Accept and sign button');
+            // Wait for signature fields to appear after button click
+            await page.waitForTimeout(2000);
+            // Wait for network to settle
+            await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+            break;
+          }
+          await page.waitForTimeout(500);
+          attempts++;
+        }
+        
+        if (!acceptButtonClicked) {
+          console.warn('[RegistrationScraper] Accept and sign button is still disabled after waiting');
+        }
+      } else {
+        // Button might not be present if we're already on signature entry step
+        console.log('[RegistrationScraper] Accept and sign button not found, may already be on signature step');
       }
     } catch (e) {
       // Button might not be present if we're already on signature entry step
-      console.log('[RegistrationScraper] Accept and sign button not found, may already be on signature step');
+      console.log('[RegistrationScraper] Accept and sign button not found or clickable, checking if already on signature step');
     }
 
-    // Step 10: Fill in signature field
+    // Step 10: Wait for and fill in signature field
     console.log('[RegistrationScraper] Step 10: Entering signature...');
     try {
+      // CRITICAL: Verify we're still on the terms page before looking for signature fields
+      const currentUrl = page.url();
+      if (!currentUrl.includes('/wizard/t-c')) {
+        throw new Error(`Not on terms page when looking for signature field. Current URL: ${currentUrl}`);
+      }
+      
+      // Wait for signature field to appear (it may take time after clicking Accept and sign)
+      // Try waiting for signature-related elements to appear
+      try {
+        await page.waitForSelector('textarea[placeholder*="signature" i], input[placeholder*="signature" i], textarea, input[type="text"]', {
+          timeout: 10000,
+          state: 'visible'
+        }).catch(() => {
+          // Continue anyway
+        });
+      } catch (e) {
+        // Continue
+      }
+      
+      await page.waitForTimeout(1000);
+      
       // Find signature input field (usually a textarea or text input)
       const signatureSelectors = [
         'textarea[placeholder*="signature" i]',
@@ -360,38 +434,90 @@ export async function registerAddress(
       ];
 
       let signatureFilled = false;
-      for (let i = 0; i < signatureSelectors.length; i++) {
+      let allInputs: any[] = [];
+      
+      // First, collect all potential inputs
+      for (const selector of signatureSelectors) {
         try {
-          const inputs = await page.locator(signatureSelectors[i]).all();
-          // Usually the first textarea/input is the message, second is signature
-          // Look for one that doesn't have the message content
+          const inputs = await page.locator(selector).all();
           for (const input of inputs) {
-            if (await input.isVisible({ timeout: 2000 })) {
-              const placeholder = await input.getAttribute('placeholder') || '';
-              const value = await input.inputValue();
-              
-              // Skip if it's the message field (already has content)
-              if (value && value.length > 100 && value.includes('agree')) {
-                continue;
-              }
-              
-              // This should be the signature field
-              if (placeholder.toLowerCase().includes('signature') || i > 0) {
-                await input.fill(signature);
-                await page.waitForTimeout(500);
-                signatureFilled = true;
-                console.log('[RegistrationScraper] Entered signature');
-                break;
-              }
+            if (await input.isVisible({ timeout: 1000 }).catch(() => false)) {
+              allInputs.push(input);
             }
           }
-          if (signatureFilled) break;
         } catch (e) {
           continue;
         }
       }
+      
+      // Debug: log what we found
+      if (allInputs.length === 0) {
+        const pageText = await page.textContent('body') || '';
+        const url = page.url();
+        console.error('[RegistrationScraper] Debug: No inputs found on page');
+        console.error(`[RegistrationScraper] Debug: Current URL: ${url}`);
+        console.error(`[RegistrationScraper] Debug: Page text contains "signature": ${pageText.toLowerCase().includes('signature')}`);
+        console.error(`[RegistrationScraper] Debug: Page text contains "public key": ${pageText.toLowerCase().includes('public key')}`);
+      }
+      
+      // Sort inputs: prefer ones with "signature" in placeholder, exclude message field
+      for (const input of allInputs) {
+        try {
+          const placeholder = (await input.getAttribute('placeholder') || '').toLowerCase();
+          const value = await input.inputValue().catch(() => '');
+          const label = await input.locator('..').locator('label').textContent().catch(() => '') || '';
+          
+          // Skip if it's the message field (already has content with "agree")
+          if (value && value.length > 100 && (value.includes('agree') || value.includes('terms'))) {
+            console.log('[RegistrationScraper] Skipping message field');
+            continue;
+          }
+          
+          // Prefer fields with "signature" in placeholder or label
+          if (placeholder.includes('signature') || label.toLowerCase().includes('signature')) {
+            await input.fill(signature);
+            await page.waitForTimeout(500);
+            signatureFilled = true;
+            console.log('[RegistrationScraper] Entered signature in field with placeholder: ' + placeholder);
+            break;
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+      
+      // If we didn't find a signature-specific field, try the second empty input (first is message, second is signature)
+      if (!signatureFilled && allInputs.length >= 2) {
+        try {
+          // Get all inputs and find the second empty one
+          let emptyInputs = [];
+          for (const input of allInputs) {
+            const value = await input.inputValue().catch(() => '');
+            if (!value || value.length === 0) {
+              emptyInputs.push(input);
+            }
+          }
+          
+          if (emptyInputs.length > 0) {
+            // Use the first empty input (should be signature)
+            await emptyInputs[0].fill(signature);
+            await page.waitForTimeout(500);
+            signatureFilled = true;
+            console.log('[RegistrationScraper] Entered signature in first empty input field');
+          }
+        } catch (e) {
+          // Continue
+        }
+      }
 
       if (!signatureFilled) {
+        // Debug: get more info
+        const pageText = await page.textContent('body') || '';
+        const url = page.url();
+        console.error('[RegistrationScraper] Debug: Could not find signature input field');
+        console.error(`[RegistrationScraper] Debug: Current URL: ${url}`);
+        console.error(`[RegistrationScraper] Debug: Found ${allInputs.length} input fields`);
+        console.error(`[RegistrationScraper] Debug: Page text sample: ${pageText.substring(0, 500)}`);
         throw new Error('Could not find signature input field');
       }
     } catch (e: any) {

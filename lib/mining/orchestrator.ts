@@ -5080,11 +5080,12 @@ class MiningOrchestrator extends EventEmitter {
     const tandcResp = await fetchTandCMessageWithRetry();
     const message = tandcResp.message;
 
-    // Sign message
-    const signature = await this.walletManager.signMessage(addr.index, message);
+    // Sign message and get both signature and public key from the signing operation
+    // This ensures the public key matches the signature
+    const { signature, publicKeyHex } = await this.walletManager.signMessageWithKey(addr.index, message);
 
     // Register through website UI (web scraping)
-    const registrationResult = await registerAddressWithRetry(addr.bech32, signature, addr.publicKeyHex);
+    const registrationResult = await registerAddressWithRetry(addr.bech32, signature, publicKeyHex);
     
     // Check registration result
     if (!registrationResult.success) {

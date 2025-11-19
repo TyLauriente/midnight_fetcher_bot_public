@@ -256,6 +256,7 @@ export class WalletManager {
 
   /**
    * Sign a message with specific address
+   * Returns the signature
    */
   async signMessage(addressIndex: number, message: string): Promise<string> {
     if (!this.mnemonic) {
@@ -276,6 +277,47 @@ export class WalletManager {
     const signedMessage = await lucid.wallet.signMessage(addr.bech32, payload);
 
     return signedMessage.signature;
+  }
+
+  /**
+   * Sign a message and return both signature and public key
+   * The public key is extracted from the signing operation
+   */
+  async signMessageWithKey(addressIndex: number, message: string): Promise<{ signature: string; publicKeyHex: string }> {
+    if (!this.mnemonic) {
+      throw new Error('Mnemonic not loaded');
+    }
+
+    const addr = this.derivedAddresses.find(a => a.index === addressIndex);
+    if (!addr) {
+      throw new Error(`Address not found for index ${addressIndex}`);
+    }
+
+    const lucid = await Lucid.new(undefined, 'Mainnet');
+    lucid.selectWalletFromSeed(this.mnemonic, {
+      accountIndex: addressIndex,
+    });
+
+    const payload = toHex(Buffer.from(message, 'utf8'));
+    const signedMessage = await lucid.wallet.signMessage(addr.bech32, payload);
+
+    // Extract public key from COSE_Key structure in the signed message
+    const coseKey = signedMessage.key;
+    const pubKeyHex = coseKey.slice(-64);
+
+    if (!pubKeyHex || pubKeyHex.length !== 64) {
+      // Fallback to stored public key if extraction fails
+      console.warn(`[WalletManager] Could not extract public key from signature, using stored key for index ${addressIndex}`);
+      return {
+        signature: signedMessage.signature,
+        publicKeyHex: addr.publicKeyHex,
+      };
+    }
+
+    return {
+      signature: signedMessage.signature,
+      publicKeyHex: pubKeyHex,
+    };
   }
 
   /**
