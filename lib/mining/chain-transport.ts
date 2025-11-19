@@ -31,6 +31,11 @@ import { receiptsLogger } from '@/lib/storage/receipts-logger';
 
 const execFileAsync = promisify(execFile);
 
+const DEFAULT_WEBSITE_BASE = process.env.MIDNIGHT_WEBSITE_BASE || 'https://midnight.glacier-drop.io';
+const LEGACY_API_BASE = process.env.MIDNIGHT_LEGACY_API_BASE || 'https://scavenger.prod.gd.midnighttge.io';
+
+const WEBSITE_MIRRORS = Array.from(new Set([DEFAULT_WEBSITE_BASE, LEGACY_API_BASE].filter(Boolean)));
+
 export interface ChainTransportOptions {
   challengeCommand?: string;
   submitCommand?: string;
@@ -65,6 +70,29 @@ async function runCommand(command: string, extraArgs: string[], label: string): 
   } catch (err: any) {
     throw new Error(`[ChainTransport] ${label} command failed: ${err.message}`);
   }
+}
+
+async function fetchFromMirrors<T>(
+  label: string,
+  fallbackDir: string | undefined,
+  fetcher: (fallbackDir?: string, baseUrl?: string) => Promise<T>
+): Promise<T> {
+  let lastError: any;
+
+  for (const baseUrl of WEBSITE_MIRRORS) {
+    try {
+      return await fetcher(fallbackDir, baseUrl);
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`[ChainTransport] ${label} mirror at ${baseUrl} failed:`, err.message);
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  throw new Error(`[ChainTransport] No ${label.toLowerCase()} mirrors configured.`);
 }
 
 export class ChainTransport {
@@ -104,9 +132,9 @@ export class ChainTransport {
     }
 
     try {
-      return await fetchWebsiteChallenge(this.fallbackDir);
+      return await fetchFromMirrors('Challenge fetch', this.fallbackDir, fetchWebsiteChallenge);
     } catch (err: any) {
-      throw new Error('[ChainTransport] No challenge command configured and website mirror failed. Set MIDNIGHT_CHALLENGE_COMMAND to a cardano-cli script that outputs challenge JSON.');
+      throw new Error('[ChainTransport] No challenge command configured and website/legacy mirrors failed. Set MIDNIGHT_CHALLENGE_COMMAND to a cardano-cli script that outputs challenge JSON.');
     }
   }
 
@@ -152,9 +180,9 @@ export class ChainTransport {
     }
 
     try {
-      return await fetchWebsiteTerms(this.fallbackDir);
+      return await fetchFromMirrors('T&C fetch', this.fallbackDir, fetchWebsiteTerms);
     } catch (err: any) {
-      throw new Error('[ChainTransport] No T&C command configured and website mirror failed. Set MIDNIGHT_TANDC_COMMAND or provide a fallback file.');
+      throw new Error('[ChainTransport] No T&C command configured and website/legacy mirrors failed. Set MIDNIGHT_TANDC_COMMAND or provide a fallback file.');
     }
   }
 
@@ -198,9 +226,9 @@ export class ChainTransport {
     }
 
     try {
-      return await fetchWebsiteRates(this.fallbackDir);
+      return await fetchFromMirrors('Work to STAR rate fetch', this.fallbackDir, fetchWebsiteRates);
     } catch (err: any) {
-      console.warn('[ChainTransport] No work rate command configured and website mirror failed; STAR calculations will be empty.');
+      console.warn('[ChainTransport] No work rate command configured and website/legacy mirrors failed; STAR calculations will be empty.');
       return [];
     }
   }

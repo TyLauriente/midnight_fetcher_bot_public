@@ -14,9 +14,16 @@ import { ChallengeResponse } from './types';
 const DEFAULT_BASE = process.env.MIDNIGHT_WEBSITE_BASE || 'https://midnight.glacier-drop.io';
 
 const candidatePaths = {
-  challenge: ['/api/challenge', '/challenge', '/challenge.json'],
-  tandc: ['/api/tandc', '/tandc', '/tandc.txt'],
-  workRates: ['/api/work_to_star_rate', '/work_to_star_rate.json', '/rates.json'],
+  challenge: ['/api/challenge', '/challenge', '/challenge.json', '/api/Challenge', '/Challenge'],
+  tandc: ['/api/tandc', '/tandc', '/tandc.txt', '/api/TandC', '/TandC'],
+  workRates: [
+    '/api/work_to_star_rate',
+    '/work_to_star_rate.json',
+    '/rates.json',
+    '/api/work-rates',
+    '/work_to_star_rate',
+    '/WorkToStarRate',
+  ],
 };
 
 async function fetchFirst(baseUrl: string, paths: string[]): Promise<any> {
