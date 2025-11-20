@@ -1471,57 +1471,6 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
 
   return (
     <div className="space-y-6">
-      {donating && !autoDetecting && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-          <div className="max-w-xl w-full bg-gray-900/90 border border-gray-700 rounded-2xl p-6 space-y-4">
-            <div className="flex items-center gap-3">
-              <Loader2 className="w-6 h-6 text-green-400 animate-spin" />
-              <div>
-                <p className="text-lg font-semibold text-white">
-                  Consolidating Addresses...
-                </p>
-                <p className="text-sm text-gray-400">
-                  Donations are running in parallel. Keep the app open until completion.
-                </p>
-              </div>
-            </div>
-
-            {donationStatus && (
-              <div className="space-y-1 text-sm text-gray-300">
-                <p>
-                  Address {donationStatus.currentNumber}/{donationStatus.total}
-                </p>
-                <p>
-                  Index:{' '}
-                  <span className="text-white font-semibold">{donationStatus.currentIndex ?? 'N/A'}</span>
-                </p>
-                {donationStatus.currentAddress && (
-                  <p className="font-mono text-xs break-all text-gray-400">
-                    {donationStatus.currentAddress}
-                  </p>
-                )}
-                <p className="text-xs text-gray-500">
-                  Total addresses queued: {donationStatus.total.toLocaleString()}
-                </p>
-              </div>
-            )}
-
-            {donationProgress && (
-              <div className="space-y-2">
-                <div className="w-full bg-gray-800 rounded-full h-2">
-                  <div
-                    className="bg-green-500 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${(donationProgress.current / donationProgress.total) * 100}%` }}
-                  />
-                </div>
-                <p className="text-xs text-gray-400">
-                  {donationProgress.current}/{donationProgress.total} donations processed
-                </p>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       <Card variant="bordered">
         <CardHeader>
@@ -1878,6 +1827,18 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                     'Donate to Destination Address'
                   )}
                 </Button>
+                
+                {/* Inline status for donate-single */}
+                {donating && viewMode === 'donate-single' && (
+                  <Card variant="bordered" className="bg-green-900/30 border-green-700/40">
+                    <CardContent className="pt-6">
+                      <div className="flex items-center gap-2">
+                        <Loader2 className="w-4 h-4 text-green-400 animate-spin" />
+                        <p className="text-sm font-semibold text-green-200">Processing Donation...</p>
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
               </div>
             </div>
           )}
@@ -1896,6 +1857,40 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 </div>
               </Alert>
               <div className="space-y-4">
+                {/* Inline status for donate-range */}
+                {donating && viewMode === 'donate-range' && (
+                  <Card variant="bordered" className="bg-green-900/30 border-green-700/40">
+                    <CardContent className="pt-6">
+                      <div className="space-y-3">
+                        <div className="flex items-center gap-2">
+                          <Loader2 className="w-4 h-4 text-green-400 animate-spin" />
+                          <p className="text-sm font-semibold text-green-200">Processing Donations...</p>
+                        </div>
+                        {donationStatus && (
+                          <div className="text-sm text-green-300">
+                            Address {donationStatus.currentNumber}/{donationStatus.total}
+                            {donationStatus.currentIndex !== undefined && (
+                              <> (Index: <span className="text-white font-semibold">{donationStatus.currentIndex}</span>)</>
+                            )}
+                          </div>
+                        )}
+                        {donationProgress && (
+                          <div className="space-y-1">
+                            <div className="w-full bg-gray-800 rounded-full h-2">
+                              <div
+                                className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                                style={{ width: `${(donationProgress.current / donationProgress.total) * 100}%` }}
+                              />
+                            </div>
+                            <p className="text-xs text-gray-400">
+                              {donationProgress.current}/{donationProgress.total} donations processed
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <label className="block text-sm font-medium text-gray-300">
