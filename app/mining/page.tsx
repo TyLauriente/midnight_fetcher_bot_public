@@ -953,86 +953,170 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     setFailedDonationQueue([]);
     setAutoDetectionRange(null);
     resetDestinationCounters();
-    setAutoDetecting(true);
     setDonating(true);
 
     try {
-      const detectedRequests: DonationRequestPayload[] = [];
       const destination = donateDestinationAddress.trim();
       let lastRegisteredOffset = -1;
 
-      // Helper function to check if an address is registered by attempting a donation
-      const checkAddressRegisteredViaDonation = async (address: string, addressIndex: number): Promise<boolean> => {
-        try {
-          const response = await fetch('/api/wallet/donate-to', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              password: pwd,
-              sourceAddress: address,
-              sourceAddressIndex: addressIndex,
-              destinationAddress: destination,
-            }),
-          });
-
-          const data = await response.json();
-          
-          // Check if the error indicates the address is not registered
-          if (!data.success && data.error) {
-            const errorMsg = (data.error || '').toLowerCase();
-            // Check for various "not registered" error messages
-            if (errorMsg.includes('not registered') || 
-                errorMsg.includes('unregistered') ||
-                errorMsg.includes('no registered') ||
-                errorMsg.includes('has no registered')) {
-              return false; // Address is not registered
-            }
-          }
-          
-          // If successful or other error, consider it registered (or at least worth processing)
-          return true;
-        } catch (err: any) {
-          // On network errors, assume registered to be safe
-          logDonationMessage(`Error checking address ${address.substring(0, 20)}... via donation: ${err.message}`);
-          return true;
-        }
+      // Helper function to check if donation error indicates address is not registered
+      const isNotRegisteredError = (error: string): boolean => {
+        const errorMsg = (error || '').toLowerCase();
+        return errorMsg.includes('not registered') || 
+               errorMsg.includes('unregistered') ||
+               errorMsg.includes('no registered') ||
+               errorMsg.includes('has no registered');
       };
 
-      // Iterate through offsets sequentially, checking via donation API
+      // Collect all requests as we process offsets
+      const allRequests: DonationRequestPayload[] = [];
+
+      // Iterate through offsets sequentially
       for (let offset = 0; offset < AUTO_MAX_OFFSET; offset++) {
-        setAutoDetectionStatus({ currentOffset: offset });
-        logDonationMessage(`Checking offset ${offset} for registered addresses...`);
+        logDonationMessage(`Processing offset ${offset} (addresses ${offsetToStartIndex(offset)}-${offsetToEndIndex(offset)})...`);
 
         const offsetStart = offsetToStartIndex(offset);
+        const offsetEnd = offsetToEndIndex(offset);
         
         try {
-          // Derive first address in this offset as a sample
-          const sampleResponse = await fetch('/api/wallet/derive-addresses', {
+          // Derive all 200 addresses for this offset
+          const deriveResponse = await fetch('/api/wallet/derive-addresses', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               password: pwd,
               startIndex: offsetStart,
-              endIndex: offsetStart,
+              endIndex: offsetEnd,
             }),
           });
 
-          const sampleData = await sampleResponse.json();
-          if (!sampleResponse.ok || !sampleData.addresses?.[0]) {
-            logDonationMessage(`Offset ${offset}: Failed to derive sample address`);
-            // If we can't derive, assume end of range
+          const deriveData = await deriveResponse.json();
+          if (!deriveResponse.ok || !deriveData.addresses || deriveData.addresses.length === 0) {
+            logDonationMessage(`Offset ${offset}: Failed to derive addresses`);
             break;
           }
 
-          const sampleAddress = sampleData.addresses[0];
-          
-          // Check if this address is registered via donation API
-          const isRegistered = await checkAddressRegisteredViaDonation(sampleAddress.bech32, offsetStart);
-          
-          if (!isRegistered) {
-            logDonationMessage(`Offset ${offset}: Sample address not registered, checking next offset as sanity check...`);
+          // Prepare requests for all addresses in this offset
+          const offsetRequests: DonationRequestPayload[] = [];
+          for (const addr of deriveData.addresses) {
+            if (addr.bech32 !== destination) {
+              offsetRequests.push({
+                sourceAddress: addr.bech32,
+                sourceIndex: addr.index,
+                destinationAddress: destination,
+                solutions: 0,
+                night: 0,
+              });
+            }
+          }
+
+          if (offsetRequests.length === 0) {
+            continue;
+          }
+
+          // Check first address as a sample to see if this offset has registered addresses
+          const sampleRequest = offsetRequests[0];
+          let hasRegisteredAddress = false;
+          let allNotRegistered = true;
+
+          try {
+            const sampleResponse = await fetch('/api/wallet/donate-to', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                password: pwd,
+                sourceAddress: sampleRequest.sourceAddress,
+                sourceAddressIndex: sampleRequest.sourceIndex,
+                destinationAddress: destination,
+              }),
+            });
+
+            const sampleData = await sampleResponse.json();
             
-            // Sanity check: also check the next offset
+            if (sampleResponse.ok && sampleData.success) {
+              hasRegisteredAddress = true;
+              allNotRegistered = false;
+            } else if (sampleData.error && isNotRegisteredError(sampleData.error)) {
+              // Sample address is not registered - check all addresses to be sure
+              allNotRegistered = true;
+            } else {
+              // Other error - consider it registered
+              hasRegisteredAddress = true;
+              allNotRegistered = false;
+            }
+          } catch (err: any) {
+            // On error, assume registered to be safe
+            hasRegisteredAddress = true;
+            allNotRegistered = false;
+          }
+
+          // If sample indicates not registered, check all addresses in this offset
+          if (allNotRegistered) {
+            logDonationMessage(`Offset ${offset}: Sample address not registered, checking all addresses...`);
+            
+            // Check a few more addresses to be sure
+            const checkCount = Math.min(5, offsetRequests.length);
+            let checkedNotRegistered = 0;
+            
+            for (let i = 0; i < checkCount; i++) {
+              const checkRequest = offsetRequests[i];
+              try {
+                const checkResponse = await fetch('/api/wallet/donate-to', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    password: pwd,
+                    sourceAddress: checkRequest.sourceAddress,
+                    sourceAddressIndex: checkRequest.sourceIndex,
+                    destinationAddress: destination,
+                  }),
+                });
+
+                const checkData = await checkResponse.json();
+                
+                if (checkResponse.ok && checkData.success) {
+                  hasRegisteredAddress = true;
+                  allNotRegistered = false;
+                  break;
+                } else if (checkData.error && isNotRegisteredError(checkData.error)) {
+                  checkedNotRegistered++;
+                } else {
+                  hasRegisteredAddress = true;
+                  allNotRegistered = false;
+                  break;
+                }
+              } catch (err: any) {
+                hasRegisteredAddress = true;
+                allNotRegistered = false;
+                break;
+              }
+            }
+
+            // If all checked addresses are not registered, consider the whole offset not registered
+            if (checkedNotRegistered === checkCount) {
+              allNotRegistered = true;
+            }
+          }
+
+          // If this offset has registered addresses, process all of them
+          if (hasRegisteredAddress) {
+            lastRegisteredOffset = offset;
+            logDonationMessage(`Offset ${offset}: Has registered addresses, processing all ${offsetRequests.length} addresses...`);
+            
+            // Initialize counters if this is the first offset
+            if (offset === 0) {
+              await initializeDestinationCounters(offsetRequests, destination);
+            }
+
+            // Process donations for this offset
+            await processDonations(offsetRequests, pwd, destination);
+          }
+
+          // Check if we should continue
+          if (allNotRegistered && offsetRequests.length > 0) {
+            logDonationMessage(`Offset ${offset}: All addresses not registered, checking next offset as sanity check...`);
+            
+            // Sanity check: check the next offset
             if (offset + 1 < AUTO_MAX_OFFSET) {
               const nextOffsetStart = offsetToStartIndex(offset + 1);
               try {
@@ -1049,12 +1133,32 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 const nextSampleData = await nextSampleResponse.json();
                 if (nextSampleResponse.ok && nextSampleData.addresses?.[0]) {
                   const nextSampleAddress = nextSampleData.addresses[0];
-                  const nextIsRegistered = await checkAddressRegisteredViaDonation(nextSampleAddress.bech32, nextOffsetStart);
                   
-                  if (nextIsRegistered) {
+                  // Try to donate the sample address
+                  const sampleResponse = await fetch('/api/wallet/donate-to', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      password: pwd,
+                      sourceAddress: nextSampleAddress.bech32,
+                      sourceAddressIndex: nextSampleAddress.index,
+                      destinationAddress: destination,
+                    }),
+                  });
+
+                  const sampleData = await sampleResponse.json();
+                  
+                  if (sampleResponse.ok && sampleData.success) {
                     logDonationMessage(`Offset ${offset + 1}: Has registered address, continuing...`);
-                    // Continue processing, this offset was just skipped
+                    // Continue to next offset
                     continue;
+                  } else if (sampleData.error && isNotRegisteredError(sampleData.error)) {
+                    logDonationMessage(`Offset ${offset + 1}: Also not registered, reached end`);
+                    // Both offsets are not registered, we've reached the end
+                    if (lastRegisteredOffset >= 0) {
+                      setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+                    }
+                    break;
                   }
                 }
               } catch (err: any) {
@@ -1062,7 +1166,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
               }
             }
             
-            // Both current and next offset are not registered, we've reached the end
+            // Reached the end
             logDonationMessage(`Reached end of registered addresses at offset ${offset}`);
             if (lastRegisteredOffset >= 0) {
               setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
@@ -1070,53 +1174,19 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             break;
           }
 
-          // Address is registered, derive all addresses in this offset and add to requests
-          logDonationMessage(`Offset ${offset}: Has registered addresses, deriving all addresses...`);
-          lastRegisteredOffset = offset;
-          
-          const chunkStart = offsetToStartIndex(offset);
-          const chunkEnd = offsetToEndIndex(offset);
-          
-          const chunkResponse = await fetch('/api/wallet/derive-addresses', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              password: pwd,
-              startIndex: chunkStart,
-              endIndex: chunkEnd,
-            }),
-          });
-
-          const chunkData = await chunkResponse.json();
-          if (!chunkResponse.ok) {
-            logDonationMessage(`Error deriving addresses for offset ${offset}: ${chunkData.error}`);
-            continue;
+          // This offset has registered addresses
+          if (hasRegisteredAddress) {
+            lastRegisteredOffset = offset;
+            logDonationMessage(`Offset ${offset}: Has registered addresses, continuing to next offset...`);
           }
-
-          // Add all addresses from this offset (we'll process donations later)
-          chunkData.addresses.forEach((addr: any) => {
-            if (addr.bech32 !== destination) {
-              detectedRequests.push({
-                sourceAddress: addr.bech32,
-                sourceIndex: addr.index,
-                destinationAddress: destination,
-                solutions: 0, // Will be updated from donation response
-                night: 0, // Will be updated from donation response
-              });
-            }
-          });
 
         } catch (err: any) {
           logDonationMessage(`Error processing offset ${offset}: ${err.message}`);
-          // On error, assume we've reached the end
           break;
         }
       }
 
-      setAutoDetectionStatus(null);
-      setAutoDetecting(false);
-
-      if (detectedRequests.length === 0) {
+      if (lastRegisteredOffset < 0 || allRequests.length === 0) {
         setDonating(false);
         setError('No registered addresses found for auto consolidate.');
         return;
@@ -1126,9 +1196,9 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
       }
 
-      logDonationMessage(`Auto consolidate will process ${detectedRequests.length} addresses from offsets 0-${lastRegisteredOffset}`);
-      await initializeDestinationCounters(detectedRequests, destination);
-      await processDonations(detectedRequests, pwd, destination);
+      logDonationMessage(`Auto consolidate completed detection. Processed ${allRequests.length} addresses from offsets 0-${lastRegisteredOffset}`);
+      // Donations have already been processed during detection, so we're done
+      setDonating(false);
     } catch (err: any) {
       setError(err.message || 'Auto consolidate failed');
     } finally {
@@ -1399,7 +1469,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
 
   return (
     <div className="space-y-6">
-      {(donating || autoDetecting) && (
+      {donating && !autoDetecting && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
           <div className="max-w-xl w-full bg-gray-900/90 border border-gray-700 rounded-2xl p-6 space-y-4">
             <div className="flex items-center gap-3">
