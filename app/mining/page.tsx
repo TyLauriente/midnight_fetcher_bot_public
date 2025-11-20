@@ -235,9 +235,13 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
   const [autoDetectionStatus, setAutoDetectionStatus] = useState<{ currentOffset: number } | null>(null);
   const [donationResultCounters, setDonationResultCounters] = useState<Record<DonationResultType, number>>(initialResultCounters);
   const totalDonationOutcomeCount = Object.values(donationResultCounters).reduce((sum, count) => sum + count, 0);
-  const [derivationStatus, setDerivationStatus] = useState<{ currentOffset: number; totalOffsets: number } | null>(null);
+  const [derivationProgress, setDerivationProgress] = useState<{ completed: number; total: number; label: string } | null>(null);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [itemsPerPage, setItemsPerPage] = useState<number>(100);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [statistics.length, addresses.length, viewMode, itemsPerPage]);
 
   const classifyDonationOutcome = (
     success: boolean,
@@ -339,6 +343,71 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     } catch {
       return fallback || '—';
     }
+  };
+
+  const deriveAddressesByOffsetRange = async (
+    passwordValue: string,
+    startOffset: number,
+    endOffset: number,
+    label: string
+  ) => {
+    const offsets: number[] = [];
+    for (let offset = startOffset; offset <= endOffset; offset++) {
+      offsets.push(offset);
+    }
+
+    if (offsets.length === 0) {
+      return [];
+    }
+
+    setDerivationProgress({ completed: 0, total: offsets.length, label });
+    const derived: any[] = [];
+    let completedOffsets = 0;
+    let nextOffsetIndex = 0;
+    const concurrency = Math.min(DERIVATION_CONCURRENCY, offsets.length);
+
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const currentIndex = nextOffsetIndex++;
+        if (currentIndex >= offsets.length) break;
+        const offset = offsets[currentIndex];
+        const startIndex = offsetToStartIndex(offset);
+        const endIndex = offsetToEndIndex(offset);
+
+        const response = await fetch('/api/wallet/derive-addresses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            password: passwordValue,
+            startIndex,
+            endIndex,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || `Failed to derive addresses for offset ${offset}`);
+        }
+
+        if (Array.isArray(data.addresses)) {
+          derived.push(...data.addresses);
+        }
+
+        completedOffsets++;
+        setDerivationProgress(prev =>
+          prev && prev.label === label ? { ...prev, completed: completedOffsets } : prev
+        );
+      }
+    });
+
+    try {
+      await Promise.all(workers);
+    } finally {
+      setDerivationProgress(null);
+    }
+
+    return derived.sort((a: any, b: any) => (a.index ?? 0) - (b.index ?? 0));
   };
 
   const fetchStatsForRecords = async (
@@ -716,35 +785,23 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     setFailedDonationQueue([]);
     resetDestinationCounters();
     setDonating(true);
-    setDerivationStatus({ currentOffset: startOffset, totalOffsets: endOffset - startOffset + 1 });
 
     try {
       logDonationMessage(`Starting range donation for offsets ${startOffset}-${endOffset} (addresses ${startAddressIndex}-${endAddressIndex})`);
-      const deriveResponse = await fetch('/api/wallet/derive-addresses', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          password: pwd,
-          startIndex: startAddressIndex,
-          endIndex: endAddressIndex,
-        }),
-      });
-
-      const deriveData = await deriveResponse.json();
-
-      if (!deriveResponse.ok) {
-        throw new Error(deriveData.error || 'Failed to derive addresses');
-      }
-
-      setDerivationStatus(null);
+      const derivedAddresses = await deriveAddressesByOffsetRange(
+        pwd,
+        startOffset,
+        endOffset,
+        `Deriving offsets ${startOffset}-${endOffset} for donation`
+      );
 
       const { stats: rangeStats } = await fetchStatsForRecords(
-        deriveData.addresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 }))
+        derivedAddresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 }))
       );
       const statsMap = new Map(rangeStats.map(stat => [stat.bech32, stat]));
 
       const requests: DonationRequestPayload[] = [];
-      deriveData.addresses.forEach((addr: any) => {
+      derivedAddresses.forEach((addr: any) => {
         if (addr.bech32 === donateDestinationAddress.trim()) {
           return;
         }
@@ -898,6 +955,9 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         return;
       }
 
+      setDerivationProgress({ completed: 0, total: registeredOffsets.length, label: 'Deriving auto-consolidation offsets' });
+      let completedAutoDerivations = 0;
+
       const deriveWorkers = Array.from({ length: Math.min(DERIVATION_CONCURRENCY, registeredOffsets.length) }, async (_, workerId) => {
         for (let i = workerId; i < registeredOffsets.length; i += DERIVATION_CONCURRENCY) {
           const offset = registeredOffsets[i];
@@ -941,13 +1001,27 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 });
               }
             });
+
+            completedAutoDerivations++;
+            setDerivationProgress(prev =>
+              prev && prev.total === registeredOffsets.length
+                ? { ...prev, completed: Math.min(completedAutoDerivations, registeredOffsets.length) }
+                : prev
+            );
           } catch (err: any) {
             logDonationMessage(`Error processing offset ${offset}: ${err.message}`);
+            completedAutoDerivations++;
+            setDerivationProgress(prev =>
+              prev && prev.total === registeredOffsets.length
+                ? { ...prev, completed: Math.min(completedAutoDerivations, registeredOffsets.length) }
+                : prev
+            );
           }
         }
       });
 
       await Promise.all(deriveWorkers);
+      setDerivationProgress(null);
 
       setAutoDetectionStatus(null);
       setAutoDetecting(false);
@@ -975,6 +1049,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     } finally {
       setAutoDetectionStatus(null);
       setAutoDetecting(false);
+      setDerivationProgress(null);
       setDonating(false);
     }
   };
@@ -1112,35 +1187,23 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     setStatistics([]);
     setTotals(null);
     setCheckProgress(null);
-    setDerivationStatus({ currentOffset: startOffset, totalOffsets: endOffset - startOffset + 1 });
 
     try {
       const pwd = password || passwordInput;
 
-      // Derive addresses with progress tracking
-      const deriveResponse = await fetch('/api/wallet/derive-addresses', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          password: pwd,
-          startIndex: startAddressIndex,
-          endIndex: endAddressIndex,
-        }),
-      });
+      const derivedAddresses = await deriveAddressesByOffsetRange(
+        pwd,
+        startOffset,
+        endOffset,
+        `Deriving offsets ${startOffset}-${endOffset}`
+      );
 
-      const deriveData = await deriveResponse.json();
-
-      if (!deriveResponse.ok) {
-        throw new Error(deriveData.error || 'Failed to derive addresses');
-      }
-
-      setAddresses(deriveData.addresses);
-      setDerivationStatus(null);
+      setAddresses(derivedAddresses);
 
       // Automatically check statistics
       setCheckingStats(true);
       const { stats, totals } = await fetchStatsForRecords(
-        deriveData.addresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 })),
+        derivedAddresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 })),
         true
       );
       setStatistics(stats);
@@ -1151,30 +1214,23 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
       setLoading(false);
       setCheckingStats(false);
       setCheckProgress(null);
-      setDerivationStatus(null);
     }
   };
 
   return (
     <div className="space-y-6">
-      {(donating || autoDetecting || derivationStatus || loading) && (
+      {(donating || autoDetecting) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
           <div className="max-w-xl w-full bg-gray-900/90 border border-gray-700 rounded-2xl p-6 space-y-4">
             <div className="flex items-center gap-3">
               <Loader2 className="w-6 h-6 text-green-400 animate-spin" />
               <div>
                 <p className="text-lg font-semibold text-white">
-                  {autoDetecting
-                    ? 'Detecting Registered Addresses...'
-                    : derivationStatus || loading
-                    ? 'Deriving Addresses...'
-                    : 'Consolidating Addresses...'}
+                  {autoDetecting ? 'Detecting Registered Addresses...' : 'Consolidating Addresses...'}
                 </p>
                 <p className="text-sm text-gray-400">
                   {autoDetecting
                     ? 'Scanning wallet indexes to find registered sources.'
-                    : derivationStatus || loading
-                    ? 'Generating addresses from wallet seed phrase.'
                     : 'Donations are running in parallel. Keep the app open until completion.'}
                 </p>
               </div>
@@ -1187,15 +1243,6 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 {' '}
                 (addresses {offsetToStartIndex(autoDetectionStatus.currentOffset)}-
                 {offsetToEndIndex(autoDetectionStatus.currentOffset)})
-              </div>
-            )}
-
-            {derivationStatus && (
-              <div className="text-sm text-gray-300">
-                Deriving addresses for offset{' '}
-                <span className="text-white font-semibold">{derivationStatus.currentOffset}</span>
-                {' '}
-                ({derivationStatus.currentOffset + 1}/{derivationStatus.totalOffsets} offsets)
               </div>
             )}
 
@@ -1327,6 +1374,23 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 placeholder="Enter wallet password"
               />
+            </div>
+          )}
+
+          {derivationProgress && (
+            <div className="bg-blue-900/30 border border-blue-700/40 rounded-lg p-4 space-y-2">
+              <div className="flex justify-between items-center text-sm text-blue-200">
+                <span>{derivationProgress.label}</span>
+                <span>
+                  {derivationProgress.completed.toLocaleString()} / {derivationProgress.total.toLocaleString()} completed
+                </span>
+              </div>
+              <div className="w-full bg-gray-800 rounded-full h-2">
+                <div
+                  className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(derivationProgress.completed / derivationProgress.total) * 100}%` }}
+                />
+              </div>
             </div>
           )}
 
