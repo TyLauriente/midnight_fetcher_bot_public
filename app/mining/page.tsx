@@ -122,6 +122,7 @@ interface DonationResultItem extends DonationRequestPayload {
   response?: any;
   timestamp: string;
   resultType: DonationResultType;
+  solutionsConsolidated?: number;
 }
 
 interface DestinationCounters {
@@ -144,6 +145,7 @@ const STARS_PER_NIGHT = 1_000_000;
 const convertStarsToNight = (value: number) => value / STARS_PER_NIGHT;
 const formatNightValue = (value: number) =>
   value.toLocaleString(undefined, { minimumFractionDigits: 6, maximumFractionDigits: 6 });
+const NIGHT_PER_SOLUTION_ESTIMATE = 2; // Average NIGHT per solution for most of the mine
 const offsetToStartIndex = (offset: number) => offset * ADDRESSES_PER_OFFSET;
 const offsetToEndIndex = (offset: number) => (offset + 1) * ADDRESSES_PER_OFFSET - 1;
 const initialResultCounters: Record<DonationResultType, number> = {
@@ -235,6 +237,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
   const [autoDetectionStatus, setAutoDetectionStatus] = useState<{ currentOffset: number } | null>(null);
   const [donationResultCounters, setDonationResultCounters] = useState<Record<DonationResultType, number>>(initialResultCounters);
   const totalDonationOutcomeCount = Object.values(donationResultCounters).reduce((sum, count) => sum + count, 0);
+  const [consolidatedMetrics, setConsolidatedMetrics] = useState<{ totalSolutions: number; estimatedNight: number }>({ totalSolutions: 0, estimatedNight: 0 });
   const [derivationProgress, setDerivationProgress] = useState<{ completed: number; total: number; label: string } | null>(null);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [itemsPerPage, setItemsPerPage] = useState<number>(100);
@@ -284,6 +287,8 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     setDestinationCounters(initialDestinationCounters);
     setCurrentDestinationAddress(null);
     setDonationResultCounters(initialResultCounters);
+    setConsolidatedMetrics({ totalSolutions: 0, estimatedNight: 0 });
+    setConsolidatedMetrics({ totalSolutions: 0, estimatedNight: 0 });
   };
 
   const initializeDestinationCounters = async (
@@ -637,6 +642,9 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         });
         const result = await attemptDonationWithRetries(request, passwordValue);
 
+        // Extract solutions_consolidated from response
+        const solutionsConsolidated = result.response?.solutions_consolidated;
+
         results[currentIndex] = {
           ...request,
           success: result.success,
@@ -645,12 +653,21 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
           response: result.response,
           timestamp: new Date().toISOString(),
           resultType: result.resultType,
+          solutionsConsolidated: solutionsConsolidated,
         };
 
         setDonationResultCounters(prev => ({
           ...prev,
           [result.resultType]: prev[result.resultType] + 1,
         }));
+
+        // Track consolidated solutions and estimated NIGHT
+        if (result.success && solutionsConsolidated !== undefined && solutionsConsolidated > 0) {
+          setConsolidatedMetrics((prev: { totalSolutions: number; estimatedNight: number }) => ({
+            totalSolutions: prev.totalSolutions + solutionsConsolidated,
+            estimatedNight: prev.estimatedNight + (solutionsConsolidated * NIGHT_PER_SOLUTION_ESTIMATE),
+          }));
+        }
 
         if (!result.success && result.resultType === 'error') {
           failedQueue.push(request);
@@ -944,139 +961,157 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
       const destination = donateDestinationAddress.trim();
       let lastRegisteredOffset = -1;
 
-      // First pass: quickly check which offsets have registered addresses (parallel)
-      const offsetChecks: Array<{ offset: number; isRegistered: boolean }> = [];
-      const checkWorkers = Array.from({ length: Math.min(DERIVATION_CONCURRENCY, AUTO_MAX_OFFSET) }, async (_, workerId) => {
-        for (let offset = workerId; offset < AUTO_MAX_OFFSET; offset += DERIVATION_CONCURRENCY) {
-          setAutoDetectionStatus({ currentOffset: offset });
-          const sampleStart = offsetToStartIndex(offset);
+      // Helper function to check if an address is registered by attempting a donation
+      const checkAddressRegisteredViaDonation = async (address: string, addressIndex: number): Promise<boolean> => {
+        try {
+          const response = await fetch('/api/wallet/donate-to', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              password: pwd,
+              sourceAddress: address,
+              sourceAddressIndex: addressIndex,
+              destinationAddress: destination,
+            }),
+          });
+
+          const data = await response.json();
           
-          try {
-            const sampleResponse = await fetch('/api/wallet/derive-addresses', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                password: pwd,
-                startIndex: sampleStart,
-                endIndex: sampleStart,
-              }),
-            });
-
-            const sampleData = await sampleResponse.json();
-            if (!sampleResponse.ok || !sampleData.addresses?.[0]) {
-              offsetChecks.push({ offset, isRegistered: false });
-              continue;
+          // Check if the error indicates the address is not registered
+          if (!data.success && data.error) {
+            const errorMsg = (data.error || '').toLowerCase();
+            // Check for various "not registered" error messages
+            if (errorMsg.includes('not registered') || 
+                errorMsg.includes('unregistered') ||
+                errorMsg.includes('no registered') ||
+                errorMsg.includes('has no registered')) {
+              return false; // Address is not registered
             }
-
-            const sampleAddress = sampleData.addresses[0];
-            const { stats: sampleStats } = await fetchStatsForRecords([{ index: sampleStart, bech32: sampleAddress.bech32 }]);
-            const sampleEntry = sampleStats[0];
-            const isRegistered = !!sampleEntry?.registered;
-
-            logDonationMessage(
-              `Auto detect offset ${offset} (${sampleStart}-${offsetToEndIndex(offset)}): ${isRegistered ? 'registered' : 'not registered'}`
-            );
-
-            offsetChecks.push({ offset, isRegistered });
-          } catch (err: any) {
-            logDonationMessage(`Error checking offset ${offset}: ${err.message}`);
-            offsetChecks.push({ offset, isRegistered: false });
           }
+          
+          // If successful or other error, consider it registered (or at least worth processing)
+          return true;
+        } catch (err: any) {
+          // On network errors, assume registered to be safe
+          logDonationMessage(`Error checking address ${address.substring(0, 20)}... via donation: ${err.message}`);
+          return true;
         }
-      });
+      };
 
-      await Promise.all(checkWorkers);
+      // Iterate through offsets sequentially, checking via donation API
+      for (let offset = 0; offset < AUTO_MAX_OFFSET; offset++) {
+        setAutoDetectionStatus({ currentOffset: offset });
+        logDonationMessage(`Checking offset ${offset} for registered addresses...`);
 
-      // Sort by offset and find the last registered offset
-      offsetChecks.sort((a, b) => a.offset - b.offset);
-      for (const check of offsetChecks) {
-        if (!check.isRegistered) {
-          if (lastRegisteredOffset >= 0) {
-            setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
-          } else {
-            setAutoDetectionRange(null);
+        const offsetStart = offsetToStartIndex(offset);
+        
+        try {
+          // Derive first address in this offset as a sample
+          const sampleResponse = await fetch('/api/wallet/derive-addresses', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              password: pwd,
+              startIndex: offsetStart,
+              endIndex: offsetStart,
+            }),
+          });
+
+          const sampleData = await sampleResponse.json();
+          if (!sampleResponse.ok || !sampleData.addresses?.[0]) {
+            logDonationMessage(`Offset ${offset}: Failed to derive sample address`);
+            // If we can't derive, assume end of range
+            break;
           }
-          break;
-        }
-        lastRegisteredOffset = check.offset;
-      }
 
-      // Second pass: derive and process all registered offsets in parallel
-      const registeredOffsets = offsetChecks.filter(c => c.isRegistered).map(c => c.offset);
-      
-      if (registeredOffsets.length === 0) {
-        setDonating(false);
-        setError('No registered addresses found for auto consolidate.');
-        return;
-      }
+          const sampleAddress = sampleData.addresses[0];
+          
+          // Check if this address is registered via donation API
+          const isRegistered = await checkAddressRegisteredViaDonation(sampleAddress.bech32, offsetStart);
+          
+          if (!isRegistered) {
+            logDonationMessage(`Offset ${offset}: Sample address not registered, checking next offset as sanity check...`);
+            
+            // Sanity check: also check the next offset
+            if (offset + 1 < AUTO_MAX_OFFSET) {
+              const nextOffsetStart = offsetToStartIndex(offset + 1);
+              try {
+                const nextSampleResponse = await fetch('/api/wallet/derive-addresses', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    password: pwd,
+                    startIndex: nextOffsetStart,
+                    endIndex: nextOffsetStart,
+                  }),
+                });
 
-      setDerivationProgress({ completed: 0, total: registeredOffsets.length, label: 'Deriving auto-consolidation offsets' });
-      let completedAutoDerivations = 0;
+                const nextSampleData = await nextSampleResponse.json();
+                if (nextSampleResponse.ok && nextSampleData.addresses?.[0]) {
+                  const nextSampleAddress = nextSampleData.addresses[0];
+                  const nextIsRegistered = await checkAddressRegisteredViaDonation(nextSampleAddress.bech32, nextOffsetStart);
+                  
+                  if (nextIsRegistered) {
+                    logDonationMessage(`Offset ${offset + 1}: Has registered address, continuing...`);
+                    // Continue processing, this offset was just skipped
+                    continue;
+                  }
+                }
+              } catch (err: any) {
+                logDonationMessage(`Error checking next offset ${offset + 1}: ${err.message}`);
+              }
+            }
+            
+            // Both current and next offset are not registered, we've reached the end
+            logDonationMessage(`Reached end of registered addresses at offset ${offset}`);
+            if (lastRegisteredOffset >= 0) {
+              setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+            }
+            break;
+          }
 
-      const deriveWorkers = Array.from({ length: Math.min(DERIVATION_CONCURRENCY, registeredOffsets.length) }, async (_, workerId) => {
-        for (let i = workerId; i < registeredOffsets.length; i += DERIVATION_CONCURRENCY) {
-          const offset = registeredOffsets[i];
-          setAutoDetectionStatus({ currentOffset: offset });
+          // Address is registered, derive all addresses in this offset and add to requests
+          logDonationMessage(`Offset ${offset}: Has registered addresses, deriving all addresses...`);
+          lastRegisteredOffset = offset;
           
           const chunkStart = offsetToStartIndex(offset);
           const chunkEnd = offsetToEndIndex(offset);
           
-          try {
-            const chunkResponse = await fetch('/api/wallet/derive-addresses', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                password: pwd,
-                startIndex: chunkStart,
-                endIndex: chunkEnd,
-              }),
-            });
+          const chunkResponse = await fetch('/api/wallet/derive-addresses', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              password: pwd,
+              startIndex: chunkStart,
+              endIndex: chunkEnd,
+            }),
+          });
 
-            const chunkData = await chunkResponse.json();
-            if (!chunkResponse.ok) {
-              throw new Error(chunkData.error || `Failed to derive chunk for offset ${offset}`);
-            }
-
-            const { stats: chunkStats } = await fetchStatsForRecords(
-              chunkData.addresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 }))
-            );
-
-            chunkData.addresses.forEach((addr: any, idx: number) => {
-              if (addr.bech32 === destination) {
-                return;
-              }
-              const statEntry = chunkStats[idx];
-              if (statEntry?.registered) {
-                detectedRequests.push({
-                  sourceAddress: addr.bech32,
-                  sourceIndex: addr.index,
-                  destinationAddress: destination,
-                  solutions: statEntry?.solutionsSubmitted ?? 0,
-                  night: statEntry?.nightEarned ?? 0,
-                });
-              }
-            });
-
-            completedAutoDerivations++;
-            setDerivationProgress(prev =>
-              prev && prev.total === registeredOffsets.length
-                ? { ...prev, completed: Math.min(completedAutoDerivations, registeredOffsets.length) }
-                : prev
-            );
-          } catch (err: any) {
-            logDonationMessage(`Error processing offset ${offset}: ${err.message}`);
-            completedAutoDerivations++;
-            setDerivationProgress(prev =>
-              prev && prev.total === registeredOffsets.length
-                ? { ...prev, completed: Math.min(completedAutoDerivations, registeredOffsets.length) }
-                : prev
-            );
+          const chunkData = await chunkResponse.json();
+          if (!chunkResponse.ok) {
+            logDonationMessage(`Error deriving addresses for offset ${offset}: ${chunkData.error}`);
+            continue;
           }
-        }
-      });
 
-      await Promise.all(deriveWorkers);
-      setDerivationProgress(null);
+          // Add all addresses from this offset (we'll process donations later)
+          chunkData.addresses.forEach((addr: any) => {
+            if (addr.bech32 !== destination) {
+              detectedRequests.push({
+                sourceAddress: addr.bech32,
+                sourceIndex: addr.index,
+                destinationAddress: destination,
+                solutions: 0, // Will be updated from donation response
+                night: 0, // Will be updated from donation response
+              });
+            }
+          });
+
+        } catch (err: any) {
+          logDonationMessage(`Error processing offset ${offset}: ${err.message}`);
+          // On error, assume we've reached the end
+          break;
+        }
+      }
 
       setAutoDetectionStatus(null);
       setAutoDetecting(false);
@@ -1091,12 +1126,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
       }
 
-      const finalOffset =
-        lastRegisteredOffset >= 0
-          ? lastRegisteredOffset
-          : Math.floor((detectedRequests[detectedRequests.length - 1].sourceIndex ?? 0) / ADDRESSES_PER_OFFSET);
-
-      logDonationMessage(`Auto consolidate will process offsets 0-${finalOffset}`);
+      logDonationMessage(`Auto consolidate will process ${detectedRequests.length} addresses from offsets 0-${lastRegisteredOffset}`);
       await initializeDestinationCounters(detectedRequests, destination);
       await processDonations(detectedRequests, pwd, destination);
     } catch (err: any) {
@@ -1950,38 +1980,39 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             </Card>
           )}
 
-          {destinationCounters.apiSolutions !== null || destinationCounters.apiNight !== null ? (
-            <Card variant="bordered" className="bg-gray-900/40">
+          {/* Consolidated Metrics - Primary tracking metric */}
+          {(consolidatedMetrics.totalSolutions > 0 || donating) && (
+            <Card variant="bordered" className="bg-gradient-to-br from-green-900/30 to-emerald-900/30 border-green-700/50">
               <CardHeader>
-                <CardTitle className="text-sm">Destination Address Summary</CardTitle>
-                {currentDestinationAddress && (
-                  <CardDescription className="font-mono text-xs truncate">
-                    {currentDestinationAddress}
-                  </CardDescription>
-                )}
+                <CardTitle className="text-lg">Consolidation Summary</CardTitle>
+                <CardDescription>
+                  Total solutions and estimated NIGHT consolidated from donation API responses
+                </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-gray-300">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div>
-                    <p className="text-gray-400">API Solutions (may lag)</p>
-                    <p className="text-white text-lg font-semibold">
-                      {destinationCounters.apiSolutions !== null ? destinationCounters.apiSolutions.toLocaleString() : 'N/A'}
+                    <p className="text-sm text-gray-400 mb-2">Total Solutions Consolidated</p>
+                    <p className="text-3xl font-bold text-green-400">
+                      {consolidatedMetrics.totalSolutions.toLocaleString()}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-2">
+                      From successful donation API responses
                     </p>
                   </div>
                   <div>
-                    <p className="text-gray-400">API NIGHT (may lag)</p>
-                    <p className="text-white text-lg font-semibold">
-                      {destinationCounters.apiNight !== null ? formatNightValue(destinationCounters.apiNight) : 'N/A'}
+                    <p className="text-sm text-gray-400 mb-2">Estimated NIGHT Consolidated</p>
+                    <p className="text-3xl font-bold text-yellow-400">
+                      {formatNightValue(consolidatedMetrics.estimatedNight)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-2">
+                      Estimated at {NIGHT_PER_SOLUTION_ESTIMATE} NIGHT per solution
                     </p>
                   </div>
                 </div>
-                <p className="text-xs text-gray-500 mt-4">
-                  API values come directly from Midnight and may lag until the network finalizes each consolidation.
-                  These values are only updated after all donations complete.
-                </p>
               </CardContent>
             </Card>
-          ) : null}
+          )}
 
           {(totalDonationOutcomeCount > 0 || donating) && (
             <Card variant="bordered" className="bg-gray-900/50">
@@ -2025,6 +2056,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                         <th className="text-left py-2 px-4 text-gray-400">Index</th>
                         <th className="text-left py-2 px-4 text-gray-400">Source Address</th>
                         <th className="text-left py-2 px-4 text-gray-400">Destination</th>
+                        <th className="text-left py-2 px-4 text-gray-400">Solutions</th>
                         <th className="text-left py-2 px-4 text-gray-400">Result</th>
                         <th className="text-left py-2 px-4 text-gray-400">API Response / Message</th>
                       </tr>
@@ -2040,6 +2072,15 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                           </td>
                           <td className="py-2 px-4">
                             <span className="font-mono text-xs text-gray-300">{result.destinationAddress.substring(0, 30)}...</span>
+                          </td>
+                          <td className="py-2 px-4 text-gray-300">
+                            {result.solutionsConsolidated !== undefined ? (
+                              <span className="font-semibold text-green-400">
+                                {result.solutionsConsolidated.toLocaleString()}
+                              </span>
+                            ) : (
+                              <span className="text-gray-500">—</span>
+                            )}
                           </td>
                           <td className="py-2 px-4">
                             <span
