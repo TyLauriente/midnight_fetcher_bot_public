@@ -155,12 +155,61 @@ export async function POST(request: NextRequest) {
           if (currentIndex >= addresses.length) break;
 
           const address = addresses[currentIndex];
-          const stat = await fetchStatsWithPage(workerPage, address);
+          let retries = 3;
+          let stat: AddressStatistics | null = null;
+
+          while (retries > 0 && !stat) {
+            try {
+              stat = await fetchStatsWithPage(workerPage, address);
+              if (stat.error && retries > 1) {
+                // If there's an error, retry (might be transient)
+                stat = null;
+                retries--;
+                await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)));
+              } else {
+                break;
+              }
+            } catch (err: any) {
+              retries--;
+              if (retries === 0) {
+                stat = {
+                  registered: false,
+                  solutionsSubmitted: 0,
+                  nightEarned: 0,
+                  error: err.message || 'Failed to fetch statistics',
+                };
+              } else {
+                await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)));
+              }
+            }
+          }
+
+          if (!stat) {
+            stat = {
+              registered: false,
+              solutionsSubmitted: 0,
+              nightEarned: 0,
+              error: 'Failed after retries',
+            };
+          }
 
           statistics[currentIndex] = stat;
           if (stat.error) {
             errors.push({ address, error: stat.error });
           }
+        }
+      } catch (err: any) {
+        console.error('[API] Worker error:', err);
+        // Mark remaining addresses in this worker's range as failed
+        while (true) {
+          const currentIndex = nextIndex++;
+          if (currentIndex >= addresses.length) break;
+          statistics[currentIndex] = {
+            registered: false,
+            solutionsSubmitted: 0,
+            nightEarned: 0,
+            error: `Worker error: ${err.message}`,
+          };
         }
       } finally {
         await workerPage.close();

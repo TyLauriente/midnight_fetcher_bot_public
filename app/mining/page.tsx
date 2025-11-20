@@ -236,6 +236,8 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
   const [donationResultCounters, setDonationResultCounters] = useState<Record<DonationResultType, number>>(initialResultCounters);
   const totalDonationOutcomeCount = Object.values(donationResultCounters).reduce((sum, count) => sum + count, 0);
   const [derivationStatus, setDerivationStatus] = useState<{ currentOffset: number; totalOffsets: number } | null>(null);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [itemsPerPage, setItemsPerPage] = useState<number>(100);
 
   const classifyDonationOutcome = (
     success: boolean,
@@ -378,37 +380,82 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         if (startIndex >= records.length) break;
 
         const batchRecords = records.slice(startIndex, startIndex + STATS_BATCH_SIZE);
-        const response = await fetch('/api/wallet/check-statistics', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ addresses: batchRecords.map(r => r.bech32) }),
-        });
+        let retries = 3;
+        let batchSuccess = false;
 
-        const data = await response.json();
+        while (retries > 0 && !batchSuccess) {
+          try {
+            const response = await fetch('/api/wallet/check-statistics', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ addresses: batchRecords.map(r => r.bech32) }),
+            });
 
-        if (!response.ok || !data.success) {
-          throw new Error(data.error || 'Failed to fetch statistics');
+            const data = await response.json();
+
+            if (!response.ok || !data.success) {
+              throw new Error(data.error || 'Failed to fetch statistics');
+            }
+
+            // Validate that we got the expected number of statistics
+            if (!data.statistics || data.statistics.length !== batchRecords.length) {
+              throw new Error(`Expected ${batchRecords.length} statistics, got ${data.statistics?.length || 0}`);
+            }
+
+            if (data.totals) {
+              aggregatedTotals.registeredCount += data.totals.registeredCount || 0;
+              aggregatedTotals.totalSolutions += data.totals.totalSolutions || 0;
+              aggregatedTotals.totalNight += convertStarsToNight(data.totals.totalNight || 0);
+            }
+
+            batchRecords.forEach((record, idx) => {
+              const stat = data.statistics[idx];
+              if (!stat) {
+                // If stat is missing, mark as error but don't throw
+                results[startIndex + idx] = {
+                  index: record.index,
+                  bech32: record.bech32,
+                  registered: false,
+                  solutionsSubmitted: 0,
+                  nightEarned: 0,
+                  error: 'Statistics data missing from response',
+                };
+              } else {
+                const solutions = stat.solutionsSubmitted || 0;
+                const night = convertStarsToNight(stat.nightEarned || 0);
+                results[startIndex + idx] = {
+                  index: record.index,
+                  bech32: record.bech32,
+                  registered: !!stat.registered,
+                  solutionsSubmitted: solutions,
+                  nightEarned: night,
+                  error: stat.error,
+                };
+              }
+            });
+
+            batchSuccess = true;
+          } catch (err: any) {
+            retries--;
+            if (retries === 0) {
+              // On final failure, mark all addresses in batch as having errors
+              console.error(`[Stats] Failed to fetch batch starting at ${startIndex} after 3 retries:`, err.message);
+              batchRecords.forEach((record, idx) => {
+                results[startIndex + idx] = {
+                  index: record.index,
+                  bech32: record.bech32,
+                  registered: false,
+                  solutionsSubmitted: 0,
+                  nightEarned: 0,
+                  error: `Batch fetch failed: ${err.message}`,
+                };
+              });
+            } else {
+              // Wait before retry with exponential backoff
+              await new Promise(resolve => setTimeout(resolve, Math.pow(2, 3 - retries) * 1000));
+            }
+          }
         }
-
-        if (data.totals) {
-          aggregatedTotals.registeredCount += data.totals.registeredCount || 0;
-          aggregatedTotals.totalSolutions += data.totals.totalSolutions || 0;
-          aggregatedTotals.totalNight += convertStarsToNight(data.totals.totalNight || 0);
-        }
-
-        batchRecords.forEach((record, idx) => {
-          const stat = data.statistics[idx] || {};
-          const solutions = stat.solutionsSubmitted || 0;
-          const night = convertStarsToNight(stat.nightEarned || 0);
-          results[startIndex + idx] = {
-            index: record.index,
-            bech32: record.bech32,
-            registered: !!stat.registered,
-            solutionsSubmitted: solutions,
-            nightEarned: night,
-            error: stat.error,
-          };
-        });
 
         completed += batchRecords.length;
         if (updateProgress) {
@@ -1856,84 +1903,158 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
           )}
 
           {/* Addresses Table */}
-          {(addresses.length > 0 || statistics.length > 0) && (
-            <Card variant="bordered">
-              <CardHeader>
-                <CardTitle>
-                  {viewMode === 'index-range' ? 'Addresses' : viewMode === 'individual' ? 'Address Statistics' : 'Address Range Results'}
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-gray-700">
-                        {viewMode !== 'individual' && <th className="text-left py-2 px-4 text-gray-400">Index</th>}
-                        <th className="text-left py-2 px-4 text-gray-400">Address</th>
-                        <th className="text-left py-2 px-4 text-gray-400">Registered</th>
-                        <th className="text-left py-2 px-4 text-gray-400">Solutions</th>
-                        <th className="text-left py-2 px-4 text-gray-400">NIGHT Earned</th>
-                        {statistics.some(s => s.error) && <th className="text-left py-2 px-4 text-gray-400">Error</th>}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(statistics.length > 0 ? statistics : addresses.map(a => ({ bech32: a.bech32, index: a.index }))).map((item, idx) => {
-                        const stat = statistics.find(s => s.bech32 === item.bech32);
-                        return (
-                          <tr key={idx} className="border-b border-gray-800 hover:bg-gray-800/50">
-                            {viewMode !== 'individual' && (
-                              <td className="py-2 px-4 text-gray-300">
-                                {'index' in item ? item.index : '-'}
-                              </td>
-                            )}
-                            <td className="py-2 px-4">
-                              <div className="flex items-center gap-2">
-                                <span className="font-mono text-xs text-gray-300">{item.bech32}</span>
-                                <button
-                                  onClick={() => {
-                                    navigator.clipboard.writeText(item.bech32);
-                                  }}
-                                  className="text-gray-500 hover:text-gray-300"
-                                >
-                                  <Copy className="w-3 h-3" />
-                                </button>
-                              </div>
-                            </td>
-                            <td className="py-2 px-4">
-                              {stat ? (
-                                stat.registered ? (
-                                  <span className="text-green-400">✓ Yes</span>
-                                ) : (
-                                  <span className="text-gray-500">✗ No</span>
-                                )
-                              ) : (
-                                <span className="text-gray-500">-</span>
+          {(addresses.length > 0 || statistics.length > 0) && (() => {
+            const allItems = statistics.length > 0 ? statistics : addresses.map(a => ({ bech32: a.bech32, index: a.index }));
+            const totalPages = Math.ceil(allItems.length / itemsPerPage);
+            const startIndex = (currentPage - 1) * itemsPerPage;
+            const endIndex = startIndex + itemsPerPage;
+            const paginatedItems = allItems.slice(startIndex, endIndex);
+
+            return (
+              <Card variant="bordered">
+                <CardHeader>
+                  <div className="flex items-center justify-between">
+                    <CardTitle>
+                      {viewMode === 'index-range' ? 'Addresses' : viewMode === 'individual' ? 'Address Statistics' : 'Address Range Results'}
+                    </CardTitle>
+                    {allItems.length > itemsPerPage && (
+                      <div className="flex items-center gap-4">
+                        <div className="flex items-center gap-2">
+                          <label className="text-sm text-gray-400">Items per page:</label>
+                          <select
+                            value={itemsPerPage}
+                            onChange={(e) => {
+                              setItemsPerPage(Number(e.target.value));
+                              setCurrentPage(1);
+                            }}
+                            className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm text-white"
+                          >
+                            <option value={50}>50</option>
+                            <option value={100}>100</option>
+                            <option value={200}>200</option>
+                            <option value={500}>500</option>
+                          </select>
+                        </div>
+                        <div className="text-sm text-gray-400">
+                          Showing {startIndex + 1}-{Math.min(endIndex, allItems.length)} of {allItems.length.toLocaleString()}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-gray-700">
+                          {viewMode !== 'individual' && <th className="text-left py-2 px-4 text-gray-400">Index</th>}
+                          <th className="text-left py-2 px-4 text-gray-400">Address</th>
+                          <th className="text-left py-2 px-4 text-gray-400">Registered</th>
+                          <th className="text-left py-2 px-4 text-gray-400">Solutions</th>
+                          <th className="text-left py-2 px-4 text-gray-400">NIGHT Earned</th>
+                          {statistics.some(s => s.error) && <th className="text-left py-2 px-4 text-gray-400">Error</th>}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {paginatedItems.map((item, idx) => {
+                          const stat = statistics.find(s => s.bech32 === item.bech32);
+                          return (
+                            <tr key={startIndex + idx} className="border-b border-gray-800 hover:bg-gray-800/50">
+                              {viewMode !== 'individual' && (
+                                <td className="py-2 px-4 text-gray-300">
+                                  {'index' in item ? item.index : '-'}
+                                </td>
                               )}
-                            </td>
-                            <td className="py-2 px-4 text-gray-300">
-                              {stat ? stat.solutionsSubmitted.toLocaleString() : '-'}
-                            </td>
-                            <td className="py-2 px-4 text-gray-300">
-                              {stat ? formatNightValue(stat.nightEarned) : '-'}
-                            </td>
-                            {statistics.some(s => s.error) && (
                               <td className="py-2 px-4">
-                                {stat?.error ? (
-                                  <span className="text-red-400 text-xs">{stat.error}</span>
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-xs text-gray-300">{item.bech32}</span>
+                                  <button
+                                    onClick={() => {
+                                      navigator.clipboard.writeText(item.bech32);
+                                    }}
+                                    className="text-gray-500 hover:text-gray-300"
+                                  >
+                                    <Copy className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </td>
+                              <td className="py-2 px-4">
+                                {stat ? (
+                                  stat.registered ? (
+                                    <span className="text-green-400">✓ Yes</span>
+                                  ) : (
+                                    <span className="text-gray-500">✗ No</span>
+                                  )
                                 ) : (
                                   <span className="text-gray-500">-</span>
                                 )}
                               </td>
-                            )}
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </CardContent>
-            </Card>
-          )}
+                              <td className="py-2 px-4 text-gray-300">
+                                {stat ? stat.solutionsSubmitted.toLocaleString() : '-'}
+                              </td>
+                              <td className="py-2 px-4 text-gray-300">
+                                {stat ? formatNightValue(stat.nightEarned) : '-'}
+                              </td>
+                              {statistics.some(s => s.error) && (
+                                <td className="py-2 px-4">
+                                  {stat?.error ? (
+                                    <span className="text-red-400 text-xs">{stat.error}</span>
+                                  ) : (
+                                    <span className="text-gray-500">-</span>
+                                  )}
+                                </td>
+                              )}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  {totalPages > 1 && (
+                    <div className="mt-4 flex items-center justify-between">
+                      <div className="text-sm text-gray-400">
+                        Page {currentPage} of {totalPages}
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setCurrentPage(1)}
+                          disabled={currentPage === 1}
+                        >
+                          First
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                          disabled={currentPage === 1}
+                        >
+                          Previous
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                          disabled={currentPage === totalPages}
+                        >
+                          Next
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setCurrentPage(totalPages)}
+                          disabled={currentPage === totalPages}
+                        >
+                          Last
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            );
+          })()}
         </CardContent>
       </Card>
     </div>
