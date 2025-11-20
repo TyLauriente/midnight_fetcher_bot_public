@@ -349,7 +349,8 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     passwordValue: string,
     startOffset: number,
     endOffset: number,
-    label: string
+    label: string,
+    onOffsetDerived?: (addresses: any[], offset: number) => void
   ) => {
     const offsets: number[] = [];
     for (let offset = startOffset; offset <= endOffset; offset++) {
@@ -391,7 +392,13 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         }
 
         if (Array.isArray(data.addresses)) {
-          derived.push(...data.addresses);
+          const sortedAddresses = data.addresses.sort((a: any, b: any) => (a.index ?? 0) - (b.index ?? 0));
+          derived.push(...sortedAddresses);
+          
+          // Call callback immediately as addresses are derived
+          if (onOffsetDerived) {
+            onOffsetDerived(sortedAddresses, offset);
+          }
         }
 
         completedOffsets++;
@@ -785,52 +792,121 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     setFailedDonationQueue([]);
     resetDestinationCounters();
     setDonating(true);
+    setCheckProgress({ current: 0, total: totalAddresses });
 
     try {
       logDonationMessage(`Starting range donation for offsets ${startOffset}-${endOffset} (addresses ${startAddressIndex}-${endAddressIndex})`);
-      const derivedAddresses = await deriveAddressesByOffsetRange(
+      
+      const allAddresses: any[] = [];
+      const donationQueue: DonationRequestPayload[] = [];
+      const addressQueue: Array<{ index?: number; bech32: string }> = [];
+      let derivationComplete = false;
+      let totalStatsProcessed = 0;
+      const destination = donateDestinationAddress.trim();
+
+      // Process stats queue and create donation requests
+      const processStatsQueue = async () => {
+        while (!derivationComplete || addressQueue.length > 0) {
+          if (addressQueue.length === 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+          }
+
+          const batch = addressQueue.splice(0, STATS_BATCH_SIZE);
+          if (batch.length === 0) continue;
+
+          try {
+            const response = await fetch('/api/wallet/check-statistics', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ addresses: batch.map(r => r.bech32) }),
+            });
+
+            const data = await response.json();
+
+            if (response.ok && data.success && data.statistics) {
+              batch.forEach((record, idx) => {
+                const stat = data.statistics[idx];
+                if (stat && stat.registered && !stat.error && record.bech32 !== destination) {
+                  const solutions = stat.solutionsSubmitted || 0;
+                  const night = convertStarsToNight(stat.nightEarned || 0);
+                  donationQueue.push({
+                    sourceAddress: record.bech32,
+                    sourceIndex: record.index,
+                    destinationAddress: destination,
+                    solutions,
+                    night,
+                  });
+                }
+              });
+
+              totalStatsProcessed += batch.length;
+              setCheckProgress({
+                current: totalStatsProcessed,
+                total: totalAddresses,
+              });
+            }
+          } catch (err: any) {
+            console.error('[Stats] Error processing batch:', err);
+          }
+        }
+      };
+
+      // Start stats processing
+      const statsWorker = processStatsQueue();
+
+      // Initialize destination counters once we have some requests
+      let countersInitialized = false;
+      const initializeCountersWhenReady = async () => {
+        while (!derivationComplete || addressQueue.length > 0 || donationQueue.length < 10) {
+          if (donationQueue.length >= 10 && !countersInitialized) {
+            await initializeDestinationCounters(donationQueue.slice(0, Math.min(100, donationQueue.length)), destination);
+            countersInitialized = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      };
+      const counterWorker = initializeCountersWhenReady();
+
+      // Derive addresses with streaming callback
+      await deriveAddressesByOffsetRange(
         pwd,
         startOffset,
         endOffset,
-        `Deriving offsets ${startOffset}-${endOffset} for donation`
+        `Deriving offsets ${startOffset}-${endOffset} for donation`,
+        (addresses, offset) => {
+          allAddresses.push(...addresses);
+          // Queue addresses for stats processing immediately
+          addresses.forEach((addr: any) => {
+            addressQueue.push({ index: addr.index, bech32: addr.bech32 });
+          });
+        }
       );
 
-      const { stats: rangeStats } = await fetchStatsForRecords(
-        derivedAddresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 }))
-      );
-      const statsMap = new Map(rangeStats.map(stat => [stat.bech32, stat]));
+      derivationComplete = true;
+      await Promise.all([statsWorker, counterWorker]);
 
-      const requests: DonationRequestPayload[] = [];
-      derivedAddresses.forEach((addr: any) => {
-        if (addr.bech32 === donateDestinationAddress.trim()) {
-          return;
-        }
-        const statEntry = statsMap.get(addr.bech32);
-        if (!statEntry?.registered) {
-          return;
-        }
-        requests.push({
-          sourceAddress: addr.bech32,
-          sourceIndex: addr.index,
-          destinationAddress: donateDestinationAddress.trim(),
-          solutions: statEntry?.solutionsSubmitted ?? 0,
-          night: statEntry?.nightEarned ?? 0,
-        });
-      });
-
-      if (requests.length === 0) {
+      if (donationQueue.length === 0) {
         setError('No registered addresses available for donation in the specified offset range.');
         setDonating(false);
+        setCheckProgress(null);
         return;
       }
 
-      logDonationMessage(`Derived ${requests.length} registered addresses for donation`);
-      await initializeDestinationCounters(requests, donateDestinationAddress.trim());
-      await processDonations(requests, pwd, donateDestinationAddress.trim());
+      logDonationMessage(`Derived ${donationQueue.length} registered addresses for donation`);
+      
+      if (!countersInitialized) {
+        await initializeDestinationCounters(donationQueue, destination);
+      }
+
+      await processDonations(donationQueue, pwd, destination);
+      setCheckProgress(null);
     } catch (err: any) {
       setError(err.message || 'Failed to process donation range');
     } finally {
       setDonating(false);
+      setCheckProgress(null);
     }
   };
 
@@ -1190,24 +1266,119 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
 
     try {
       const pwd = password || passwordInput;
+      const allAddresses: any[] = [];
+      const allStats: AddressStat[] = [];
+      const aggregatedTotals = {
+        registeredCount: 0,
+        totalSolutions: 0,
+        totalNight: 0,
+      };
 
-      const derivedAddresses = await deriveAddressesByOffsetRange(
+      // Queue for processing addresses as they're derived
+      const addressQueue: Array<{ index?: number; bech32: string }> = [];
+      let statsProcessing = false;
+      let derivationComplete = false;
+
+      // Start stats processing worker
+      const processStatsQueue = async () => {
+        while (!derivationComplete || addressQueue.length > 0) {
+          if (addressQueue.length === 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+          }
+
+          // Take a batch from the queue
+          const batch = addressQueue.splice(0, STATS_BATCH_SIZE);
+          if (batch.length === 0) continue;
+
+          try {
+            const response = await fetch('/api/wallet/check-statistics', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ addresses: batch.map(r => r.bech32) }),
+            });
+
+            const data = await response.json();
+
+            if (response.ok && data.success && data.statistics) {
+              batch.forEach((record, idx) => {
+                const stat = data.statistics[idx];
+                if (stat) {
+                  const solutions = stat.solutionsSubmitted || 0;
+                  const night = convertStarsToNight(stat.nightEarned || 0);
+                  const addressStat: AddressStat = {
+                    index: record.index,
+                    bech32: record.bech32,
+                    registered: !!stat.registered,
+                    solutionsSubmitted: solutions,
+                    nightEarned: night,
+                    error: stat.error,
+                  };
+                  allStats.push(addressStat);
+
+                  if (stat.registered && !stat.error) {
+                    aggregatedTotals.registeredCount++;
+                    aggregatedTotals.totalSolutions += solutions;
+                    aggregatedTotals.totalNight += night;
+                  }
+                }
+              });
+
+              // Update progress
+              setCheckProgress({
+                current: allStats.length,
+                total: totalAddresses,
+              });
+
+              // Update state incrementally
+              setStatistics([...allStats]);
+              setTotals({ ...aggregatedTotals });
+            }
+          } catch (err: any) {
+            console.error('[Stats] Error processing batch:', err);
+            // Mark batch as errors
+            batch.forEach(record => {
+              allStats.push({
+                index: record.index,
+                bech32: record.bech32,
+                registered: false,
+                solutionsSubmitted: 0,
+                nightEarned: 0,
+                error: err.message || 'Failed to fetch statistics',
+              });
+            });
+          }
+        }
+      };
+
+      // Start stats processing
+      setCheckingStats(true);
+      const statsWorker = processStatsQueue();
+
+      // Derive addresses with streaming callback
+      await deriveAddressesByOffsetRange(
         pwd,
         startOffset,
         endOffset,
-        `Deriving offsets ${startOffset}-${endOffset}`
+        `Deriving offsets ${startOffset}-${endOffset}`,
+        (addresses, offset) => {
+          allAddresses.push(...addresses);
+          setAddresses([...allAddresses]);
+
+          // Queue addresses for stats processing
+          addresses.forEach((addr: any) => {
+            addressQueue.push({ index: addr.index, bech32: addr.bech32 });
+          });
+        }
       );
 
-      setAddresses(derivedAddresses);
+      derivationComplete = true;
+      await statsWorker;
 
-      // Automatically check statistics
-      setCheckingStats(true);
-      const { stats, totals } = await fetchStatsForRecords(
-        derivedAddresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 })),
-        true
-      );
-      setStatistics(stats);
-      setTotals(totals);
+      // Final update
+      setStatistics(allStats);
+      setTotals(aggregatedTotals);
+      setCheckProgress({ current: allStats.length, total: totalAddresses });
     } catch (err: any) {
       setError(err.message || 'Failed to process range');
     } finally {
@@ -1377,20 +1548,56 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             </div>
           )}
 
-          {derivationProgress && (
-            <div className="bg-blue-900/30 border border-blue-700/40 rounded-lg p-4 space-y-2">
-              <div className="flex justify-between items-center text-sm text-blue-200">
-                <span>{derivationProgress.label}</span>
-                <span>
-                  {derivationProgress.completed.toLocaleString()} / {derivationProgress.total.toLocaleString()} completed
-                </span>
-              </div>
-              <div className="w-full bg-gray-800 rounded-full h-2">
-                <div
-                  className="bg-blue-500 h-2 rounded-full transition-all duration-300"
-                  style={{ width: `${(derivationProgress.completed / derivationProgress.total) * 100}%` }}
-                />
-              </div>
+          {(derivationProgress || checkProgress || (donating && donationProgress)) && (
+            <div className="space-y-3">
+              {derivationProgress && (
+                <div className="bg-blue-900/30 border border-blue-700/40 rounded-lg p-4 space-y-2">
+                  <div className="flex justify-between items-center text-sm text-blue-200">
+                    <span>{derivationProgress.label}</span>
+                    <span>
+                      {derivationProgress.completed.toLocaleString()} / {derivationProgress.total.toLocaleString()} offsets completed
+                    </span>
+                  </div>
+                  <div className="w-full bg-gray-800 rounded-full h-2">
+                    <div
+                      className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${(derivationProgress.completed / derivationProgress.total) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+              {checkProgress && (
+                <div className="bg-purple-900/30 border border-purple-700/40 rounded-lg p-4 space-y-2">
+                  <div className="flex justify-between items-center text-sm text-purple-200">
+                    <span>Checking Statistics</span>
+                    <span>
+                      {checkProgress.current.toLocaleString()} / {checkProgress.total.toLocaleString()} addresses checked
+                    </span>
+                  </div>
+                  <div className="w-full bg-gray-800 rounded-full h-2">
+                    <div
+                      className="bg-purple-500 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${(checkProgress.current / checkProgress.total) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+              {donating && donationProgress && (
+                <div className="bg-green-900/30 border border-green-700/40 rounded-lg p-4 space-y-2">
+                  <div className="flex justify-between items-center text-sm text-green-200">
+                    <span>Processing Donations</span>
+                    <span>
+                      {donationProgress.current.toLocaleString()} / {donationProgress.total.toLocaleString()} donations completed
+                    </span>
+                  </div>
+                  <div className="w-full bg-gray-800 rounded-full h-2">
+                    <div
+                      className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${(donationProgress.current / donationProgress.total) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
