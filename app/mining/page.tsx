@@ -1098,29 +1098,46 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             lastRegisteredOffset = offset;
             logDonationMessage(`Offset ${offset}: Has registered addresses, processing all ${offsetRequests.length} addresses...`);
             
-            // CRITICAL: Re-derive all addresses for this offset to ensure they're available
-            // This is necessary because each donate-to API call creates a new WalletManager instance
-            logDonationMessage(`Offset ${offset}: Re-deriving all addresses to ensure they're available for donation...`);
-            try {
-              const rederiveResponse = await fetch('/api/wallet/derive-addresses', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  password: pwd,
-                  startIndex: offsetStart,
-                  endIndex: offsetEnd,
-                }),
-              });
+            // CRITICAL: Pre-derive ALL addresses for this offset before processing donations
+            // This ensures each address is available when donate-to API calls are made
+            // Each donate-to call creates a new WalletManager instance, so we need to derive
+            // addresses individually within each call, but pre-deriving helps ensure consistency
+            logDonationMessage(`Offset ${offset}: Pre-deriving all ${offsetRequests.length} addresses for this offset...`);
+            const addressesToDerive = offsetRequests
+              .map(r => r.sourceIndex)
+              .filter((idx): idx is number => idx !== undefined)
+              .sort((a, b) => a - b);
+            
+            // Derive addresses in batches to avoid overwhelming the system
+            const DERIVE_BATCH_SIZE = 50;
+            for (let i = 0; i < addressesToDerive.length; i += DERIVE_BATCH_SIZE) {
+              const batch = addressesToDerive.slice(i, i + DERIVE_BATCH_SIZE);
+              const batchStart = batch[0];
+              const batchEnd = batch[batch.length - 1];
+              
+              try {
+                const batchDeriveResponse = await fetch('/api/wallet/derive-addresses', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    password: pwd,
+                    startIndex: batchStart,
+                    endIndex: batchEnd,
+                  }),
+                });
 
-              const rederiveData = await rederiveResponse.json();
-              if (!rederiveResponse.ok || !rederiveData.addresses || rederiveData.addresses.length === 0) {
-                logDonationMessage(`Offset ${offset}: WARNING - Failed to re-derive addresses, but proceeding anyway...`);
-              } else {
-                logDonationMessage(`Offset ${offset}: Successfully re-derived ${rederiveData.addresses.length} addresses`);
+                const batchDeriveData = await batchDeriveResponse.json();
+                if (!batchDeriveResponse.ok || !batchDeriveData.addresses) {
+                  logDonationMessage(`Offset ${offset}: WARNING - Failed to derive batch ${batchStart}-${batchEnd}`);
+                } else {
+                  logDonationMessage(`Offset ${offset}: Derived batch ${batchStart}-${batchEnd} (${batchDeriveData.addresses.length} addresses)`);
+                }
+              } catch (batchErr: any) {
+                logDonationMessage(`Offset ${offset}: WARNING - Error deriving batch ${batchStart}-${batchEnd}: ${batchErr.message}`);
               }
-            } catch (rederiveErr: any) {
-              logDonationMessage(`Offset ${offset}: WARNING - Error re-deriving addresses: ${rederiveErr.message}, but proceeding anyway...`);
             }
+            
+            logDonationMessage(`Offset ${offset}: Finished pre-deriving addresses, starting donation processing...`);
             
             // Initialize counters if this is the first offset
             if (offset === 0) {

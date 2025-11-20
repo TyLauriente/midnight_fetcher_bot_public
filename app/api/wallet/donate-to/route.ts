@@ -97,27 +97,18 @@ export async function POST(request: NextRequest) {
             { status: 500 }
           );
         }
-        // Verify it's now in the derivedAddresses array
-        const allDerived = walletManager.getDerivedAddresses();
-        const foundInArray = allDerived.find(a => a.index === addressIndex);
-        if (!foundInArray) {
-          console.error(`[Donate-to] Address ${addressIndex} derived but not found in derivedAddresses array. Array has ${allDerived.length} addresses.`);
+        // The address should now be in derivedAddresses array
+        // Use the pubkey directly from the derived address instead of calling getPubKeyHex
+        // This avoids the issue where getPubKeyHex might not find it immediately
+        if (!derivedAddr.publicKeyHex) {
+          console.error(`[Donate-to] Derived address ${addressIndex} has no publicKeyHex`);
           return NextResponse.json(
-            { error: `Failed to derive address for index ${addressIndex}: Address not persisted in derivedAddresses array` },
+            { error: `Failed to derive address for index ${addressIndex}: No public key in derived address` },
             { status: 500 }
           );
         }
-        // Now try to get the pubkey again
-        try {
-          pubkey = walletManager.getPubKeyHex(addressIndex);
-          console.log(`[Donate-to] Successfully derived and retrieved pubkey for index ${addressIndex}`);
-        } catch (pubkeyErr: any) {
-          console.error(`[Donate-to] Failed to get pubkey after derivation:`, pubkeyErr);
-          return NextResponse.json(
-            { error: `Failed to get pubkey for index ${addressIndex} after derivation: ${pubkeyErr.message}` },
-            { status: 500 }
-          );
-        }
+        pubkey = derivedAddr.publicKeyHex;
+        console.log(`[Donate-to] Successfully derived address ${addressIndex} and using pubkey from derived address`);
       } catch (deriveErr: any) {
         console.error(`[Donate-to] Derivation error for index ${addressIndex}:`, deriveErr);
         return NextResponse.json(
