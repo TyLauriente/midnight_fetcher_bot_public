@@ -86,6 +86,58 @@ export class WalletManager {
   }
 
   /**
+   * Import an existing wallet from a seed phrase
+   */
+  async importWallet(seedPhrase: string, password: string, count: number = 40): Promise<WalletInfo> {
+    // Ensure secure directory exists
+    if (!fs.existsSync(SECURE_DIR)) {
+      fs.mkdirSync(SECURE_DIR, { recursive: true, mode: 0o700 });
+    }
+
+    // Normalize seed phrase (trim and normalize whitespace)
+    const normalizedSeedPhrase = seedPhrase.trim().replace(/\s+/g, ' ');
+    const words = normalizedSeedPhrase.split(' ');
+
+    // Validate word count
+    if (words.length !== 24) {
+      throw new Error('Seed phrase must contain exactly 24 words');
+    }
+
+    // Validate seed phrase by trying to use it with Lucid
+    try {
+      const tempLucid = await Lucid.new(undefined, 'Mainnet');
+      tempLucid.selectWalletFromSeed(normalizedSeedPhrase, {
+        accountIndex: 0,
+      });
+      // Try to get an address to verify the seed phrase is valid
+      await tempLucid.wallet.address();
+    } catch (err: any) {
+      throw new Error(`Invalid seed phrase: ${err.message || 'Failed to validate seed phrase'}`);
+    }
+
+    this.mnemonic = normalizedSeedPhrase;
+
+    // Derive addresses
+    await this.deriveAddresses(count);
+
+    // Encrypt and save seed
+    const encryptedData = encrypt(this.mnemonic, password);
+    fs.writeFileSync(SEED_FILE, JSON.stringify(encryptedData, null, 2), { mode: 0o600 });
+
+    // Save derived addresses
+    fs.writeFileSync(
+      DERIVED_ADDRESSES_FILE,
+      JSON.stringify(this.derivedAddresses, null, 2),
+      { mode: 0o600 }
+    );
+
+    return {
+      seedPhrase: this.mnemonic,
+      addresses: this.derivedAddresses,
+    };
+  }
+
+  /**
    * Load existing wallet from encrypted file
    */
   async loadWallet(password: string): Promise<DerivedAddress[]> {
@@ -173,6 +225,44 @@ export class WalletManager {
     }
 
     return { address, pubKeyHex };
+  }
+
+  /**
+   * Derive addresses by index range (for consolidation view)
+   * Requires password to decrypt seed phrase
+   */
+  async deriveAddressesByRange(password: string, startIndex: number, endIndex: number): Promise<DerivedAddress[]> {
+    if (!fs.existsSync(SEED_FILE)) {
+      throw new Error('No wallet found. Please create or import a wallet first.');
+    }
+
+    const encryptedData: EncryptedData = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8'));
+
+    try {
+      const mnemonic = decrypt(encryptedData, password);
+      this.mnemonic = mnemonic;
+    } catch (err) {
+      throw new Error('Failed to decrypt wallet. Incorrect password?');
+    }
+
+    const addresses: DerivedAddress[] = [];
+
+    for (let i = startIndex; i <= endIndex; i++) {
+      try {
+        const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
+        addresses.push({
+          index: i,
+          bech32: address,
+          publicKeyHex: pubKeyHex,
+          registered: false, // Will be checked via API
+        });
+      } catch (err: any) {
+        console.error(`Failed to derive address at index ${i}:`, err.message);
+        throw err;
+      }
+    }
+
+    return addresses;
   }
 
   /**

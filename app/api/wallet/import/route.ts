@@ -3,7 +3,14 @@ import { WalletManager } from '@/lib/wallet/manager';
 
 export async function POST(request: NextRequest) {
   try {
-    const { password, count } = await request.json();
+    const { seedPhrase, password, count } = await request.json();
+
+    if (!seedPhrase) {
+      return NextResponse.json(
+        { error: 'Seed phrase is required' },
+        { status: 400 }
+      );
+    }
 
     if (!password || password.length < 8) {
       return NextResponse.json(
@@ -12,7 +19,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const walletCount = count || 40;
+    const walletCount = count || 200;
 
     if (walletCount < 1 || walletCount > 500) {
       return NextResponse.json(
@@ -23,25 +30,21 @@ export async function POST(request: NextRequest) {
 
     const manager = new WalletManager();
 
-    // Check if wallet already exists - warn but allow replacement
-    const walletExists = manager.walletExists();
-    if (walletExists) {
-      console.warn('[API] Wallet already exists. Creating new wallet will replace existing wallet.');
-    }
-
-    const walletInfo = await manager.generateWallet(password, walletCount);
+    // Import wallet (this will replace existing wallet if one exists)
+    const walletInfo = await manager.importWallet(seedPhrase, password, walletCount);
 
     return NextResponse.json({
       success: true,
-      seedPhrase: walletInfo.seedPhrase,
       addressCount: walletInfo.addresses.length,
       primaryAddress: walletInfo.addresses[0]?.bech32,
+      message: manager.walletExists() ? 'Wallet imported and replaced existing wallet' : 'Wallet imported successfully',
     });
   } catch (error: any) {
-    console.error('[API] Wallet creation error:', error);
+    console.error('[API] Wallet import error:', error);
     return NextResponse.json(
-      { error: error.message || 'Failed to create wallet' },
+      { error: error.message || 'Failed to import wallet' },
       { status: 500 }
     );
   }
 }
+

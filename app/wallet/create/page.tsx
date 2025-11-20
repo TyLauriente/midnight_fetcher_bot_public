@@ -6,12 +6,16 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Alert } from '@/components/ui/alert';
-import { Lock, Eye, EyeOff, Copy, Check, ShieldAlert, ArrowLeft, Loader2 } from 'lucide-react';
+import { Lock, Eye, EyeOff, Copy, Check, ShieldAlert, ArrowLeft, Loader2, Download, Plus } from 'lucide-react';
+
+type WalletMode = 'create' | 'import';
 
 export default function CreateWallet() {
   const router = useRouter();
+  const [mode, setMode] = useState<WalletMode>('create');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [importSeedPhrase, setImportSeedPhrase] = useState('');
   const [seedPhrase, setSeedPhrase] = useState<string | null>(null);
   const [savedConfirm, setSavedConfirm] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -36,19 +40,48 @@ export default function CreateWallet() {
     setError(null);
 
     try {
-      const response = await fetch('/api/wallet/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password, count: addressCount }),
-      });
+      if (mode === 'import') {
+        // Import existing wallet
+        if (!importSeedPhrase.trim()) {
+          setError('Please enter your seed phrase');
+          setLoading(false);
+          return;
+        }
 
-      const data = await response.json();
+        const response = await fetch('/api/wallet/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            seedPhrase: importSeedPhrase.trim(), 
+            password, 
+            count: addressCount 
+          }),
+        });
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to create wallet');
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to import wallet');
+        }
+
+        // Import successful, redirect to load page
+        router.push('/wallet/load');
+      } else {
+        // Create new wallet
+        const response = await fetch('/api/wallet/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password, count: addressCount }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to create wallet');
+        }
+
+        setSeedPhrase(data.seedPhrase);
       }
-
-      setSeedPhrase(data.seedPhrase);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -208,33 +241,102 @@ export default function CreateWallet() {
       <div className="relative max-w-2xl w-full space-y-8">
         {/* Header */}
         <div className="text-center space-y-4">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-green-900/30 border-2 border-green-500/50 rounded-full mb-4">
-            <Lock className="w-8 h-8 text-green-400" />
+          <div className={`inline-flex items-center justify-center w-16 h-16 ${mode === 'create' ? 'bg-green-900/30 border-green-500/50' : 'bg-blue-900/30 border-blue-500/50'} border-2 rounded-full mb-4`}>
+            {mode === 'create' ? (
+              <Lock className="w-8 h-8 text-green-400" />
+            ) : (
+              <Download className="w-8 h-8 text-blue-400" />
+            )}
           </div>
           <h1 className="text-4xl md:text-5xl font-bold text-white">
-            Create New Wallet
+            {mode === 'create' ? 'Create New Wallet' : 'Import Existing Wallet'}
           </h1>
           <p className="text-lg text-gray-400">
-            Generate a secure wallet with {addressCount} mining addresses
+            {mode === 'create' 
+              ? `Generate a secure wallet with ${addressCount} mining addresses`
+              : `Import your wallet using your 24-word seed phrase`}
           </p>
         </div>
 
+        {/* Mode Toggle */}
+        <div className="flex items-center justify-center gap-2 p-1 bg-gray-800/50 rounded-lg border border-gray-700">
+          <button
+            onClick={() => {
+              setMode('create');
+              setError(null);
+              setImportSeedPhrase('');
+            }}
+            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-md transition-all ${
+              mode === 'create'
+                ? 'bg-green-600 text-white shadow-lg'
+                : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <Plus className="w-4 h-4" />
+            Create New
+          </button>
+          <button
+            onClick={() => {
+              setMode('import');
+              setError(null);
+            }}
+            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-md transition-all ${
+              mode === 'import'
+                ? 'bg-blue-600 text-white shadow-lg'
+                : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <Download className="w-4 h-4" />
+            Import Existing
+          </button>
+        </div>
+
         {/* Info Alert */}
-        <Alert variant="info" title="Wallet Security">
-          Choose a strong password to encrypt your wallet. You'll need this password every time you
-          want to access your mining addresses.
-        </Alert>
+        {mode === 'create' ? (
+          <Alert variant="info" title="Wallet Security">
+            Choose a strong password to encrypt your wallet. You'll need this password every time you
+            want to access your mining addresses.
+          </Alert>
+        ) : (
+          <Alert variant="warning" title="Importing Wallet">
+            This will replace any existing wallet. Make sure you have your seed phrase backed up before proceeding.
+            Your seed phrase will be encrypted with the password you provide.
+          </Alert>
+        )}
 
         {/* Form Card */}
         <Card variant="elevated">
           <CardHeader>
-            <CardTitle>Set Your Wallet Password</CardTitle>
+            <CardTitle>{mode === 'create' ? 'Set Your Wallet Password' : 'Import Your Wallet'}</CardTitle>
             <CardDescription>
-              Minimum 8 characters required for security
+              {mode === 'create' 
+                ? 'Minimum 8 characters required for security'
+                : 'Enter your 24-word seed phrase and set a password to encrypt it'}
             </CardDescription>
           </CardHeader>
 
           <CardContent className="space-y-6">
+            {mode === 'import' && (
+              <div className="space-y-2">
+                <label className="block text-sm font-medium text-gray-300">
+                  Seed Phrase (24 words)
+                </label>
+                <textarea
+                  value={importSeedPhrase}
+                  onChange={(e) => setImportSeedPhrase(e.target.value)}
+                  className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all min-h-[120px] font-mono text-sm"
+                  placeholder="Enter your 24-word seed phrase here..."
+                />
+                <p className="text-xs text-gray-500">
+                  Enter all 24 words separated by spaces. The seed phrase will be validated before import.
+                </p>
+                {importSeedPhrase && importSeedPhrase.trim().split(/\s+/).length !== 24 && (
+                  <p className="text-sm text-yellow-400 flex items-center gap-1">
+                    <span>⚠</span> Seed phrase should contain exactly 24 words (currently: {importSeedPhrase.trim().split(/\s+/).length})
+                  </p>
+                )}
+              </div>
+            )}
             <div className="space-y-2">
               <label className="block text-sm font-medium text-gray-300">
                 Password
@@ -297,18 +399,25 @@ export default function CreateWallet() {
           <CardFooter className="flex-col gap-3">
             <Button
               onClick={handleCreateWallet}
-              disabled={loading || !password || !confirmPassword || password.length < 8 || password !== confirmPassword}
-              variant="success"
+              disabled={
+                loading || 
+                !password || 
+                !confirmPassword || 
+                password.length < 8 || 
+                password !== confirmPassword ||
+                (mode === 'import' && (!importSeedPhrase.trim() || importSeedPhrase.trim().split(/\s+/).length !== 24))
+              }
+              variant={mode === 'create' ? 'success' : 'primary'}
               size="lg"
               className="w-full"
             >
               {loading ? (
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  Creating Wallet...
+                  {mode === 'create' ? 'Creating Wallet...' : 'Importing Wallet...'}
                 </>
               ) : (
-                'Create Wallet'
+                mode === 'create' ? 'Create Wallet' : 'Import Wallet'
               )}
             </Button>
 

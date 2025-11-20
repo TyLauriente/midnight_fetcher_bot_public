@@ -233,7 +233,7 @@ export default function Home() {
                   <CardFooter className="flex-col space-y-3 bg-gray-800/30 border-t border-gray-800 rounded-b-lg">
                     <Alert variant="warning" className="w-full text-sm">
                       <Sparkles className="w-4 h-4" />
-                      <span>Creating a new wallet requires backing up a new seed phrase</span>
+                      <span>You can create a new wallet or import an existing one using your seed phrase</span>
                     </Alert>
                     <Button
                       onClick={() => router.push('/wallet/create')}
@@ -242,7 +242,7 @@ export default function Home() {
                       className="w-full group"
                     >
                       <Plus className="w-4 h-4 group-hover:rotate-90 transition-transform" />
-                      Create New Wallet Instead
+                      Create or Import Wallet
                       <ChevronRight className="w-4 h-4 ml-auto group-hover:translate-x-1 transition-transform" />
                     </Button>
                   </CardFooter>

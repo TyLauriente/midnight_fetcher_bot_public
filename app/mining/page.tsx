@@ -96,6 +96,1850 @@ interface HistoryData {
   };
 }
 
+interface AddressStat {
+  index?: number;
+  bech32: string;
+  registered: boolean;
+  solutionsSubmitted: number;
+  nightEarned: number;
+  error?: string;
+}
+
+type DonationResultType = 'success' | 'undone' | 'warning' | 'error';
+
+interface DonationRequestPayload {
+  sourceAddress: string;
+  sourceIndex?: number;
+  destinationAddress: string;
+  solutions?: number;
+  night?: number;
+}
+
+interface DonationResultItem extends DonationRequestPayload {
+  success: boolean;
+  message?: string;
+  error?: string;
+  response?: any;
+  timestamp: string;
+  resultType: DonationResultType;
+}
+
+interface DestinationCounters {
+  apiSolutions: number | null;
+  apiNight: number | null;
+  countedTotalSolutions: number;
+  countedTotalNight: number;
+  countedProcessedSolutions: number;
+  countedProcessedNight: number;
+}
+
+const DONATION_CONCURRENCY = parseInt(process.env.NEXT_PUBLIC_DONATION_CONCURRENCY || '15', 10);
+const DONATION_RETRY_LIMIT = 3;
+const STATS_BATCH_SIZE = 50; // Increased from 10 for faster processing
+const STATS_CONCURRENCY = parseInt(process.env.NEXT_PUBLIC_STATS_CONCURRENCY || '15', 10);
+const DERIVATION_CONCURRENCY = 10; // Parallel derivation of address offsets
+const AUTO_MAX_OFFSET = 150; // 150 offsets * 200 = 30,000 addresses
+const ADDRESSES_PER_OFFSET = 200;
+const STARS_PER_NIGHT = 1_000_000;
+const convertStarsToNight = (value: number) => value / STARS_PER_NIGHT;
+const formatNightValue = (value: number) =>
+  value.toLocaleString(undefined, { minimumFractionDigits: 6, maximumFractionDigits: 6 });
+const offsetToStartIndex = (offset: number) => offset * ADDRESSES_PER_OFFSET;
+const offsetToEndIndex = (offset: number) => (offset + 1) * ADDRESSES_PER_OFFSET - 1;
+const initialResultCounters: Record<DonationResultType, number> = {
+  success: 0,
+  undone: 0,
+  warning: 0,
+  error: 0,
+};
+const orderedResultTypes: DonationResultType[] = ['success', 'undone', 'warning', 'error'];
+const donationResultTypeMeta: Record<
+  DonationResultType,
+  { label: string; description: string; className: string; textColor: string }
+> = {
+  success: {
+    label: 'Consolidated',
+    description: 'Successfully consolidated to destination.',
+    className: 'bg-green-500/10 text-green-300 border border-green-500/40',
+    textColor: 'text-green-400',
+  },
+  undone: {
+    label: 'Undone',
+    description: 'Previous consolidation removed.',
+    className: 'bg-blue-500/10 text-blue-300 border border-blue-500/40',
+    textColor: 'text-blue-400',
+  },
+  warning: {
+    label: 'Already Assigned',
+    description: 'Address was already assigned elsewhere.',
+    className: 'bg-yellow-500/10 text-yellow-300 border border-yellow-500/40',
+    textColor: 'text-yellow-300',
+  },
+  error: {
+    label: 'Error',
+    description: 'Request failed.',
+    className: 'bg-red-500/10 text-red-300 border border-red-500/40',
+    textColor: 'text-red-400',
+  },
+};
+
+interface TyConsolidationTabProps {
+  password: string | null;
+}
+
+function TyConsolidationTab({ password }: TyConsolidationTabProps) {
+  const [viewMode, setViewMode] = useState<
+    'index-range' | 'individual' | 'address-range' | 'donate-single' | 'donate-range' | 'auto-consolidate'
+  >('index-range');
+  const [indexInput, setIndexInput] = useState<string>('0');
+  const [individualAddress, setIndividualAddress] = useState<string>('');
+  const [rangeStart, setRangeStart] = useState<string>('');
+  const [rangeEnd, setRangeEnd] = useState<string>('');
+  const [addresses, setAddresses] = useState<Array<{ index: number; bech32: string }>>([]);
+  const [statistics, setStatistics] = useState<AddressStat[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [checkingStats, setCheckingStats] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [totals, setTotals] = useState<{ registeredCount: number; totalSolutions: number; totalNight: number } | null>(null);
+  const [passwordInput, setPasswordInput] = useState<string>('');
+  const [checkProgress, setCheckProgress] = useState<{ current: number; total: number } | null>(null);
+  
+  // Donation state
+  const [donateSourceAddress, setDonateSourceAddress] = useState<string>('');
+  const [donateDestinationAddress, setDonateDestinationAddress] = useState<string>('');
+  const [donateRangeStart, setDonateRangeStart] = useState<string>('');
+  const [donateRangeEnd, setDonateRangeEnd] = useState<string>('');
+  const [donating, setDonating] = useState(false);
+  const [donationResults, setDonationResults] = useState<DonationResultItem[]>([]);
+  const [donationLogs, setDonationLogs] = useState<string[]>([]);
+  const [donationProgress, setDonationProgress] = useState<{ current: number; total: number } | null>(null);
+  const [failedDonationQueue, setFailedDonationQueue] = useState<DonationRequestPayload[]>([]);
+  const [autoDetectionRange, setAutoDetectionRange] = useState<{ startOffset: number; endOffset: number } | null>(null);
+  const [autoDetecting, setAutoDetecting] = useState(false);
+  const initialDestinationCounters: DestinationCounters = {
+    apiSolutions: null,
+    apiNight: null,
+    countedTotalSolutions: 0,
+    countedTotalNight: 0,
+    countedProcessedSolutions: 0,
+    countedProcessedNight: 0,
+  };
+  const [destinationCounters, setDestinationCounters] = useState<DestinationCounters>(initialDestinationCounters);
+  const [currentDestinationAddress, setCurrentDestinationAddress] = useState<string | null>(null);
+  const [donationStatus, setDonationStatus] = useState<{
+    currentNumber: number;
+    total: number;
+    currentIndex?: number;
+    currentAddress?: string;
+  } | null>(null);
+  const [autoDetectionStatus, setAutoDetectionStatus] = useState<{ currentOffset: number } | null>(null);
+  const [donationResultCounters, setDonationResultCounters] = useState<Record<DonationResultType, number>>(initialResultCounters);
+  const totalDonationOutcomeCount = Object.values(donationResultCounters).reduce((sum, count) => sum + count, 0);
+  const [derivationStatus, setDerivationStatus] = useState<{ currentOffset: number; totalOffsets: number } | null>(null);
+
+  const classifyDonationOutcome = (
+    success: boolean,
+    message?: string,
+    response?: any
+  ): DonationResultType => {
+    const responseMessage = (message || response?.message || '').toLowerCase();
+
+    const containsAny = (keywords: string[]) =>
+      keywords.some(keyword => responseMessage.includes(keyword));
+
+    if (success) {
+      if (containsAny(['undo', 'removed', 'remove', 'cleared', 'reset', 'null destination'])) {
+        return 'undone';
+      }
+      return 'success';
+    }
+
+    if (containsAny(['already has an active donation assignment'])) {
+      return 'warning';
+    }
+
+    return 'error';
+  };
+
+  const logDonationMessage = (message: string, data?: any) => {
+    const timestamp = new Date().toISOString();
+    const suffix =
+      data !== undefined
+        ? typeof data === 'string'
+          ? data
+          : JSON.stringify(data)
+        : '';
+    const formatted = suffix ? `${message} ${suffix}` : message;
+    console.log(`[TyConsolidation] ${formatted}`);
+    setDonationLogs(prev => [...prev, `[${timestamp}] ${formatted}`]);
+  };
+
+  const resetDestinationCounters = () => {
+    setDestinationCounters(initialDestinationCounters);
+    setCurrentDestinationAddress(null);
+    setDonationResultCounters(initialResultCounters);
+  };
+
+  const initializeDestinationCounters = async (
+    requests: DonationRequestPayload[],
+    destinationAddress: string
+  ) => {
+    const totalSolutions = requests.reduce((sum, req) => sum + (req.solutions || 0), 0);
+    const totalNight = requests.reduce((sum, req) => sum + (req.night || 0), 0);
+    setCurrentDestinationAddress(destinationAddress);
+
+    try {
+      const { stats } = await fetchStatsForRecords([{ bech32: destinationAddress }]);
+      const destStat = stats[0];
+      setDestinationCounters({
+        apiSolutions: destStat?.solutionsSubmitted ?? null,
+        apiNight: destStat?.nightEarned ?? null,
+        countedTotalSolutions: totalSolutions,
+        countedTotalNight: totalNight,
+        countedProcessedSolutions: 0,
+        countedProcessedNight: 0,
+      });
+    } catch (err: any) {
+      logDonationMessage('Warning: Failed to fetch destination statistics', err.message || String(err));
+      setDestinationCounters({
+        apiSolutions: null,
+        apiNight: null,
+        countedTotalSolutions: totalSolutions,
+        countedTotalNight: totalNight,
+        countedProcessedSolutions: 0,
+        countedProcessedNight: 0,
+      });
+    }
+  };
+
+  const refreshDestinationCounters = async (destinationAddress: string) => {
+    try {
+      const { stats } = await fetchStatsForRecords([{ bech32: destinationAddress }]);
+      const destStat = stats[0];
+      if (destStat) {
+        setDestinationCounters(prev => ({
+          ...prev,
+          apiSolutions: destStat.solutionsSubmitted,
+          apiNight: destStat.nightEarned,
+        }));
+      }
+    } catch (err: any) {
+      logDonationMessage('Warning: Failed to refresh destination statistics', err.message || String(err));
+    }
+  };
+
+  const summarizeResponse = (response: any, fallback?: string) => {
+    if (!response) return fallback || '—';
+    if (typeof response === 'string') return response;
+    if (response.message) return response.message;
+    try {
+      return JSON.stringify(response);
+    } catch {
+      return fallback || '—';
+    }
+  };
+
+  const fetchStatsForRecords = async (
+    records: Array<{ index?: number; bech32: string }>,
+    updateProgress: boolean = false
+  ): Promise<{
+    stats: AddressStat[];
+    totals: { registeredCount: number; totalSolutions: number; totalNight: number };
+  }> => {
+    if (records.length === 0) {
+      return {
+        stats: [],
+        totals: { registeredCount: 0, totalSolutions: 0, totalNight: 0 },
+      };
+    }
+
+    if (updateProgress) {
+      setCheckProgress({ current: 0, total: records.length });
+    }
+
+    const results: Array<AddressStat | undefined> = new Array(records.length);
+    const aggregatedTotals = {
+      registeredCount: 0,
+      totalSolutions: 0,
+      totalNight: 0,
+    };
+
+    let completed = 0;
+    let nextChunkStart = 0;
+    const workerCount = Math.min(
+      STATS_CONCURRENCY,
+      Math.max(1, Math.ceil(records.length / STATS_BATCH_SIZE))
+    );
+
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const startIndex = nextChunkStart;
+        nextChunkStart += STATS_BATCH_SIZE;
+        if (startIndex >= records.length) break;
+
+        const batchRecords = records.slice(startIndex, startIndex + STATS_BATCH_SIZE);
+        const response = await fetch('/api/wallet/check-statistics', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ addresses: batchRecords.map(r => r.bech32) }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || !data.success) {
+          throw new Error(data.error || 'Failed to fetch statistics');
+        }
+
+        if (data.totals) {
+          aggregatedTotals.registeredCount += data.totals.registeredCount || 0;
+          aggregatedTotals.totalSolutions += data.totals.totalSolutions || 0;
+          aggregatedTotals.totalNight += convertStarsToNight(data.totals.totalNight || 0);
+        }
+
+        batchRecords.forEach((record, idx) => {
+          const stat = data.statistics[idx] || {};
+          const solutions = stat.solutionsSubmitted || 0;
+          const night = convertStarsToNight(stat.nightEarned || 0);
+          results[startIndex + idx] = {
+            index: record.index,
+            bech32: record.bech32,
+            registered: !!stat.registered,
+            solutionsSubmitted: solutions,
+            nightEarned: night,
+            error: stat.error,
+          };
+        });
+
+        completed += batchRecords.length;
+        if (updateProgress) {
+          setCheckProgress({
+            current: Math.min(completed, records.length),
+            total: records.length,
+          });
+        }
+      }
+    });
+
+    await Promise.all(workers);
+
+    if (updateProgress) {
+      setCheckProgress({ current: records.length, total: records.length });
+    }
+
+    return {
+      stats: results.filter((r): r is AddressStat => !!r),
+      totals: aggregatedTotals,
+    };
+  };
+
+  const attemptDonationWithRetries = async (
+    request: DonationRequestPayload,
+    passwordValue: string
+  ): Promise<{ success: boolean; message?: string; error?: string; response?: any; resultType: DonationResultType }> => {
+    let lastError: string | undefined;
+    let lastResponse: any = undefined;
+
+    for (let attempt = 1; attempt <= DONATION_RETRY_LIMIT; attempt++) {
+      logDonationMessage(
+        `Donation attempt ${attempt}/${DONATION_RETRY_LIMIT} for index ${request.sourceIndex ?? 'N/A'}`,
+        request.sourceAddress.substring(0, 32) + (request.sourceAddress.length > 32 ? '...' : '')
+      );
+
+      try {
+        const response = await fetch('/api/wallet/donate-to', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            password: passwordValue,
+            sourceAddress: request.sourceAddress,
+            sourceAddressIndex: request.sourceIndex,
+            destinationAddress: request.destinationAddress,
+          }),
+        });
+
+        const data = await response.json();
+        lastResponse = data.response ?? data;
+
+        if (response.ok && data.success) {
+          const message = data.message || 'Donation successful';
+          logDonationMessage(`✓ Donation success for ${request.sourceAddress.substring(0, 24)}...`, message);
+          logDonationMessage('Server response', lastResponse);
+          return {
+            success: true,
+            message,
+            response: lastResponse,
+            resultType: classifyDonationOutcome(true, data.message, lastResponse),
+          };
+        }
+
+        lastError = data.error || `HTTP ${response.status}`;
+        logDonationMessage(`✗ Donation failed`, lastError);
+        logDonationMessage('Server response', lastResponse);
+      } catch (err: any) {
+        lastError = err.message || 'Network error';
+        logDonationMessage(`✗ Donation error`, lastError);
+      }
+    }
+
+    return {
+      success: false,
+      error: lastError || 'Donation failed',
+      response: lastResponse,
+      resultType: classifyDonationOutcome(false, lastError, lastResponse),
+    };
+  };
+
+  const processDonations = async (
+    requests: DonationRequestPayload[],
+    passwordValue: string,
+    destinationAddress: string
+  ) => {
+    if (requests.length === 0) {
+      logDonationMessage('No addresses to donate.');
+      setDonationProgress(null);
+      setDonationResults([]);
+      setFailedDonationQueue([]);
+      resetDestinationCounters();
+      return;
+    }
+
+    setDonationProgress({ current: 0, total: requests.length });
+    setDonationResults([]);
+    setFailedDonationQueue([]);
+    setDonationStatus({ currentNumber: 0, total: requests.length });
+    setDonationResultCounters(initialResultCounters);
+
+    const results: DonationResultItem[] = new Array(requests.length);
+    const failedQueue: DonationRequestPayload[] = [];
+    let completed = 0;
+    let nextIndexToProcess = 0;
+    const concurrency = Math.min(DONATION_CONCURRENCY, requests.length);
+
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const currentIndex = nextIndexToProcess++;
+        if (currentIndex >= requests.length) break;
+
+        const request = requests[currentIndex];
+        setDonationStatus({
+          currentNumber: currentIndex + 1,
+          total: requests.length,
+          currentIndex: request.sourceIndex,
+          currentAddress: request.sourceAddress,
+        });
+        const result = await attemptDonationWithRetries(request, passwordValue);
+
+        results[currentIndex] = {
+          ...request,
+          success: result.success,
+          message: result.message,
+          error: result.error,
+          response: result.response,
+          timestamp: new Date().toISOString(),
+          resultType: result.resultType,
+        };
+
+        setDonationResultCounters(prev => ({
+          ...prev,
+          [result.resultType]: prev[result.resultType] + 1,
+        }));
+
+        if (!result.success && result.resultType === 'error') {
+          failedQueue.push(request);
+        } else if (result.success) {
+          setDestinationCounters(prev => ({
+            ...prev,
+            countedProcessedSolutions: prev.countedProcessedSolutions + (request.solutions || 0),
+            countedProcessedNight: prev.countedProcessedNight + (request.night || 0),
+          }));
+        }
+
+        completed++;
+        setDonationProgress({ current: completed, total: requests.length });
+      }
+    });
+
+    await Promise.all(workers);
+
+    setDonationResults(results.filter(Boolean));
+    setFailedDonationQueue(failedQueue);
+    setDonationProgress(null);
+    setDonationStatus(null);
+
+    await refreshDestinationCounters(destinationAddress);
+
+    if (failedQueue.length > 0) {
+      logDonationMessage(`Donations completed with ${failedQueue.length} failure(s).`);
+    } else {
+      logDonationMessage('All donations completed successfully.');
+    }
+  };
+
+  const handleDonateSingle = async () => {
+    if (!donateSourceAddress.trim() || !donateDestinationAddress.trim()) {
+      setError('Please enter both source and destination addresses');
+      return;
+    }
+
+    const pwd = password || passwordInput;
+    if (!pwd) {
+      setError('Password is required for donations');
+      return;
+    }
+
+    setError(null);
+    setDonationLogs([]);
+    setDonationResults([]);
+    setFailedDonationQueue([]);
+    resetDestinationCounters();
+    setDonating(true);
+
+    try {
+      const { stats: sourceStats } = await fetchStatsForRecords([{ bech32: donateSourceAddress.trim() }]);
+      const statEntry = sourceStats[0];
+
+      if (!statEntry?.registered) {
+        const message = 'Source address has no registered activity to consolidate.';
+        logDonationMessage(message);
+        setError(message);
+        setDonating(false);
+        return;
+      }
+
+      const request: DonationRequestPayload = {
+        sourceAddress: donateSourceAddress.trim(),
+        sourceIndex: statEntry?.index,
+        destinationAddress: donateDestinationAddress.trim(),
+        solutions: statEntry?.solutionsSubmitted ?? 0,
+        night: statEntry?.nightEarned ?? 0,
+      };
+
+      await initializeDestinationCounters([request], donateDestinationAddress.trim());
+      logDonationMessage(`Starting donation from ${donateSourceAddress.trim()} to ${donateDestinationAddress.trim()}`);
+
+      await processDonations(
+        [request],
+        pwd,
+        donateDestinationAddress.trim()
+      );
+    } catch (err: any) {
+      setError(err.message || 'Failed to process donation');
+    } finally {
+      setDonating(false);
+    }
+  };
+
+  const handleDonateRange = async () => {
+    if (!donateRangeStart || !donateRangeEnd) {
+      setError('Please provide both start and end indices');
+      return;
+    }
+
+    if (!donateDestinationAddress.trim()) {
+      setError('Destination address is required');
+      return;
+    }
+
+    const pwd = password || passwordInput;
+    if (!pwd) {
+      setError('Password is required for donations');
+      return;
+    }
+
+    const startOffset = parseInt(donateRangeStart, 10);
+    const endOffset = parseInt(donateRangeEnd, 10);
+
+    if (isNaN(startOffset) || isNaN(endOffset) || startOffset < 0 || endOffset < startOffset) {
+      setError('Invalid range. Offsets must be non-negative and end must be >= start.');
+      return;
+    }
+
+    const startAddressIndex = offsetToStartIndex(startOffset);
+    const endAddressIndex = offsetToEndIndex(endOffset);
+    const totalAddresses = endAddressIndex - startAddressIndex + 1;
+
+    if (totalAddresses > 150000) {
+      setError('Range cannot exceed 150,000 derived addresses. Reduce the offset span.');
+      return;
+    }
+
+    setError(null);
+    setDonationLogs([]);
+    setDonationResults([]);
+    setFailedDonationQueue([]);
+    resetDestinationCounters();
+    setDonating(true);
+    setDerivationStatus({ currentOffset: startOffset, totalOffsets: endOffset - startOffset + 1 });
+
+    try {
+      logDonationMessage(`Starting range donation for offsets ${startOffset}-${endOffset} (addresses ${startAddressIndex}-${endAddressIndex})`);
+      const deriveResponse = await fetch('/api/wallet/derive-addresses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          password: pwd,
+          startIndex: startAddressIndex,
+          endIndex: endAddressIndex,
+        }),
+      });
+
+      const deriveData = await deriveResponse.json();
+
+      if (!deriveResponse.ok) {
+        throw new Error(deriveData.error || 'Failed to derive addresses');
+      }
+
+      setDerivationStatus(null);
+
+      const { stats: rangeStats } = await fetchStatsForRecords(
+        deriveData.addresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 }))
+      );
+      const statsMap = new Map(rangeStats.map(stat => [stat.bech32, stat]));
+
+      const requests: DonationRequestPayload[] = [];
+      deriveData.addresses.forEach((addr: any) => {
+        if (addr.bech32 === donateDestinationAddress.trim()) {
+          return;
+        }
+        const statEntry = statsMap.get(addr.bech32);
+        if (!statEntry?.registered) {
+          return;
+        }
+        requests.push({
+          sourceAddress: addr.bech32,
+          sourceIndex: addr.index,
+          destinationAddress: donateDestinationAddress.trim(),
+          solutions: statEntry?.solutionsSubmitted ?? 0,
+          night: statEntry?.nightEarned ?? 0,
+        });
+      });
+
+      if (requests.length === 0) {
+        setError('No registered addresses available for donation in the specified offset range.');
+        setDonating(false);
+        return;
+      }
+
+      logDonationMessage(`Derived ${requests.length} registered addresses for donation`);
+      await initializeDestinationCounters(requests, donateDestinationAddress.trim());
+      await processDonations(requests, pwd, donateDestinationAddress.trim());
+    } catch (err: any) {
+      setError(err.message || 'Failed to process donation range');
+    } finally {
+      setDonating(false);
+    }
+  };
+
+  const handleRetryFailedDonations = async () => {
+    if (failedDonationQueue.length === 0) {
+      return;
+    }
+
+    const pwd = password || passwordInput;
+    if (!pwd) {
+      setError('Password is required to retry donations');
+      return;
+    }
+
+    setError(null);
+    setDonationLogs([]);
+    setDonationResults([]);
+    resetDestinationCounters();
+    setDonating(true);
+
+    try {
+      const destination = failedDonationQueue[0].destinationAddress;
+      logDonationMessage(`Retrying ${failedDonationQueue.length} failed donations to ${destination}`);
+      await initializeDestinationCounters(failedDonationQueue, destination);
+      await processDonations(failedDonationQueue, pwd, destination);
+    } catch (err: any) {
+      setError(err.message || 'Failed to retry donations');
+    } finally {
+      setDonating(false);
+    }
+  };
+
+  const handleAutoConsolidate = async () => {
+    if (!donateDestinationAddress.trim()) {
+      setError('Destination address is required for auto consolidate');
+      return;
+    }
+
+    const pwd = password || passwordInput;
+    if (!pwd) {
+      setError('Password is required for auto consolidate');
+      return;
+    }
+
+    setError(null);
+    setDonationLogs([]);
+    setDonationResults([]);
+    setFailedDonationQueue([]);
+    setAutoDetectionRange(null);
+    resetDestinationCounters();
+    setAutoDetecting(true);
+    setDonating(true);
+
+    try {
+      const detectedRequests: DonationRequestPayload[] = [];
+      const destination = donateDestinationAddress.trim();
+      let lastRegisteredOffset = -1;
+
+      // First pass: quickly check which offsets have registered addresses (parallel)
+      const offsetChecks: Array<{ offset: number; isRegistered: boolean }> = [];
+      const checkWorkers = Array.from({ length: Math.min(DERIVATION_CONCURRENCY, AUTO_MAX_OFFSET) }, async (_, workerId) => {
+        for (let offset = workerId; offset < AUTO_MAX_OFFSET; offset += DERIVATION_CONCURRENCY) {
+          setAutoDetectionStatus({ currentOffset: offset });
+          const sampleStart = offsetToStartIndex(offset);
+          
+          try {
+            const sampleResponse = await fetch('/api/wallet/derive-addresses', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                password: pwd,
+                startIndex: sampleStart,
+                endIndex: sampleStart,
+              }),
+            });
+
+            const sampleData = await sampleResponse.json();
+            if (!sampleResponse.ok || !sampleData.addresses?.[0]) {
+              offsetChecks.push({ offset, isRegistered: false });
+              continue;
+            }
+
+            const sampleAddress = sampleData.addresses[0];
+            const { stats: sampleStats } = await fetchStatsForRecords([{ index: sampleStart, bech32: sampleAddress.bech32 }]);
+            const sampleEntry = sampleStats[0];
+            const isRegistered = !!sampleEntry?.registered;
+
+            logDonationMessage(
+              `Auto detect offset ${offset} (${sampleStart}-${offsetToEndIndex(offset)}): ${isRegistered ? 'registered' : 'not registered'}`
+            );
+
+            offsetChecks.push({ offset, isRegistered });
+          } catch (err: any) {
+            logDonationMessage(`Error checking offset ${offset}: ${err.message}`);
+            offsetChecks.push({ offset, isRegistered: false });
+          }
+        }
+      });
+
+      await Promise.all(checkWorkers);
+
+      // Sort by offset and find the last registered offset
+      offsetChecks.sort((a, b) => a.offset - b.offset);
+      for (const check of offsetChecks) {
+        if (!check.isRegistered) {
+          if (lastRegisteredOffset >= 0) {
+            setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+          } else {
+            setAutoDetectionRange(null);
+          }
+          break;
+        }
+        lastRegisteredOffset = check.offset;
+      }
+
+      // Second pass: derive and process all registered offsets in parallel
+      const registeredOffsets = offsetChecks.filter(c => c.isRegistered).map(c => c.offset);
+      
+      if (registeredOffsets.length === 0) {
+        setDonating(false);
+        setError('No registered addresses found for auto consolidate.');
+        return;
+      }
+
+      const deriveWorkers = Array.from({ length: Math.min(DERIVATION_CONCURRENCY, registeredOffsets.length) }, async (_, workerId) => {
+        for (let i = workerId; i < registeredOffsets.length; i += DERIVATION_CONCURRENCY) {
+          const offset = registeredOffsets[i];
+          setAutoDetectionStatus({ currentOffset: offset });
+          
+          const chunkStart = offsetToStartIndex(offset);
+          const chunkEnd = offsetToEndIndex(offset);
+          
+          try {
+            const chunkResponse = await fetch('/api/wallet/derive-addresses', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                password: pwd,
+                startIndex: chunkStart,
+                endIndex: chunkEnd,
+              }),
+            });
+
+            const chunkData = await chunkResponse.json();
+            if (!chunkResponse.ok) {
+              throw new Error(chunkData.error || `Failed to derive chunk for offset ${offset}`);
+            }
+
+            const { stats: chunkStats } = await fetchStatsForRecords(
+              chunkData.addresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 }))
+            );
+
+            chunkData.addresses.forEach((addr: any, idx: number) => {
+              if (addr.bech32 === destination) {
+                return;
+              }
+              const statEntry = chunkStats[idx];
+              if (statEntry?.registered) {
+                detectedRequests.push({
+                  sourceAddress: addr.bech32,
+                  sourceIndex: addr.index,
+                  destinationAddress: destination,
+                  solutions: statEntry?.solutionsSubmitted ?? 0,
+                  night: statEntry?.nightEarned ?? 0,
+                });
+              }
+            });
+          } catch (err: any) {
+            logDonationMessage(`Error processing offset ${offset}: ${err.message}`);
+          }
+        }
+      });
+
+      await Promise.all(deriveWorkers);
+
+      setAutoDetectionStatus(null);
+      setAutoDetecting(false);
+
+      if (detectedRequests.length === 0) {
+        setDonating(false);
+        setError('No registered addresses found for auto consolidate.');
+        return;
+      }
+
+      if (!autoDetectionRange && lastRegisteredOffset >= 0) {
+        setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+      }
+
+      const finalOffset =
+        lastRegisteredOffset >= 0
+          ? lastRegisteredOffset
+          : Math.floor((detectedRequests[detectedRequests.length - 1].sourceIndex ?? 0) / ADDRESSES_PER_OFFSET);
+
+      logDonationMessage(`Auto consolidate will process offsets 0-${finalOffset}`);
+      await initializeDestinationCounters(detectedRequests, destination);
+      await processDonations(detectedRequests, pwd, destination);
+    } catch (err: any) {
+      setError(err.message || 'Auto consolidate failed');
+    } finally {
+      setAutoDetectionStatus(null);
+      setAutoDetecting(false);
+      setDonating(false);
+    }
+  };
+
+  const handleViewByIndex = async () => {
+    if (!password && !passwordInput) {
+      setError('Password is required to derive addresses');
+      return;
+    }
+
+    const index = parseInt(indexInput);
+    if (isNaN(index) || index < 0) {
+      setError('Invalid index. Must be a non-negative number.');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setAddresses([]);
+    setStatistics([]);
+    setTotals(null);
+
+    try {
+      const pwd = password || passwordInput;
+      const startIndex = index * 200;
+      const endIndex = startIndex + 199;
+
+      const response = await fetch('/api/wallet/derive-addresses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          password: pwd,
+          startIndex,
+          endIndex,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to derive addresses');
+      }
+
+      setAddresses(data.addresses);
+    } catch (err: any) {
+      setError(err.message || 'Failed to load addresses');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCheckStatistics = async () => {
+    if (addresses.length === 0) {
+      setError('No addresses to check. Please load addresses first.');
+      return;
+    }
+
+    setCheckingStats(true);
+    setError(null);
+    setStatistics([]);
+    setTotals(null);
+
+    try {
+      const { stats, totals } = await fetchStatsForRecords(
+        addresses.map(a => ({ index: a.index, bech32: a.bech32 })),
+        true
+      );
+
+      setStatistics(stats);
+      setTotals(totals);
+    } catch (err: any) {
+      setError(err.message || 'Failed to check statistics');
+    } finally {
+      setCheckingStats(false);
+      setCheckProgress(null);
+    }
+  };
+
+  const handleCheckIndividual = async () => {
+    if (!individualAddress.trim()) {
+      setError('Please enter an address');
+      return;
+    }
+
+    if (!individualAddress.startsWith('addr1')) {
+      setError('Invalid address format. Must start with addr1');
+      return;
+    }
+
+    setCheckingStats(true);
+    setError(null);
+    setStatistics([]);
+    setTotals(null);
+
+    try {
+      const { stats, totals } = await fetchStatsForRecords(
+        [{ bech32: individualAddress.trim() }],
+        false
+      );
+      setStatistics(stats);
+      setTotals(totals);
+    } catch (err: any) {
+      setError(err.message || 'Failed to check statistics');
+    } finally {
+      setCheckingStats(false);
+    }
+  };
+
+  const handleCheckRange = async () => {
+    if (!password && !passwordInput) {
+      setError('Password is required to derive addresses');
+      return;
+    }
+
+    const startOffset = parseInt(rangeStart, 10);
+    const endOffset = parseInt(rangeEnd, 10);
+
+    if (isNaN(startOffset) || isNaN(endOffset) || startOffset < 0 || endOffset < startOffset) {
+      setError('Invalid range. Offsets must be non-negative and end must be >= start.');
+      return;
+    }
+
+    const startAddressIndex = offsetToStartIndex(startOffset);
+    const endAddressIndex = offsetToEndIndex(endOffset);
+    const totalAddresses = endAddressIndex - startAddressIndex + 1;
+
+    if (totalAddresses > 150000) {
+      setError('Range cannot exceed 150,000 derived addresses. Reduce the offset span.');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setAddresses([]);
+    setStatistics([]);
+    setTotals(null);
+    setCheckProgress(null);
+    setDerivationStatus({ currentOffset: startOffset, totalOffsets: endOffset - startOffset + 1 });
+
+    try {
+      const pwd = password || passwordInput;
+
+      // Derive addresses with progress tracking
+      const deriveResponse = await fetch('/api/wallet/derive-addresses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          password: pwd,
+          startIndex: startAddressIndex,
+          endIndex: endAddressIndex,
+        }),
+      });
+
+      const deriveData = await deriveResponse.json();
+
+      if (!deriveResponse.ok) {
+        throw new Error(deriveData.error || 'Failed to derive addresses');
+      }
+
+      setAddresses(deriveData.addresses);
+      setDerivationStatus(null);
+
+      // Automatically check statistics
+      setCheckingStats(true);
+      const { stats, totals } = await fetchStatsForRecords(
+        deriveData.addresses.map((addr: any) => ({ index: addr.index, bech32: addr.bech32 })),
+        true
+      );
+      setStatistics(stats);
+      setTotals(totals);
+    } catch (err: any) {
+      setError(err.message || 'Failed to process range');
+    } finally {
+      setLoading(false);
+      setCheckingStats(false);
+      setCheckProgress(null);
+      setDerivationStatus(null);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {(donating || autoDetecting || derivationStatus || loading) && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="max-w-xl w-full bg-gray-900/90 border border-gray-700 rounded-2xl p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <Loader2 className="w-6 h-6 text-green-400 animate-spin" />
+              <div>
+                <p className="text-lg font-semibold text-white">
+                  {autoDetecting
+                    ? 'Detecting Registered Addresses...'
+                    : derivationStatus || loading
+                    ? 'Deriving Addresses...'
+                    : 'Consolidating Addresses...'}
+                </p>
+                <p className="text-sm text-gray-400">
+                  {autoDetecting
+                    ? 'Scanning wallet indexes to find registered sources.'
+                    : derivationStatus || loading
+                    ? 'Generating addresses from wallet seed phrase.'
+                    : 'Donations are running in parallel. Keep the app open until completion.'}
+                </p>
+              </div>
+            </div>
+
+            {autoDetecting && autoDetectionStatus && (
+              <div className="text-sm text-gray-300">
+                Checking offset{' '}
+                <span className="text-white font-semibold">{autoDetectionStatus.currentOffset}</span>
+                {' '}
+                (addresses {offsetToStartIndex(autoDetectionStatus.currentOffset)}-
+                {offsetToEndIndex(autoDetectionStatus.currentOffset)})
+              </div>
+            )}
+
+            {derivationStatus && (
+              <div className="text-sm text-gray-300">
+                Deriving addresses for offset{' '}
+                <span className="text-white font-semibold">{derivationStatus.currentOffset}</span>
+                {' '}
+                ({derivationStatus.currentOffset + 1}/{derivationStatus.totalOffsets} offsets)
+              </div>
+            )}
+
+            {!autoDetecting && donationStatus && (
+              <div className="space-y-1 text-sm text-gray-300">
+                <p>
+                  Address {donationStatus.currentNumber}/{donationStatus.total}
+                </p>
+                <p>
+                  Index:{' '}
+                  <span className="text-white font-semibold">{donationStatus.currentIndex ?? 'N/A'}</span>
+                </p>
+                {donationStatus.currentAddress && (
+                  <p className="font-mono text-xs break-all text-gray-400">
+                    {donationStatus.currentAddress}
+                  </p>
+                )}
+                <p className="text-xs text-gray-500">
+                  Total addresses queued: {donationStatus.total.toLocaleString()}
+                </p>
+              </div>
+            )}
+
+            {!autoDetecting && donationProgress && (
+              <div className="space-y-2">
+                <div className="w-full bg-gray-800 rounded-full h-2">
+                  <div
+                    className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${(donationProgress.current / donationProgress.total) * 100}%` }}
+                  />
+                </div>
+                <p className="text-xs text-gray-400">
+                  {donationProgress.current}/{donationProgress.total} donations processed
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <Card variant="bordered">
+        <CardHeader>
+          <CardTitle>Ty Consolidation</CardTitle>
+          <CardDescription>
+            View addresses and check statistics for registration, solutions submitted, and NIGHT earned
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {/* Mode Selection */}
+          <div className="flex gap-2 border-b border-gray-700 pb-4">
+            <button
+              onClick={() => setViewMode('index-range')}
+              className={cn(
+                'px-4 py-2 rounded-md font-medium transition-colors',
+                viewMode === 'index-range'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              )}
+            >
+              View by Index Range
+            </button>
+            <button
+              onClick={() => setViewMode('individual')}
+              className={cn(
+                'px-4 py-2 rounded-md font-medium transition-colors',
+                viewMode === 'individual'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              )}
+            >
+              Check Individual Address
+            </button>
+            <button
+              onClick={() => setViewMode('address-range')}
+              className={cn(
+                'px-4 py-2 rounded-md font-medium transition-colors',
+                viewMode === 'address-range'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              )}
+            >
+              Check Address Range
+            </button>
+            <button
+              onClick={() => setViewMode('donate-single')}
+              className={cn(
+                'px-4 py-2 rounded-md font-medium transition-colors',
+                viewMode === 'donate-single'
+                  ? 'bg-green-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              )}
+            >
+              Donate Single Address
+            </button>
+            <button
+              onClick={() => setViewMode('donate-range')}
+              className={cn(
+                'px-4 py-2 rounded-md font-medium transition-colors',
+                viewMode === 'donate-range'
+                  ? 'bg-green-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              )}
+            >
+              Donate Address Range
+            </button>
+            <button
+              onClick={() => setViewMode('auto-consolidate')}
+              className={cn(
+                'px-4 py-2 rounded-md font-medium transition-colors',
+                viewMode === 'auto-consolidate'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              )}
+            >
+              Auto Consolidate
+            </button>
+          </div>
+
+          {/* Password Input (if not already loaded) */}
+          {!password && (
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-300">
+                Wallet Password
+              </label>
+              <input
+                type="password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="Enter wallet password"
+              />
+            </div>
+          )}
+
+          {/* Index Range View */}
+          {viewMode === 'index-range' && (
+            <div className="space-y-4">
+              <div className="flex gap-4 items-end">
+                <div className="flex-1 space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Index (0 = addresses 0-199, 1 = 200-399, etc.)
+                  </label>
+                  <input
+                    type="number"
+                    value={indexInput}
+                    onChange={(e) => setIndexInput(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="0"
+                    min="0"
+                  />
+                </div>
+                <Button
+                  onClick={handleViewByIndex}
+                  disabled={loading}
+                  variant="primary"
+                >
+                  {loading ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                      Loading...
+                    </>
+                  ) : (
+                    'View Addresses'
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Individual Address Check */}
+          {viewMode === 'individual' && (
+            <div className="space-y-4">
+              <div className="flex gap-4 items-end">
+                <div className="flex-1 space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Address
+                  </label>
+                  <input
+                    type="text"
+                    value={individualAddress}
+                    onChange={(e) => setIndividualAddress(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                    placeholder="addr1..."
+                  />
+                </div>
+                <Button
+                  onClick={handleCheckIndividual}
+                  disabled={checkingStats}
+                  variant="primary"
+                >
+                  {checkingStats ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                      Checking...
+                    </>
+                  ) : (
+                    'Check Statistics'
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Address Range Check */}
+          {viewMode === 'address-range' && (
+            <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                      Start Offset (0 = addresses 0-199)
+                  </label>
+                  <input
+                    type="number"
+                    value={rangeStart}
+                    onChange={(e) => setRangeStart(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="100"
+                    min="0"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    End Index
+                  </label>
+                  <input
+                    type="number"
+                    value={rangeEnd}
+                    onChange={(e) => setRangeEnd(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="800"
+                    min="0"
+                  />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Button
+                  onClick={handleCheckRange}
+                  disabled={loading || checkingStats}
+                  variant="primary"
+                  className="w-full"
+                >
+                  {loading || checkingStats ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                      {loading ? 'Deriving Addresses...' : `Checking Statistics...${checkProgress ? ` (${checkProgress.current}/${checkProgress.total})` : ''}`}
+                    </>
+                  ) : (
+                    'Check Range'
+                  )}
+                </Button>
+                {checkProgress && checkProgress.total > 0 && (loading || checkingStats) && (
+                  <div className="w-full bg-gray-700 rounded-full h-2">
+                    <div
+                      className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${(checkProgress.current / checkProgress.total) * 100}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Check Statistics Button (for index-range mode) */}
+          {viewMode === 'index-range' && addresses.length > 0 && (
+            <div className="space-y-2">
+              <Button
+                onClick={handleCheckStatistics}
+                disabled={checkingStats}
+                variant="success"
+                className="w-full"
+              >
+                {checkingStats ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                    Checking Statistics...
+                    {checkProgress && ` (${checkProgress.current}/${checkProgress.total})`}
+                  </>
+                ) : (
+                  `Check Statistics for All Addresses (${addresses.length})`
+                )}
+              </Button>
+              {checkProgress && checkProgress.total > 0 && (
+                <div className="w-full bg-gray-700 rounded-full h-2">
+                  <div
+                    className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${(checkProgress.current / checkProgress.total) * 100}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Donate Single Address */}
+          {viewMode === 'donate-single' && (
+            <div className="space-y-4">
+              <Alert variant="warning">
+                <Info className="w-4 h-4" />
+                <div>
+                  <p className="font-semibold mb-1">Donate (Consolidate) Rewards</p>
+                  <p className="text-sm">This will assign all accumulated Scavenger rights from the source address to the destination address. All past and future solutions will be consolidated.</p>
+                </div>
+              </Alert>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Source Address (to donate from)
+                  </label>
+                  <input
+                    type="text"
+                    value={donateSourceAddress}
+                    onChange={(e) => setDonateSourceAddress(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                    placeholder="addr1..."
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Destination Address (to donate to)
+                  </label>
+                  <input
+                    type="text"
+                    value={donateDestinationAddress}
+                    onChange={(e) => setDonateDestinationAddress(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                    placeholder="addr1..."
+                  />
+                </div>
+                <Button
+                  onClick={handleDonateSingle}
+                  disabled={donating || !donateSourceAddress.trim() || !donateDestinationAddress.trim()}
+                  variant="success"
+                  className="w-full"
+                >
+                  {donating && viewMode === 'donate-single' ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                      Processing Donation...
+                    </>
+                  ) : (
+                    'Donate to Destination Address'
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Donate Address Range */}
+          {viewMode === 'donate-range' && (
+            <div className="space-y-4">
+              <Alert variant="warning">
+                <Info className="w-4 h-4" />
+                <div>
+                  <p className="font-semibold mb-1">Donate (Consolidate) Offset Range</p>
+                  <p className="text-sm">
+                    This will donate all addresses within each 200-address offset block to the destination address. Offsets are
+                    generated in chunks of 200 mining addresses.
+                  </p>
+                </div>
+              </Alert>
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <label className="block text-sm font-medium text-gray-300">
+                      Start Offset (0 = addresses 0-199)
+                    </label>
+                    <input
+                      type="number"
+                      value={donateRangeStart}
+                      onChange={(e) => setDonateRangeStart(e.target.value)}
+                      className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      placeholder="0"
+                      min="0"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-sm font-medium text-gray-300">
+                      End Offset (e.g. 2 = addresses 400-599)
+                    </label>
+                    <input
+                      type="number"
+                      value={donateRangeEnd}
+                      onChange={(e) => setDonateRangeEnd(e.target.value)}
+                      className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      placeholder="199"
+                      min="0"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Destination Address
+                  </label>
+                  <input
+                    type="text"
+                    value={donateDestinationAddress}
+                    onChange={(e) => setDonateDestinationAddress(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                    placeholder="addr1..."
+                  />
+                </div>
+                <Button
+                  onClick={handleDonateRange}
+                  disabled={donating || !donateRangeStart || !donateRangeEnd || !donateDestinationAddress.trim()}
+                  variant="success"
+                  className="w-full"
+                >
+                  {donating && viewMode === 'donate-range' ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                      Processing Donations...
+                    </>
+                  ) : (
+                    'Donate Address Range to Destination'
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Auto Consolidate */}
+          {viewMode === 'auto-consolidate' && (
+            <div className="space-y-4">
+              <Alert variant="warning">
+                <Info className="w-4 h-4" />
+                <div>
+                  <p className="font-semibold mb-1">Auto Consolidate</p>
+                  <p className="text-sm">
+                    Automatically find all registered address indexes starting from 0 and consolidate them to the destination
+                    address. The scan stops at the first unregistered index.
+                  </p>
+                </div>
+              </Alert>
+          <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Destination Address
+                  </label>
+                  <input
+                    type="text"
+                    value={donateDestinationAddress}
+                    onChange={(e) => setDonateDestinationAddress(e.target.value)}
+                    className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                    placeholder="addr1..."
+                  />
+                </div>
+          {autoDetectionRange && (
+                  <div className="text-sm text-green-400">
+                    Last detected offset range: {autoDetectionRange.startOffset} - {autoDetectionRange.endOffset} (
+                    addresses {offsetToStartIndex(autoDetectionRange.startOffset)}-
+                    {offsetToEndIndex(autoDetectionRange.endOffset)})
+                  </div>
+                )}
+                <Button
+                  onClick={handleAutoConsolidate}
+                  disabled={donating || autoDetecting || !donateDestinationAddress.trim()}
+                  variant="success"
+                  className="w-full"
+                >
+                  {donating ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                      {autoDetecting ? 'Detecting Addresses...' : 'Consolidating...'}
+                    </>
+                  ) : (
+                    'Auto Consolidate'
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Donation Progress */}
+          {donationProgress && (
+            <div className="space-y-2">
+              <p className="text-sm text-gray-400">
+                Processing donations {donationProgress.current}/{donationProgress.total}
+              </p>
+              <div className="w-full bg-gray-700 rounded-full h-2">
+                <div
+                  className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(donationProgress.current / donationProgress.total) * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Donation Logs */}
+          {donationLogs.length > 0 && (
+            <Card variant="bordered" className="bg-gray-900/50">
+              <CardHeader>
+                <CardTitle className="text-sm">Donation Logs</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="bg-black rounded-lg p-4 font-mono text-xs max-h-64 overflow-y-auto">
+                  {donationLogs.map((log, idx) => (
+                    <div key={idx} className="text-gray-300 mb-1">
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {(destinationCounters.apiSolutions !== null ||
+            destinationCounters.countedTotalSolutions > 0 ||
+            destinationCounters.countedProcessedSolutions > 0) && (
+            <Card variant="bordered" className="bg-gray-900/40">
+              <CardHeader>
+                <CardTitle className="text-sm">Destination Address Summary</CardTitle>
+                {currentDestinationAddress && (
+                  <CardDescription className="font-mono text-xs truncate">
+                    {currentDestinationAddress}
+                  </CardDescription>
+                )}
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-gray-300">
+                  <div>
+                    <p className="text-gray-400">API Solutions (may lag)</p>
+                    <p className="text-white text-lg font-semibold">
+                      {destinationCounters.apiSolutions !== null ? destinationCounters.apiSolutions.toLocaleString() : 'N/A'}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-gray-400">API NIGHT (may lag)</p>
+                    <p className="text-white text-lg font-semibold">
+                      {destinationCounters.apiNight !== null ? formatNightValue(destinationCounters.apiNight) : 'N/A'}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-gray-400">Counted Total Solutions</p>
+                    <p className="text-white text-xl font-semibold">
+                      {destinationCounters.countedTotalSolutions.toLocaleString()}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Processed:{' '}
+                      {destinationCounters.countedProcessedSolutions.toLocaleString()}
+                      {' • Remaining: '}
+                      {Math.max(
+                        destinationCounters.countedTotalSolutions - destinationCounters.countedProcessedSolutions,
+                        0
+                      ).toLocaleString()}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-gray-400">Counted Total NIGHT</p>
+                    <p className="text-white text-xl font-semibold">
+                      {formatNightValue(destinationCounters.countedTotalNight)}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Processed:{' '}
+                      {formatNightValue(destinationCounters.countedProcessedNight)}
+                      {' • Remaining: '}
+                      {formatNightValue(
+                        Math.max(
+                          destinationCounters.countedTotalNight - destinationCounters.countedProcessedNight,
+                          0
+                        )
+                      )}
+                    </p>
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500 mt-4">
+                  Counted values include only the addresses processed in this session and update live as each donation completes.
+                  API values come directly from Midnight and may lag until the network finalizes each consolidation.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
+          {(totalDonationOutcomeCount > 0 || donating) && (
+            <Card variant="bordered" className="bg-gray-900/50">
+              <CardHeader>
+                <CardTitle className="text-sm">Donation Outcome Counters</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+                  {orderedResultTypes.map(type => (
+                    <div
+                      key={type}
+                      className={`p-3 rounded-lg border ${donationResultTypeMeta[type].className}`}
+                    >
+                      <p className="text-xs uppercase tracking-wide text-gray-400">
+                        {donationResultTypeMeta[type].label}
+                      </p>
+                      <p className="text-2xl font-semibold text-white">
+                        {donationResultCounters[type].toLocaleString()}
+                      </p>
+                      <p className="text-xs text-gray-400">
+                        {donationResultTypeMeta[type].description}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Donation Results */}
+          {donationResults.length > 0 && (
+            <Card variant="bordered">
+              <CardHeader>
+                <CardTitle>Donation Results</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-700">
+                        <th className="text-left py-2 px-4 text-gray-400">Index</th>
+                        <th className="text-left py-2 px-4 text-gray-400">Source Address</th>
+                        <th className="text-left py-2 px-4 text-gray-400">Destination</th>
+                        <th className="text-left py-2 px-4 text-gray-400">Result</th>
+                        <th className="text-left py-2 px-4 text-gray-400">API Response / Message</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {donationResults.map((result, idx) => (
+                        <tr key={idx} className="border-b border-gray-800 hover:bg-gray-800/50">
+                          <td className="py-2 px-4 text-gray-300">
+                            {result.sourceIndex !== undefined ? result.sourceIndex : '-'}
+                          </td>
+                          <td className="py-2 px-4">
+                            <span className="font-mono text-xs text-gray-300">{result.sourceAddress.substring(0, 30)}...</span>
+                          </td>
+                          <td className="py-2 px-4">
+                            <span className="font-mono text-xs text-gray-300">{result.destinationAddress.substring(0, 30)}...</span>
+                          </td>
+                          <td className="py-2 px-4">
+                            <span
+                              className={`px-2 py-1 rounded-full text-xs font-semibold ${donationResultTypeMeta[result.resultType].className}`}
+                              title={donationResultTypeMeta[result.resultType].description}
+                            >
+                              {donationResultTypeMeta[result.resultType].label}
+                            </span>
+                          </td>
+                          <td className="py-2 px-4 text-xs">
+                            <div
+                              className={cn(
+                                'whitespace-pre-wrap break-words',
+                                result.resultType === 'error'
+                                  ? 'text-red-300'
+                                  : result.resultType === 'warning'
+                                  ? 'text-yellow-200'
+                                  : 'text-gray-300'
+                              )}
+                            >
+                              {summarizeResponse(result.response, result.message || result.error)}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="mt-4 pt-4 border-t border-gray-700">
+                  <div className="flex flex-wrap gap-4 text-sm">
+                    <span className="text-gray-400">Total: {donationResults.length}</span>
+                    {orderedResultTypes.map(type => (
+                      <span key={type} className={donationResultTypeMeta[type].textColor}>
+                        {donationResultTypeMeta[type].label}: {donationResultCounters[type].toLocaleString()}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                {failedDonationQueue.length > 0 && !donating && (
+                  <div className="mt-4">
+                    <Button onClick={handleRetryFailedDonations} variant="danger" className="w-full">
+                      Retry Failed Addresses ({failedDonationQueue.length})
+                    </Button>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {error && (
+            <Alert variant="error">{error}</Alert>
+          )}
+
+          {/* Totals Display */}
+          {totals && (
+            <Card variant="bordered" className="bg-gradient-to-br from-green-900/20 to-emerald-900/20 border-green-700/50">
+              <CardHeader>
+                <CardTitle className="text-lg">Summary Statistics</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-3 gap-4">
+                  <div>
+                    <p className="text-sm text-gray-400">Registered Addresses</p>
+                    <p className="text-2xl font-bold text-green-400">{totals.registeredCount}</p>
+                  </div>
+                  <div>
+                    <p className="text-sm text-gray-400">Total Solutions</p>
+                    <p className="text-2xl font-bold text-blue-400">{totals.totalSolutions.toLocaleString()}</p>
+                  </div>
+                  <div>
+                    <p className="text-sm text-gray-400">Total NIGHT Earned</p>
+                    <p className="text-2xl font-bold text-yellow-400">{formatNightValue(totals.totalNight)}</p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Addresses Table */}
+          {(addresses.length > 0 || statistics.length > 0) && (
+            <Card variant="bordered">
+              <CardHeader>
+                <CardTitle>
+                  {viewMode === 'index-range' ? 'Addresses' : viewMode === 'individual' ? 'Address Statistics' : 'Address Range Results'}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-700">
+                        {viewMode !== 'individual' && <th className="text-left py-2 px-4 text-gray-400">Index</th>}
+                        <th className="text-left py-2 px-4 text-gray-400">Address</th>
+                        <th className="text-left py-2 px-4 text-gray-400">Registered</th>
+                        <th className="text-left py-2 px-4 text-gray-400">Solutions</th>
+                        <th className="text-left py-2 px-4 text-gray-400">NIGHT Earned</th>
+                        {statistics.some(s => s.error) && <th className="text-left py-2 px-4 text-gray-400">Error</th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(statistics.length > 0 ? statistics : addresses.map(a => ({ bech32: a.bech32, index: a.index }))).map((item, idx) => {
+                        const stat = statistics.find(s => s.bech32 === item.bech32);
+                        return (
+                          <tr key={idx} className="border-b border-gray-800 hover:bg-gray-800/50">
+                            {viewMode !== 'individual' && (
+                              <td className="py-2 px-4 text-gray-300">
+                                {'index' in item ? item.index : '-'}
+                              </td>
+                            )}
+                            <td className="py-2 px-4">
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-xs text-gray-300">{item.bech32}</span>
+                                <button
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(item.bech32);
+                                  }}
+                                  className="text-gray-500 hover:text-gray-300"
+                                >
+                                  <Copy className="w-3 h-3" />
+                                </button>
+                              </div>
+                            </td>
+                            <td className="py-2 px-4">
+                              {stat ? (
+                                stat.registered ? (
+                                  <span className="text-green-400">✓ Yes</span>
+                                ) : (
+                                  <span className="text-gray-500">✗ No</span>
+                                )
+                              ) : (
+                                <span className="text-gray-500">-</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-4 text-gray-300">
+                              {stat ? stat.solutionsSubmitted.toLocaleString() : '-'}
+                            </td>
+                            <td className="py-2 px-4 text-gray-300">
+                              {stat ? formatNightValue(stat.nightEarned) : '-'}
+                            </td>
+                            {statistics.some(s => s.error) && (
+                              <td className="py-2 px-4">
+                                {stat?.error ? (
+                                  <span className="text-red-400 text-xs">{stat.error}</span>
+                                ) : (
+                                  <span className="text-gray-500">-</span>
+                                )}
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function MiningDashboardContent() {
   const router = useRouter();
   const [password, setPassword] = useState<string | null>(null);
@@ -118,7 +1962,7 @@ function MiningDashboardContent() {
   const logContainerRef = useRef<HTMLDivElement>(null);
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'history' | 'rewards' | 'workers' | 'addresses' | 'scale' | 'devfee' | 'consolidate' | 'diagnostics'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'history' | 'rewards' | 'workers' | 'addresses' | 'scale' | 'devfee' | 'consolidate' | 'ty-consolidation' | 'diagnostics'>('dashboard');
   const [history, setHistory] = useState<HistoryData | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyFilter, setHistoryFilter] = useState<'all' | 'success' | 'error'>('all');
@@ -1453,6 +3297,21 @@ function MiningDashboardContent() {
             <Wallet className="w-4 h-4 inline mr-2" />
             Consolidate
             {activeTab === 'consolidate' && (
+              <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-400" />
+            )}
+          </button>
+          <button
+            onClick={() => setActiveTab('ty-consolidation')}
+            className={cn(
+              'px-6 py-3 font-medium transition-colors relative',
+              activeTab === 'ty-consolidation'
+                ? 'text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            )}
+          >
+            <ListChecks className="w-4 h-4 inline mr-2" />
+            Ty Consolidation
+            {activeTab === 'ty-consolidation' && (
               <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-400" />
             )}
           </button>
@@ -4137,6 +5996,11 @@ function MiningDashboardContent() {
               </CardContent>
             </Card>
           </div>
+        )}
+
+        {/* Ty Consolidation Tab */}
+        {activeTab === 'ty-consolidation' && (
+          <TyConsolidationTab password={password} />
         )}
 
         {/* Diagnostics Tab */}
