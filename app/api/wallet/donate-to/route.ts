@@ -65,22 +65,67 @@ export async function POST(request: NextRequest) {
     }
 
     // Ensure the address is derived (derive on the fly if needed)
+    // First check if it's already in the derived list
+    let pubkey: string;
     try {
-      walletManager.getPubKeyHex(addressIndex);
+      pubkey = walletManager.getPubKeyHex(addressIndex);
     } catch (err: any) {
       // Address not in derived list, derive it on the fly
+      console.log(`[Donate-to] Address ${addressIndex} not found in derived list, deriving on the fly...`);
       try {
-        await walletManager.deriveAddressesByRange(password, addressIndex, addressIndex);
+        const derived = await walletManager.deriveAddressesByRange(password, addressIndex, addressIndex);
+        if (!derived || derived.length === 0) {
+          console.error(`[Donate-to] Derivation returned no addresses for index ${addressIndex}`);
+          return NextResponse.json(
+            { error: `Failed to derive address for index ${addressIndex}: No addresses returned` },
+            { status: 500 }
+          );
+        }
+        // Verify the address matches
+        const derivedAddr = derived.find(a => a.index === addressIndex);
+        if (!derivedAddr) {
+          console.error(`[Donate-to] Derived addresses: ${derived.map(a => a.index).join(', ')}, but ${addressIndex} not found`);
+          return NextResponse.json(
+            { error: `Failed to derive address for index ${addressIndex}: Address not in derived list` },
+            { status: 500 }
+          );
+        }
+        if (derivedAddr.bech32 !== sourceAddress) {
+          console.error(`[Donate-to] Address mismatch: expected ${sourceAddress}, got ${derivedAddr.bech32}`);
+          return NextResponse.json(
+            { error: `Address mismatch: expected ${sourceAddress}, got ${derivedAddr.bech32}` },
+            { status: 500 }
+          );
+        }
+        // Verify it's now in the derivedAddresses array
+        const allDerived = walletManager.getDerivedAddresses();
+        const foundInArray = allDerived.find(a => a.index === addressIndex);
+        if (!foundInArray) {
+          console.error(`[Donate-to] Address ${addressIndex} derived but not found in derivedAddresses array. Array has ${allDerived.length} addresses.`);
+          return NextResponse.json(
+            { error: `Failed to derive address for index ${addressIndex}: Address not persisted in derivedAddresses array` },
+            { status: 500 }
+          );
+        }
+        // Now try to get the pubkey again
+        try {
+          pubkey = walletManager.getPubKeyHex(addressIndex);
+          console.log(`[Donate-to] Successfully derived and retrieved pubkey for index ${addressIndex}`);
+        } catch (pubkeyErr: any) {
+          console.error(`[Donate-to] Failed to get pubkey after derivation:`, pubkeyErr);
+          return NextResponse.json(
+            { error: `Failed to get pubkey for index ${addressIndex} after derivation: ${pubkeyErr.message}` },
+            { status: 500 }
+          );
+        }
       } catch (deriveErr: any) {
+        console.error(`[Donate-to] Derivation error for index ${addressIndex}:`, deriveErr);
         return NextResponse.json(
           { error: `Failed to derive address for index ${addressIndex}: ${deriveErr.message}` },
           { status: 500 }
         );
       }
     }
-
-    // Get public key for the address
-    const pubkey = walletManager.getPubKeyHex(addressIndex);
 
     // Sign the donation message
     const signature = await walletManager.makeDonationSignature(

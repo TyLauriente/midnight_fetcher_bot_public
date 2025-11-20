@@ -1098,6 +1098,30 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             lastRegisteredOffset = offset;
             logDonationMessage(`Offset ${offset}: Has registered addresses, processing all ${offsetRequests.length} addresses...`);
             
+            // CRITICAL: Re-derive all addresses for this offset to ensure they're available
+            // This is necessary because each donate-to API call creates a new WalletManager instance
+            logDonationMessage(`Offset ${offset}: Re-deriving all addresses to ensure they're available for donation...`);
+            try {
+              const rederiveResponse = await fetch('/api/wallet/derive-addresses', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  password: pwd,
+                  startIndex: offsetStart,
+                  endIndex: offsetEnd,
+                }),
+              });
+
+              const rederiveData = await rederiveResponse.json();
+              if (!rederiveResponse.ok || !rederiveData.addresses || rederiveData.addresses.length === 0) {
+                logDonationMessage(`Offset ${offset}: WARNING - Failed to re-derive addresses, but proceeding anyway...`);
+              } else {
+                logDonationMessage(`Offset ${offset}: Successfully re-derived ${rederiveData.addresses.length} addresses`);
+              }
+            } catch (rederiveErr: any) {
+              logDonationMessage(`Offset ${offset}: WARNING - Error re-deriving addresses: ${rederiveErr.message}, but proceeding anyway...`);
+            }
+            
             // Initialize counters if this is the first offset
             if (offset === 0) {
               await initializeDestinationCounters(offsetRequests, destination);
