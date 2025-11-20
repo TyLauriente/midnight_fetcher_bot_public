@@ -75,8 +75,11 @@ export async function POST(request: NextRequest) {
     );
 
     // Make the donation API call
+    // According to Midnight documentation: POST /donate_to/{destination}/{source}/{signature}
+    // The -d flag suggests we may also need to send pubkey in the request body
     const apiBase = 'https://scavenger.prod.gd.midnighttge.io';
-    const donateUrl = `${apiBase}/donate_to/${sourceAddress}/${destinationAddress}/${signature}/${pubkey}`;
+    // Note: destination comes first, then source (matching consolidate route format)
+    const donateUrl = `${apiBase}/donate_to/${destinationAddress}/${sourceAddress}/${signature}`;
 
     let success = false;
     let responseData: any = null;
@@ -84,11 +87,18 @@ export async function POST(request: NextRequest) {
     let httpStatus: number | undefined = undefined;
 
     try {
+      // Send pubkey in request body (using -d flag equivalent)
+      // The URL contains destination, source, and signature; body contains pubkey
+      const requestBody = {
+        pubkey: pubkey,
+      };
+
       const response = await fetch(donateUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify(requestBody),
       });
 
       httpStatus = response.status;
