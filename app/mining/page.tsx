@@ -965,7 +965,8 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         return errorMsg.includes('not registered') || 
                errorMsg.includes('unregistered') ||
                errorMsg.includes('no registered') ||
-               errorMsg.includes('has no registered');
+               errorMsg.includes('has no registered') ||
+               errorMsg.includes('address not found for index'); // Also catch the derivation error
       };
 
       // Collect all requests as we process offsets
@@ -1017,7 +1018,6 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
           // Check first address as a sample to see if this offset has registered addresses
           const sampleRequest = offsetRequests[0];
           let hasRegisteredAddress = false;
-          let allNotRegistered = true;
 
           try {
             const sampleResponse = await fetch('/api/wallet/donate-to', {
@@ -1035,30 +1035,28 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             
             if (sampleResponse.ok && sampleData.success) {
               hasRegisteredAddress = true;
-              allNotRegistered = false;
             } else if (sampleData.error && isNotRegisteredError(sampleData.error)) {
-              // Sample address is not registered - check all addresses to be sure
-              allNotRegistered = true;
+              // Sample address is not registered
+              hasRegisteredAddress = false;
             } else {
-              // Other error - consider it registered
+              // Other error (already assigned, etc.) - consider it registered
               hasRegisteredAddress = true;
-              allNotRegistered = false;
             }
           } catch (err: any) {
             // On error, assume registered to be safe
+            logDonationMessage(`Error checking sample address: ${err.message}`);
             hasRegisteredAddress = true;
-            allNotRegistered = false;
           }
 
-          // If sample indicates not registered, check all addresses in this offset
-          if (allNotRegistered) {
-            logDonationMessage(`Offset ${offset}: Sample address not registered, checking all addresses...`);
+          // If sample indicates not registered, check a few more to be sure
+          if (!hasRegisteredAddress) {
+            logDonationMessage(`Offset ${offset}: Sample address not registered, checking a few more...`);
             
-            // Check a few more addresses to be sure
+            // Check up to 5 more addresses
             const checkCount = Math.min(5, offsetRequests.length);
-            let checkedNotRegistered = 0;
+            let foundRegistered = false;
             
-            for (let i = 0; i < checkCount; i++) {
+            for (let i = 1; i < checkCount && !foundRegistered; i++) {
               const checkRequest = offsetRequests[i];
               try {
                 const checkResponse = await fetch('/api/wallet/donate-to', {
@@ -1075,26 +1073,23 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 const checkData = await checkResponse.json();
                 
                 if (checkResponse.ok && checkData.success) {
+                  foundRegistered = true;
                   hasRegisteredAddress = true;
-                  allNotRegistered = false;
-                  break;
-                } else if (checkData.error && isNotRegisteredError(checkData.error)) {
-                  checkedNotRegistered++;
-                } else {
+                } else if (checkData.error && !isNotRegisteredError(checkData.error)) {
+                  // Other error - consider it registered
+                  foundRegistered = true;
                   hasRegisteredAddress = true;
-                  allNotRegistered = false;
-                  break;
                 }
               } catch (err: any) {
-                hasRegisteredAddress = true;
-                allNotRegistered = false;
-                break;
+                // On error, check if it's a "not found" error
+                const errorMsg = (err.message || '').toLowerCase();
+                if (errorMsg.includes('address not found for index') || errorMsg.includes('not found')) {
+                  // Not found - continue checking
+                } else {
+                  // Other errors - be conservative, don't assume registered
+                  logDonationMessage(`Error checking address ${i}: ${err.message}`);
+                }
               }
-            }
-
-            // If all checked addresses are not registered, consider the whole offset not registered
-            if (checkedNotRegistered === checkCount) {
-              allNotRegistered = true;
             }
           }
 
@@ -1110,11 +1105,9 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
 
             // Process donations for this offset
             await processDonations(offsetRequests, pwd, destination);
-          }
-
-          // Check if we should continue
-          if (allNotRegistered && offsetRequests.length > 0) {
-            logDonationMessage(`Offset ${offset}: All addresses not registered, checking next offset as sanity check...`);
+          } else {
+            // No registered addresses in this offset - do sanity check on next offset
+            logDonationMessage(`Offset ${offset}: No registered addresses found, checking next offset as sanity check...`);
             
             // Sanity check: check the next offset
             if (offset + 1 < AUTO_MAX_OFFSET) {
@@ -1150,7 +1143,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                   
                   if (sampleResponse.ok && sampleData.success) {
                     logDonationMessage(`Offset ${offset + 1}: Has registered address, continuing...`);
-                    // Continue to next offset
+                    // Continue to next offset (skip current one)
                     continue;
                   } else if (sampleData.error && isNotRegisteredError(sampleData.error)) {
                     logDonationMessage(`Offset ${offset + 1}: Also not registered, reached end`);
@@ -1159,25 +1152,34 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                       setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
                     }
                     break;
+                  } else {
+                    // Other error - consider it registered, continue
+                    logDonationMessage(`Offset ${offset + 1}: Has registered address (other error), continuing...`);
+                    continue;
                   }
+                } else {
+                  // Can't derive next offset, assume end
+                  logDonationMessage(`Offset ${offset + 1}: Failed to derive, reached end`);
+                  if (lastRegisteredOffset >= 0) {
+                    setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+                  }
+                  break;
                 }
               } catch (err: any) {
-                logDonationMessage(`Error checking next offset ${offset + 1}: ${err.message}`);
+                logDonationMessage(`Error checking next offset ${offset + 1}: ${err.message}, reached end`);
+                if (lastRegisteredOffset >= 0) {
+                  setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+                }
+                break;
               }
+            } else {
+              // No more offsets to check
+              logDonationMessage(`Reached end of offset range`);
+              if (lastRegisteredOffset >= 0) {
+                setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+              }
+              break;
             }
-            
-            // Reached the end
-            logDonationMessage(`Reached end of registered addresses at offset ${offset}`);
-            if (lastRegisteredOffset >= 0) {
-              setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
-            }
-            break;
-          }
-
-          // This offset has registered addresses
-          if (hasRegisteredAddress) {
-            lastRegisteredOffset = offset;
-            logDonationMessage(`Offset ${offset}: Has registered addresses, continuing to next offset...`);
           }
 
         } catch (err: any) {
@@ -1186,7 +1188,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
         }
       }
 
-      if (lastRegisteredOffset < 0 || allRequests.length === 0) {
+      if (lastRegisteredOffset < 0) {
         setDonating(false);
         setError('No registered addresses found for auto consolidate.');
         return;
@@ -1476,27 +1478,15 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
               <Loader2 className="w-6 h-6 text-green-400 animate-spin" />
               <div>
                 <p className="text-lg font-semibold text-white">
-                  {autoDetecting ? 'Detecting Registered Addresses...' : 'Consolidating Addresses...'}
+                  Consolidating Addresses...
                 </p>
                 <p className="text-sm text-gray-400">
-                  {autoDetecting
-                    ? 'Scanning wallet indexes to find registered sources.'
-                    : 'Donations are running in parallel. Keep the app open until completion.'}
+                  Donations are running in parallel. Keep the app open until completion.
                 </p>
               </div>
             </div>
 
-            {autoDetecting && autoDetectionStatus && (
-              <div className="text-sm text-gray-300">
-                Checking offset{' '}
-                <span className="text-white font-semibold">{autoDetectionStatus.currentOffset}</span>
-                {' '}
-                (addresses {offsetToStartIndex(autoDetectionStatus.currentOffset)}-
-                {offsetToEndIndex(autoDetectionStatus.currentOffset)})
-              </div>
-            )}
-
-            {!autoDetecting && donationStatus && (
+            {donationStatus && (
               <div className="space-y-1 text-sm text-gray-300">
                 <p>
                   Address {donationStatus.currentNumber}/{donationStatus.total}
@@ -1516,7 +1506,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
               </div>
             )}
 
-            {!autoDetecting && donationProgress && (
+            {donationProgress && (
               <div className="space-y-2">
                 <div className="w-full bg-gray-800 rounded-full h-2">
                   <div
@@ -2000,20 +1990,55 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 )}
                 <Button
                   onClick={handleAutoConsolidate}
-                  disabled={donating || autoDetecting || !donateDestinationAddress.trim()}
+                  disabled={donating || !donateDestinationAddress.trim()}
                   variant="success"
                   className="w-full"
                 >
                   {donating ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin mr-2" />
-                      {autoDetecting ? 'Detecting Addresses...' : 'Consolidating...'}
+                      Consolidating...
                     </>
                   ) : (
                     'Auto Consolidate'
                   )}
                 </Button>
               </div>
+              
+              {/* Inline status for auto-consolidate */}
+              {donating && (
+                <Card variant="bordered" className="bg-blue-900/30 border-blue-700/40">
+                  <CardContent className="pt-6">
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                        <p className="text-sm font-semibold text-blue-200">Auto Consolidate in Progress</p>
+                      </div>
+                      {autoDetectionStatus && (
+                        <div className="text-sm text-blue-300">
+                          Processing offset{' '}
+                          <span className="text-white font-semibold">{autoDetectionStatus.currentOffset}</span>
+                          {' '}(addresses {offsetToStartIndex(autoDetectionStatus.currentOffset)}-
+                          {offsetToEndIndex(autoDetectionStatus.currentOffset)})
+                        </div>
+                      )}
+                      {donationProgress && (
+                        <div className="space-y-1">
+                          <div className="w-full bg-gray-800 rounded-full h-2">
+                            <div
+                              className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                              style={{ width: `${(donationProgress.current / donationProgress.total) * 100}%` }}
+                            />
+                          </div>
+                          <p className="text-xs text-gray-400">
+                            {donationProgress.current}/{donationProgress.total} donations processed
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
             </div>
           )}
 

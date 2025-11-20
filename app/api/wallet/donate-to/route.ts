@@ -64,6 +64,21 @@ export async function POST(request: NextRequest) {
       addressIndex = found.index;
     }
 
+    // Ensure the address is derived (derive on the fly if needed)
+    try {
+      walletManager.getPubKeyHex(addressIndex);
+    } catch (err: any) {
+      // Address not in derived list, derive it on the fly
+      try {
+        await walletManager.deriveAddressesByRange(password, addressIndex, addressIndex);
+      } catch (deriveErr: any) {
+        return NextResponse.json(
+          { error: `Failed to derive address for index ${addressIndex}: ${deriveErr.message}` },
+          { status: 500 }
+        );
+      }
+    }
+
     // Get public key for the address
     const pubkey = walletManager.getPubKeyHex(addressIndex);
 
