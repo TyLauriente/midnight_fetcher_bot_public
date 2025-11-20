@@ -290,32 +290,17 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
     requests: DonationRequestPayload[],
     destinationAddress: string
   ) => {
-    const totalSolutions = requests.reduce((sum, req) => sum + (req.solutions || 0), 0);
-    const totalNight = requests.reduce((sum, req) => sum + (req.night || 0), 0);
     setCurrentDestinationAddress(destinationAddress);
-
-    try {
-      const { stats } = await fetchStatsForRecords([{ bech32: destinationAddress }]);
-      const destStat = stats[0];
-      setDestinationCounters({
-        apiSolutions: destStat?.solutionsSubmitted ?? null,
-        apiNight: destStat?.nightEarned ?? null,
-        countedTotalSolutions: totalSolutions,
-        countedTotalNight: totalNight,
-        countedProcessedSolutions: 0,
-        countedProcessedNight: 0,
-      });
-    } catch (err: any) {
-      logDonationMessage('Warning: Failed to fetch destination statistics', err.message || String(err));
-      setDestinationCounters({
-        apiSolutions: null,
-        apiNight: null,
-        countedTotalSolutions: totalSolutions,
-        countedTotalNight: totalNight,
-        countedProcessedSolutions: 0,
-        countedProcessedNight: 0,
-      });
-    }
+    // Just set the destination address, no API call needed
+    // Statistics will be fetched after all donations complete
+    setDestinationCounters({
+      apiSolutions: null,
+      apiNight: null,
+      countedTotalSolutions: 0,
+      countedTotalNight: 0,
+      countedProcessedSolutions: 0,
+      countedProcessedNight: 0,
+    });
   };
 
   const refreshDestinationCounters = async (destinationAddress: string) => {
@@ -669,12 +654,6 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
 
         if (!result.success && result.resultType === 'error') {
           failedQueue.push(request);
-        } else if (result.success) {
-          setDestinationCounters(prev => ({
-            ...prev,
-            countedProcessedSolutions: prev.countedProcessedSolutions + (request.solutions || 0),
-            countedProcessedNight: prev.countedProcessedNight + (request.night || 0),
-          }));
         }
 
         completed++;
@@ -1971,9 +1950,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
             </Card>
           )}
 
-          {(destinationCounters.apiSolutions !== null ||
-            destinationCounters.countedTotalSolutions > 0 ||
-            destinationCounters.countedProcessedSolutions > 0) && (
+          {destinationCounters.apiSolutions !== null || destinationCounters.apiNight !== null ? (
             <Card variant="bordered" className="bg-gray-900/40">
               <CardHeader>
                 <CardTitle className="text-sm">Destination Address Summary</CardTitle>
@@ -1997,46 +1974,14 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                       {destinationCounters.apiNight !== null ? formatNightValue(destinationCounters.apiNight) : 'N/A'}
                     </p>
                   </div>
-                  <div>
-                    <p className="text-gray-400">Counted Total Solutions</p>
-                    <p className="text-white text-xl font-semibold">
-                      {destinationCounters.countedTotalSolutions.toLocaleString()}
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      Processed:{' '}
-                      {destinationCounters.countedProcessedSolutions.toLocaleString()}
-                      {' • Remaining: '}
-                      {Math.max(
-                        destinationCounters.countedTotalSolutions - destinationCounters.countedProcessedSolutions,
-                        0
-                      ).toLocaleString()}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-gray-400">Counted Total NIGHT</p>
-                    <p className="text-white text-xl font-semibold">
-                      {formatNightValue(destinationCounters.countedTotalNight)}
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      Processed:{' '}
-                      {formatNightValue(destinationCounters.countedProcessedNight)}
-                      {' • Remaining: '}
-                      {formatNightValue(
-                        Math.max(
-                          destinationCounters.countedTotalNight - destinationCounters.countedProcessedNight,
-                          0
-                        )
-                      )}
-                    </p>
-                  </div>
                 </div>
                 <p className="text-xs text-gray-500 mt-4">
-                  Counted values include only the addresses processed in this session and update live as each donation completes.
                   API values come directly from Midnight and may lag until the network finalizes each consolidation.
+                  These values are only updated after all donations complete.
                 </p>
               </CardContent>
             </Card>
-          )}
+          ) : null}
 
           {(totalDonationOutcomeCount > 0 || donating) && (
             <Card variant="bordered" className="bg-gray-900/50">
