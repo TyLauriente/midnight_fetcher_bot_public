@@ -2076,7 +2076,7 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
           )}
 
           {/* Consolidated Metrics - Primary tracking metric */}
-          {(consolidatedMetrics.totalSolutions > 0 || donating) && (
+          {(consolidatedMetrics.totalSolutions > 0 || donating || viewMode === 'auto-consolidate') && (
             <Card variant="bordered" className="bg-gradient-to-br from-green-900/30 to-emerald-900/30 border-green-700/50">
               <CardHeader>
                 <CardTitle className="text-lg">Consolidation Summary</CardTitle>
