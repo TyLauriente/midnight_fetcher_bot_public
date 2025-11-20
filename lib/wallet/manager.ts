@@ -250,12 +250,21 @@ export class WalletManager {
     for (let i = startIndex; i <= endIndex; i++) {
       try {
         const { address, pubKeyHex } = await this.deriveAddressAtIndex(i);
-        addresses.push({
+        const derivedAddr: DerivedAddress = {
           index: i,
           bech32: address,
           publicKeyHex: pubKeyHex,
           registered: false, // Will be checked via API
-        });
+        };
+        addresses.push(derivedAddr);
+        
+        // Also add to this.derivedAddresses if not already present
+        const existingIndex = this.derivedAddresses.findIndex(a => a.index === i);
+        if (existingIndex >= 0) {
+          this.derivedAddresses[existingIndex] = derivedAddr;
+        } else {
+          this.derivedAddresses.push(derivedAddr);
+        }
       } catch (err: any) {
         console.error(`Failed to derive address at index ${i}:`, err.message);
         throw err;
@@ -332,9 +341,23 @@ export class WalletManager {
       throw new Error('Mnemonic not loaded');
     }
 
-    const addr = this.derivedAddresses.find(a => a.index === addressIndex);
+    // Check if address is in derived list, if not derive it on the fly
+    let addr = this.derivedAddresses.find(a => a.index === addressIndex);
     if (!addr) {
-      throw new Error(`Address not found for index ${addressIndex}`);
+      // Derive the address on the fly
+      try {
+        const derived = await this.deriveAddressAtIndex(addressIndex);
+        addr = {
+          index: addressIndex,
+          bech32: derived.address,
+          publicKeyHex: derived.pubKeyHex,
+          registered: false,
+        };
+        // Add to derivedAddresses array
+        this.derivedAddresses.push(addr);
+      } catch (err: any) {
+        throw new Error(`Address not found for index ${addressIndex} and failed to derive: ${err.message}`);
+      }
     }
 
     if (addr.bech32 !== sourceAddress) {

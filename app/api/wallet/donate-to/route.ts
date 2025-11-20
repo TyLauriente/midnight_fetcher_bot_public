@@ -65,10 +65,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Ensure the address is derived (derive on the fly if needed)
-    // First check if it's already in the derived list
-    let pubkey: string;
+    // We need to derive it so it's available for both getPubKeyHex and makeDonationSignature
     try {
-      pubkey = walletManager.getPubKeyHex(addressIndex);
+      walletManager.getPubKeyHex(addressIndex);
     } catch (err: any) {
       // Address not in derived list, derive it on the fly
       console.log(`[Donate-to] Address ${addressIndex} not found in derived list, deriving on the fly...`);
@@ -97,18 +96,7 @@ export async function POST(request: NextRequest) {
             { status: 500 }
           );
         }
-        // The address should now be in derivedAddresses array
-        // Use the pubkey directly from the derived address instead of calling getPubKeyHex
-        // This avoids the issue where getPubKeyHex might not find it immediately
-        if (!derivedAddr.publicKeyHex) {
-          console.error(`[Donate-to] Derived address ${addressIndex} has no publicKeyHex`);
-          return NextResponse.json(
-            { error: `Failed to derive address for index ${addressIndex}: No public key in derived address` },
-            { status: 500 }
-          );
-        }
-        pubkey = derivedAddr.publicKeyHex;
-        console.log(`[Donate-to] Successfully derived address ${addressIndex} and using pubkey from derived address`);
+        console.log(`[Donate-to] Successfully derived address ${addressIndex}, now available for signing`);
       } catch (deriveErr: any) {
         console.error(`[Donate-to] Derivation error for index ${addressIndex}:`, deriveErr);
         return NextResponse.json(
@@ -117,6 +105,9 @@ export async function POST(request: NextRequest) {
         );
       }
     }
+
+    // Get public key for the address (should now be available)
+    const pubkey = walletManager.getPubKeyHex(addressIndex);
 
     // Sign the donation message
     const signature = await walletManager.makeDonationSignature(
