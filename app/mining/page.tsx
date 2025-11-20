@@ -960,13 +960,21 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
       let lastRegisteredOffset = -1;
 
       // Helper function to check if donation error indicates address is not registered
+      // NOTE: "Address not found for index" is a DERIVATION error, NOT a registration status!
       const isNotRegisteredError = (error: string): boolean => {
         const errorMsg = (error || '').toLowerCase();
         return errorMsg.includes('not registered') || 
                errorMsg.includes('unregistered') ||
                errorMsg.includes('no registered') ||
-               errorMsg.includes('has no registered') ||
-               errorMsg.includes('address not found for index'); // Also catch the derivation error
+               errorMsg.includes('has no registered');
+        // DO NOT include "address not found for index" - that's a derivation error!
+      };
+      
+      // Helper function to check if error is a derivation error (should retry, not treat as not registered)
+      const isDerivationError = (error: string): boolean => {
+        const errorMsg = (error || '').toLowerCase();
+        return errorMsg.includes('address not found for index') ||
+               errorMsg.includes('failed to derive address');
       };
 
       // Collect all requests as we process offsets
@@ -1016,79 +1024,71 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
           }
 
           // Check first address as a sample to see if this offset has registered addresses
+          // Use stats API to check registration status (more reliable than donate API)
           const sampleRequest = offsetRequests[0];
           let hasRegisteredAddress = false;
 
           try {
-            const sampleResponse = await fetch('/api/wallet/donate-to', {
+            // Use stats API to check if address is registered
+            const statsResponse = await fetch('/api/wallet/check-statistics', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                password: pwd,
-                sourceAddress: sampleRequest.sourceAddress,
-                sourceAddressIndex: sampleRequest.sourceIndex,
-                destinationAddress: destination,
+                addresses: [sampleRequest.sourceAddress],
               }),
             });
 
-            const sampleData = await sampleResponse.json();
+            const statsData = await statsResponse.json();
             
-            if (sampleResponse.ok && sampleData.success) {
-              hasRegisteredAddress = true;
-            } else if (sampleData.error && isNotRegisteredError(sampleData.error)) {
-              // Sample address is not registered
-              hasRegisteredAddress = false;
+            if (statsResponse.ok && statsData.statistics && statsData.statistics.length > 0) {
+              const stat = statsData.statistics[0];
+              if (stat.registered) {
+                hasRegisteredAddress = true;
+                logDonationMessage(`Offset ${offset}: Sample address (index ${sampleRequest.sourceIndex}) is registered with ${stat.solutionsSubmitted} solutions`);
+              } else {
+                hasRegisteredAddress = false;
+                logDonationMessage(`Offset ${offset}: Sample address (index ${sampleRequest.sourceIndex}) is not registered`);
+              }
             } else {
-              // Other error (already assigned, etc.) - consider it registered
-              hasRegisteredAddress = true;
+              // Stats API failed, assume not registered to be safe
+              hasRegisteredAddress = false;
+              logDonationMessage(`Offset ${offset}: Failed to check stats for sample address, assuming not registered`);
             }
           } catch (err: any) {
-            // On error, assume registered to be safe
-            logDonationMessage(`Error checking sample address: ${err.message}`);
-            hasRegisteredAddress = true;
+            // On error, assume not registered to be conservative
+            logDonationMessage(`Error checking sample address stats: ${err.message}`);
+            hasRegisteredAddress = false;
           }
 
-          // If sample indicates not registered, check a few more to be sure
+          // If sample indicates not registered, check a few more to be sure using stats API
           if (!hasRegisteredAddress) {
             logDonationMessage(`Offset ${offset}: Sample address not registered, checking a few more...`);
             
-            // Check up to 5 more addresses
+            // Check up to 5 more addresses using stats API
             const checkCount = Math.min(5, offsetRequests.length);
-            let foundRegistered = false;
+            const addressesToCheck = offsetRequests.slice(1, checkCount + 1).map(r => r.sourceAddress);
             
-            for (let i = 1; i < checkCount && !foundRegistered; i++) {
-              const checkRequest = offsetRequests[i];
+            if (addressesToCheck.length > 0) {
               try {
-                const checkResponse = await fetch('/api/wallet/donate-to', {
+                const checkStatsResponse = await fetch('/api/wallet/check-statistics', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    password: pwd,
-                    sourceAddress: checkRequest.sourceAddress,
-                    sourceAddressIndex: checkRequest.sourceIndex,
-                    destinationAddress: destination,
+                    addresses: addressesToCheck,
                   }),
                 });
 
-                const checkData = await checkResponse.json();
+                const checkStatsData = await checkStatsResponse.json();
                 
-                if (checkResponse.ok && checkData.success) {
-                  foundRegistered = true;
-                  hasRegisteredAddress = true;
-                } else if (checkData.error && !isNotRegisteredError(checkData.error)) {
-                  // Other error - consider it registered
-                  foundRegistered = true;
-                  hasRegisteredAddress = true;
+                if (checkStatsResponse.ok && checkStatsData.statistics) {
+                  const foundRegistered = checkStatsData.statistics.some((stat: any) => stat.registered);
+                  if (foundRegistered) {
+                    hasRegisteredAddress = true;
+                    logDonationMessage(`Offset ${offset}: Found registered address in additional checks`);
+                  }
                 }
               } catch (err: any) {
-                // On error, check if it's a "not found" error
-                const errorMsg = (err.message || '').toLowerCase();
-                if (errorMsg.includes('address not found for index') || errorMsg.includes('not found')) {
-                  // Not found - continue checking
-                } else {
-                  // Other errors - be conservative, don't assume registered
-                  logDonationMessage(`Error checking address ${i}: ${err.message}`);
-                }
+                logDonationMessage(`Error checking additional addresses: ${err.message}`);
               }
             }
           }
@@ -1127,35 +1127,38 @@ function TyConsolidationTab({ password }: TyConsolidationTabProps) {
                 if (nextSampleResponse.ok && nextSampleData.addresses?.[0]) {
                   const nextSampleAddress = nextSampleData.addresses[0];
                   
-                  // Try to donate the sample address
-                  const sampleResponse = await fetch('/api/wallet/donate-to', {
+                  // Check registration status using stats API
+                  const nextStatsResponse = await fetch('/api/wallet/check-statistics', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                      password: pwd,
-                      sourceAddress: nextSampleAddress.bech32,
-                      sourceAddressIndex: nextSampleAddress.index,
-                      destinationAddress: destination,
+                      addresses: [nextSampleAddress.bech32],
                     }),
                   });
 
-                  const sampleData = await sampleResponse.json();
+                  const nextStatsData = await nextStatsResponse.json();
                   
-                  if (sampleResponse.ok && sampleData.success) {
-                    logDonationMessage(`Offset ${offset + 1}: Has registered address, continuing...`);
-                    // Continue to next offset (skip current one)
-                    continue;
-                  } else if (sampleData.error && isNotRegisteredError(sampleData.error)) {
-                    logDonationMessage(`Offset ${offset + 1}: Also not registered, reached end`);
-                    // Both offsets are not registered, we've reached the end
+                  if (nextStatsResponse.ok && nextStatsData.statistics && nextStatsData.statistics.length > 0) {
+                    const nextStat = nextStatsData.statistics[0];
+                    if (nextStat.registered) {
+                      logDonationMessage(`Offset ${offset + 1}: Has registered address (${nextStat.solutionsSubmitted} solutions), continuing...`);
+                      // Continue to next offset (skip current one)
+                      continue;
+                    } else {
+                      logDonationMessage(`Offset ${offset + 1}: Also not registered, reached end`);
+                      // Both offsets are not registered, we've reached the end
+                      if (lastRegisteredOffset >= 0) {
+                        setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
+                      }
+                      break;
+                    }
+                  } else {
+                    // Stats check failed, assume not registered
+                    logDonationMessage(`Offset ${offset + 1}: Failed to check stats, assuming not registered, reached end`);
                     if (lastRegisteredOffset >= 0) {
                       setAutoDetectionRange({ startOffset: 0, endOffset: lastRegisteredOffset });
                     }
                     break;
-                  } else {
-                    // Other error - consider it registered, continue
-                    logDonationMessage(`Offset ${offset + 1}: Has registered address (other error), continuing...`);
-                    continue;
                   }
                 } else {
                   // Can't derive next offset, assume end
