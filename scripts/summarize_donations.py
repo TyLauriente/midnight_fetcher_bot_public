@@ -13,9 +13,210 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime
 import argparse
+import fnmatch
+
+
+def search_for_donation_files(search_entire_system: bool = False, max_depth: int = 10) -> List[Tuple[Path, str]]:
+    """
+    Search for donation log files across the system.
+    Returns: List of (file_path, location_type) tuples
+    """
+    found_files: List[Tuple[Path, str]] = []
+    searched_paths: Set[str] = set()
+    
+    # Patterns to match
+    donation_patterns = ['donation-*.jsonl', 'consolidations.jsonl']
+    
+    def should_skip_directory(dir_path: Path) -> bool:
+        """Check if directory should be skipped during search."""
+        dir_str = str(dir_path).lower()
+        # Skip common system directories
+        skip_patterns = [
+            'node_modules',
+            '.git',
+            '.next',
+            'target',
+            '__pycache__',
+            '.venv',
+            'venv',
+            'env',
+            'windows\\system32',
+            'windows\\syswow64',
+            'program files',
+            'program files (x86)',
+            '$recycle.bin',
+            'system volume information',
+            'appdata\\local\\temp',
+            'appdata\\local\\microsoft',
+            'appdata\\roaming\\microsoft',
+        ]
+        return any(pattern in dir_str for pattern in skip_patterns)
+    
+    def search_directory(root: Path, max_depth: int, current_depth: int = 0) -> None:
+        """Recursively search a directory for donation files."""
+        if current_depth > max_depth:
+            return
+        
+        root_str = str(root)
+        if root_str in searched_paths:
+            return
+        searched_paths.add(root_str)
+        
+        try:
+            if not root.exists() or not root.is_dir():
+                return
+            
+            if should_skip_directory(root):
+                return
+            
+            # Check for donation files in current directory
+            for pattern in donation_patterns:
+                for file_path in root.glob(pattern):
+                    if file_path.is_file():
+                        found_files.append((file_path, 'searched'))
+            
+            # Recurse into subdirectories
+            if current_depth < max_depth:
+                try:
+                    for item in root.iterdir():
+                        if item.is_dir() and not item.name.startswith('.'):
+                            search_directory(item, max_depth, current_depth + 1)
+                except (PermissionError, OSError):
+                    pass  # Skip directories we can't access
+        except (PermissionError, OSError, UnicodeDecodeError):
+            pass  # Skip directories we can't access
+    
+    print("Searching for donation log files...")
+    print("=" * 80)
+    
+    # First, check all known locations
+    print("\n1. Checking known locations...")
+    known_locations = [
+        (Path.cwd() / 'storage' / 'donations', 'installation folder'),
+        (Path.home() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations', 'Documents folder'),
+        (Path.cwd() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations', 'fallback Documents'),
+    ]
+    
+    if sys.platform == 'win32':
+        userprofile = os.environ.get('USERPROFILE')
+        if userprofile:
+            known_locations.append((
+                Path(userprofile) / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations',
+                'USERPROFILE Documents'
+            ))
+    
+    for location, desc in known_locations:
+        if location.exists():
+            print(f"   Checking {desc}: {location}")
+            for pattern in donation_patterns:
+                for file_path in location.glob(pattern):
+                    if file_path.is_file():
+                        found_files.append((file_path, f'known: {desc}'))
+            # Also check parent for consolidations.jsonl
+            parent = location.parent
+            consolidations_file = parent / 'consolidations.jsonl'
+            if consolidations_file.exists():
+                found_files.append((consolidations_file, f'known: {desc} (parent)'))
+    
+    if not search_entire_system:
+        print("\n2. Searching common user directories...")
+        common_dirs = [
+            Path.home(),
+            Path.home() / 'Documents',
+            Path.home() / 'Desktop',
+            Path.home() / 'Downloads',
+        ]
+        
+        if sys.platform == 'win32':
+            userprofile = os.environ.get('USERPROFILE', '')
+            if userprofile:
+                common_dirs.extend([
+                    Path(userprofile) / 'Documents',
+                    Path(userprofile) / 'Desktop',
+                    Path(userprofile) / 'Downloads',
+                ])
+        
+        for common_dir in common_dirs:
+            if common_dir.exists():
+                print(f"   Searching {common_dir}...")
+                search_directory(common_dir, max_depth=5, current_depth=0)
+    else:
+        print("\n2. Searching entire system (this may take a while)...")
+        print("   Warning: This will search all accessible directories. It may take several minutes.")
+        
+        # Start from common root directories
+        search_roots = [Path.home()]
+        
+        if sys.platform == 'win32':
+            # On Windows, search from user profile and common locations
+            userprofile = os.environ.get('USERPROFILE', '')
+            if userprofile:
+                search_roots.append(Path(userprofile))
+            # Also check C:\Users if accessible
+            c_users = Path('C:/Users')
+            if c_users.exists():
+                search_roots.append(c_users)
+        else:
+            # On Unix, search from home directory
+            search_roots.append(Path.home())
+        
+        for root in search_roots:
+            if root.exists():
+                print(f"   Searching from {root}...")
+                search_directory(root, max_depth=max_depth, current_depth=0)
+    
+    # Remove duplicates (same file found multiple times)
+    unique_files = {}
+    for file_path, location_type in found_files:
+        file_str = str(file_path)
+        if file_str not in unique_files:
+            unique_files[file_str] = (file_path, location_type)
+        else:
+            # Keep the more specific location type
+            existing_type = unique_files[file_str][1]
+            if 'known:' in location_type and 'known:' not in existing_type:
+                unique_files[file_str] = (file_path, location_type)
+    
+    return list(unique_files.values())
+
+
+def print_search_results(found_files: List[Tuple[Path, str]]) -> None:
+    """Print the results of the file search."""
+    if not found_files:
+        print("\n" + "=" * 80)
+        print("No donation log files found.")
+        print("=" * 80)
+        return
+    
+    print("\n" + "=" * 80)
+    print(f"Found {len(found_files)} donation log file(s):")
+    print("=" * 80)
+    
+    # Group by location type
+    by_location = defaultdict(list)
+    for file_path, location_type in found_files:
+        by_location[location_type].append(file_path)
+    
+    for location_type, files in sorted(by_location.items()):
+        print(f"\n{location_type}:")
+        for file_path in sorted(files):
+            try:
+                size = file_path.stat().st_size
+                size_str = f"{size:,} bytes" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
+                print(f"  {file_path}")
+                print(f"    Size: {size_str}")
+            except OSError:
+                print(f"  {file_path} (size unknown)")
+    
+    print("\n" + "=" * 80)
+    print("Summary:")
+    print(f"  Total files found: {len(found_files)}")
+    print(f"  Donation log files (*.jsonl in donations/): {sum(1 for _, lt in found_files if 'donation-' in str(_))}")
+    print(f"  Consolidation files (consolidations.jsonl): {sum(1 for _, lt in found_files if 'consolidations.jsonl' in str(_))}")
+    print("=" * 80)
 
 
 def find_storage_directories() -> Tuple[Optional[Path], Optional[Path]]:
@@ -33,6 +234,7 @@ def find_storage_directories() -> Tuple[Optional[Path], Optional[Path]]:
             return old_storage, donation_dir
     
     # Check new location (Documents folder)
+    # On Windows, use USERPROFILE; on Unix, use HOME
     home = Path.home()
     documents = home / 'Documents'
     
@@ -49,6 +251,18 @@ def find_storage_directories() -> Tuple[Optional[Path], Optional[Path]]:
     
     if fallback_donations.exists():
         return fallback_storage, fallback_donations
+    
+    # On Windows, also check if Documents folder might be in a different location
+    # Some Windows setups might have Documents in a different path
+    if sys.platform == 'win32':
+        # Check if USERPROFILE is set and different from Path.home()
+        userprofile = os.environ.get('USERPROFILE')
+        if userprofile and userprofile != str(home):
+            alt_documents = Path(userprofile) / 'Documents'
+            alt_storage = alt_documents / 'MidnightFetcherBot' / 'storage'
+            alt_donations = alt_storage / 'donations'
+            if alt_donations.exists():
+                return alt_storage, alt_donations
     
     return None, None
 
@@ -524,8 +738,44 @@ def main():
         action='store_true',
         help='Include failed donations in output (for debugging)'
     )
+    parser.add_argument(
+        '--search',
+        '-s',
+        action='store_true',
+        help='Search for donation log files across the system'
+    )
+    parser.add_argument(
+        '--search-all',
+        action='store_true',
+        help='Search entire system for donation files (slower but more thorough)'
+    )
+    parser.add_argument(
+        '--search-depth',
+        type=int,
+        default=10,
+        help='Maximum directory depth when searching (default: 10)'
+    )
     
     args = parser.parse_args()
+    
+    # Handle search mode
+    if args.search or args.search_all:
+        found_files = search_for_donation_files(
+            search_entire_system=args.search_all,
+            max_depth=args.search_depth
+        )
+        print_search_results(found_files)
+        
+        # Optionally, if files were found, ask if user wants to summarize them
+        if found_files:
+            print("\nTo summarize donations from these files, you can:")
+            print("  1. Use --directory to specify a specific donations folder")
+            print("  2. The script will automatically use the first found location")
+            print("\nExample:")
+            donation_dirs = {f.parent for f, _ in found_files if 'donation-' in str(f)}
+            if donation_dirs:
+                print(f"  python3 scripts/summarize_donations.py -d \"{list(donation_dirs)[0]}\"")
+        sys.exit(0)
     
     # Find storage and donation directories
     if args.directory:
@@ -539,10 +789,23 @@ def main():
         storage_dir, donation_dir = find_storage_directories()
         if not donation_dir:
             print("Error: Could not find donation log directory.", file=sys.stderr)
-            print("Checked locations:", file=sys.stderr)
-            print(f"  - {Path.cwd() / 'storage' / 'donations'}", file=sys.stderr)
-            print(f"  - {Path.home() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
-            print(f"  - {Path.cwd() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
+            print("\nChecked locations:", file=sys.stderr)
+            print(f"  1. {Path.cwd() / 'storage' / 'donations'}", file=sys.stderr)
+            print(f"  2. {Path.home() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
+            print(f"  3. {Path.cwd() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
+            if sys.platform == 'win32':
+                userprofile = os.environ.get('USERPROFILE')
+                if userprofile:
+                    print(f"  4. {Path(userprofile) / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
+            print("\nPossible reasons:", file=sys.stderr)
+            print("  - Donation logger failed to create directories (check console logs for errors)", file=sys.stderr)
+            print("  - Windows path length limit exceeded (260 characters)", file=sys.stderr)
+            print("  - Permission issues preventing directory creation", file=sys.stderr)
+            print("  - Antivirus blocking file creation", file=sys.stderr)
+            print("\nTo debug:", file=sys.stderr)
+            print("  - Check server console logs for '[Donation] Failed to write donation log' errors", file=sys.stderr)
+            print("  - Verify folder permissions on Documents directory", file=sys.stderr)
+            print("  - Check if antivirus is blocking file writes", file=sys.stderr)
             sys.exit(1)
     
     print(f"Using storage directory: {storage_dir}")
