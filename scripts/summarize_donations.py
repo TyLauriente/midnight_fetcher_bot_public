@@ -17,8 +17,11 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 
 
-def find_donation_directory() -> Optional[Path]:
-    """Find the donation log directory, checking both possible locations."""
+def find_storage_directories() -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Find the storage directory and donations subdirectory, checking all possible locations.
+    Returns: (storage_dir, donations_dir)
+    """
     # Check old location (installation folder)
     old_storage = Path.cwd() / 'storage'
     old_receipts = old_storage / 'receipts.jsonl'
@@ -26,22 +29,27 @@ def find_donation_directory() -> Optional[Path]:
     if old_receipts.exists():
         donation_dir = old_storage / 'donations'
         if donation_dir.exists():
-            return donation_dir
+            return old_storage, donation_dir
     
     # Check new location (Documents folder)
     home = Path.home()
-    if sys.platform == 'win32':
-        documents = home / 'Documents'
-    else:
-        documents = home / 'Documents'
+    documents = home / 'Documents'
     
     new_storage = documents / 'MidnightFetcherBot' / 'storage'
     donation_dir = new_storage / 'donations'
     
     if donation_dir.exists():
-        return donation_dir
+        return new_storage, donation_dir
     
-    return None
+    # Check fallback location (if USERPROFILE/HOME don't exist, uses process.cwd())
+    # This would be: process.cwd()/Documents/MidnightFetcherBot/storage
+    fallback_storage = Path.cwd() / 'Documents' / 'MidnightFetcherBot' / 'storage'
+    fallback_donations = fallback_storage / 'donations'
+    
+    if fallback_donations.exists():
+        return fallback_storage, fallback_donations
+    
+    return None, None
 
 
 def parse_donation_file(file_path: Path) -> List[Dict]:
@@ -63,39 +71,80 @@ def parse_donation_file(file_path: Path) -> List[Dict]:
     return records
 
 
+def parse_consolidation_file(file_path: Path) -> List[Dict]:
+    """Parse consolidation.jsonl file and convert to donation record format."""
+    records = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    consolidation = json.loads(line)
+                    # Convert consolidation record to donation record format
+                    if consolidation.get('status') == 'success':
+                        record = {
+                            'timestamp': consolidation.get('ts', ''),
+                            'sourceAddress': consolidation.get('sourceAddress', ''),
+                            'sourceAddressIndex': consolidation.get('sourceIndex'),
+                            'destinationAddress': consolidation.get('destinationAddress', ''),
+                            'success': True,
+                            'response': {
+                                'solutions_consolidated': consolidation.get('solutionsConsolidated', 0),
+                                'message': consolidation.get('message', ''),
+                            }
+                        }
+                        records.append(record)
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Failed to parse line {line_num} in {file_path.name}: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}", file=sys.stderr)
+    return records
+
+
 def process_file(file_path: Path) -> Tuple[str, List[Dict]]:
     """Process a single file and return its path and records."""
     return (str(file_path), parse_donation_file(file_path))
 
 
-def summarize_donations(donation_dir: Path, num_workers: int = 4) -> Dict:
+def summarize_donations(donation_dir: Path, storage_dir: Path, num_workers: int = 4) -> Dict:
     """Read all donation logs and create a summary of successful consolidations."""
-    # Find all .jsonl files
-    log_files = list(donation_dir.glob('*.jsonl'))
-    
-    if not log_files:
-        print(f"No donation log files found in {donation_dir}")
-        return {}
-    
-    print(f"Found {len(log_files)} donation log file(s)")
-    
-    # Process files in parallel if there are many, otherwise sequentially
     all_records = []
     
-    if len(log_files) > 10 and num_workers > 1:
-        print(f"Processing {len(log_files)} files with {num_workers} workers...")
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(process_file, f): f for f in log_files}
-            for future in as_completed(futures):
-                file_path, records = future.result()
+    # Find all .jsonl files in donations directory
+    log_files = list(donation_dir.glob('*.jsonl'))
+    
+    if log_files:
+        print(f"Found {len(log_files)} donation log file(s) in {donation_dir}")
+        
+        # Process files in parallel if there are many, otherwise sequentially
+        if len(log_files) > 10 and num_workers > 1:
+            print(f"Processing {len(log_files)} files with {num_workers} workers...")
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(process_file, f): f for f in log_files}
+                for future in as_completed(futures):
+                    file_path, records = future.result()
+                    all_records.extend(records)
+                    print(f"Processed {Path(file_path).name}: {len(records)} records")
+        else:
+            print(f"Processing {len(log_files)} files sequentially...")
+            for log_file in log_files:
+                records = parse_donation_file(log_file)
                 all_records.extend(records)
-                print(f"Processed {Path(file_path).name}: {len(records)} records")
-    else:
-        print(f"Processing {len(log_files)} files sequentially...")
-        for log_file in log_files:
-            records = parse_donation_file(log_file)
-            all_records.extend(records)
-            print(f"Processed {log_file.name}: {len(records)} records")
+                print(f"Processed {log_file.name}: {len(records)} records")
+    
+    # Also check for consolidations.jsonl file
+    consolidation_file = storage_dir / 'consolidations.jsonl'
+    if consolidation_file.exists():
+        print(f"\nFound consolidation log file: {consolidation_file}")
+        consolidation_records = parse_consolidation_file(consolidation_file)
+        all_records.extend(consolidation_records)
+        print(f"Loaded {len(consolidation_records)} records from consolidations.jsonl")
+    
+    if not all_records:
+        print(f"No donation records found in {donation_dir} or {consolidation_file}")
+        return {}
     
     print(f"\nTotal records loaded: {len(all_records)}")
     
@@ -248,25 +297,29 @@ def main():
     
     args = parser.parse_args()
     
-    # Find donation directory
+    # Find storage and donation directories
     if args.directory:
         donation_dir = Path(args.directory)
         if not donation_dir.exists():
             print(f"Error: Directory not found: {donation_dir}", file=sys.stderr)
             sys.exit(1)
+        # Try to find parent storage directory for consolidations.jsonl
+        storage_dir = donation_dir.parent
     else:
-        donation_dir = find_donation_directory()
+        storage_dir, donation_dir = find_storage_directories()
         if not donation_dir:
             print("Error: Could not find donation log directory.", file=sys.stderr)
             print("Checked locations:", file=sys.stderr)
             print(f"  - {Path.cwd() / 'storage' / 'donations'}", file=sys.stderr)
             print(f"  - {Path.home() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
+            print(f"  - {Path.cwd() / 'Documents' / 'MidnightFetcherBot' / 'storage' / 'donations'}", file=sys.stderr)
             sys.exit(1)
     
+    print(f"Using storage directory: {storage_dir}")
     print(f"Using donation directory: {donation_dir}")
     
     # Generate summary
-    summary = summarize_donations(donation_dir, num_workers=args.workers)
+    summary = summarize_donations(donation_dir, storage_dir, num_workers=args.workers)
     
     if not summary:
         print("No donation data found.")
