@@ -192,30 +192,56 @@ def print_search_results(found_files: List[Tuple[Path, str]]) -> None:
         return
     
     print("\n" + "=" * 80)
-    print(f"Found {len(found_files)} donation log file(s):")
+    print(f"Found {len(found_files)} donation log file(s) in {len(set(f.parent for f, _ in found_files))} directory/ies:")
     print("=" * 80)
     
-    # Group by location type
-    by_location = defaultdict(list)
+    # Group by directory
+    by_directory = defaultdict(lambda: {'files': [], 'location_type': None, 'total_size': 0})
     for file_path, location_type in found_files:
-        by_location[location_type].append(file_path)
+        directory = file_path.parent
+        by_directory[directory]['files'].append(file_path)
+        if by_directory[directory]['location_type'] is None:
+            by_directory[directory]['location_type'] = location_type
+        # Calculate total size
+        try:
+            size = file_path.stat().st_size
+            by_directory[directory]['total_size'] += size
+        except OSError:
+            pass
     
-    for location_type, files in sorted(by_location.items()):
-        print(f"\n{location_type}:")
-        for file_path in sorted(files):
-            try:
-                size = file_path.stat().st_size
-                size_str = f"{size:,} bytes" if size < 1024*1024 else f"{size/(1024*1024):.2f} MB"
-                print(f"  {file_path}")
-                print(f"    Size: {size_str}")
-            except OSError:
-                print(f"  {file_path} (size unknown)")
+    # Sort directories by file count (descending)
+    sorted_dirs = sorted(
+        by_directory.items(),
+        key=lambda x: (len(x[1]['files']), x[1]['total_size']),
+        reverse=True
+    )
+    
+    for directory, info in sorted_dirs:
+        file_count = len(info['files'])
+        total_size = info['total_size']
+        location_type = info['location_type']
+        
+        # Count file types
+        donation_files = sum(1 for f in info['files'] if 'donation-' in f.name)
+        consolidation_files = sum(1 for f in info['files'] if 'consolidations.jsonl' in f.name)
+        
+        size_str = f"{total_size:,} bytes" if total_size < 1024*1024 else f"{total_size/(1024*1024):.2f} MB"
+        
+        print(f"\n{directory}")
+        print(f"  Location type: {location_type}")
+        print(f"  Files found: {file_count}")
+        if donation_files > 0:
+            print(f"    - Donation logs: {donation_files}")
+        if consolidation_files > 0:
+            print(f"    - Consolidation logs: {consolidation_files}")
+        print(f"  Total size: {size_str}")
     
     print("\n" + "=" * 80)
     print("Summary:")
+    print(f"  Total directories: {len(by_directory)}")
     print(f"  Total files found: {len(found_files)}")
-    print(f"  Donation log files (*.jsonl in donations/): {sum(1 for _, lt in found_files if 'donation-' in str(_))}")
-    print(f"  Consolidation files (consolidations.jsonl): {sum(1 for _, lt in found_files if 'consolidations.jsonl' in str(_))}")
+    print(f"  Donation log files (donation-*.jsonl): {sum(1 for f, _ in found_files if 'donation-' in str(f))}")
+    print(f"  Consolidation files (consolidations.jsonl): {sum(1 for f, _ in found_files if 'consolidations.jsonl' in str(f))}")
     print("=" * 80)
 
 
